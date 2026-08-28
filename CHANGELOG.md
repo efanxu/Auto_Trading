@@ -2,6 +2,32 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] — Strategy Tester release
+
+MR-T is upgraded from a signal indicator with virtual position bookkeeping to a directly backtestable TradingView `strategy()`.
+
+### Added
+
+- **Real strategy orders** — confirmed-bar signals submit the fixed entry IDs `MR-L` and `MR-S`; `pyramiding = 0` and a pending-entry guard keep the model single-direction and single-position.
+- **Standard execution model** — `process_orders_on_close = false` preserves the close-confirmed signal → next available tick fill flow. After the fill, `strategy.position_avg_price` becomes the entry-price source.
+- **Real partial exits** — new `trimPct` input (default 50%) closes the first target with an OCA reduce order group; the final target is submitted only after the partial position reduction is observed.
+- **Strategy risk orders** — ATR/statistical stops, post-trim breakeven, final targets, Trend Fail, and Timeout are connected to Strategy Tester orders. Trend Fail and Timeout use `strategy.close()` after cancelling pending price orders.
+- **Tester-first performance** — the panel uses `strategy.netprofit`, `strategy.max_drawdown`, `strategy.closedtrades`, and `strategy.wintrades`; the v2 virtual P&L fields were removed from formal reporting.
+- **Range/Shock attribution** — auxiliary counts and win counts track the two engine modes while leaving formal performance to Strategy Tester.
+- **Cost inputs and alert routing** — `commissionBps` and `slippageTicks` keep breakeven estimates aligned with the Strategy Tester Properties tab. `alert()` covers lifecycle events and every strategy order includes a dynamic `alert_message`.
+
+### Changed
+
+- **Independent `requireBandReclaim`** — when enabled, the Z-score reclaim must also be accompanied by residual movement toward the mean; it no longer repeats the same current-bar Z-band inequality. `requireCandleConfirm` remains the separate raw-close direction check.
+- **Frozen trade context** — mean, standard deviation, ATR, targets, and base stop are captured from the confirmed signal context and initialized against the actual strategy fill. Chart lines use the same frozen levels as the orders.
+- **Sequential lifecycle** — T-close is not submitted until the actual T-trim has reduced the position, and it is delayed until the next bar so a single bar cannot jump directly from entry to final target.
+- **Documentation** — both READMEs now describe Strategy Tester installation, execution timing, real partial exits, cost configuration, alerts, and validation steps.
+
+### Notes
+
+- Pine requires the `strategy()` commission/slippage defaults to be compile-time values. The script defaults to `0.03%` commission per order (3 bp/side) and `0` slippage ticks; if Properties are changed, update the matching inputs used by breakeven calculations.
+- `calc_on_order_fills = true` is enabled so the actual fill average is available before the first protective price order is placed. Historical results should be checked with the selected broker-emulator and Bar Magnifier assumptions.
+
 ## [2.0.0] — Production rewrite
 
 The "9 分版" (ninth tuning iteration, previously internal) is now released as a production-grade, open-source, bilingual indicator.

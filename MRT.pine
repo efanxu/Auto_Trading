@@ -1,11 +1,12 @@
 //@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | fill={{strategy.order.price}}
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-indicator("Mean Reversion T", overlay = true, max_labels_count = 500)
+strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Production v2.0.0
+// Mean Reversion T (MR-T) · Strategy v3.0.0
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -16,10 +17,10 @@ indicator("Mean Reversion T", overlay = true, max_labels_count = 500)
 // 生命周期 / Lifecycle    观察 → T买/T空 → T减 → T平
 // 异常退出 / Exits        T止损 / 趋势失效 / T超时 / T保本
 //
-// 定位 / Scope: 纯 indicator,虚拟持仓,不自动交易,不构成投资建议。
-// 设计用于 A 股 T+0 日内做 T;换品种/周期前请重新评估全部参数。
+// 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
+// 收盘确认信号 → 下一可成交时点执行;换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v2.0.0 —— 生产重构。变更见 CHANGELOG.md。
+// 版本 / Version: v3.0.0 —— Strategy Tester 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -27,10 +28,9 @@ indicator("Mean Reversion T", overlay = true, max_labels_count = 500)
 // ⑫ 语言与版本 / ⑫ Language & Version
 // ============================================================================
 // 运行时 UI(面板 / 图表标签 / 报错)随 lang 切换中英文。
-// 注意:Pine 的 input 标题/分组、plotshape 的 text、alertcondition 的 message
-// 都是编译期 const string,无法用运行时变量切换语言:输入项标签保持中文,
-// 警报消息用双语静态文本。只有 TradingView 原生 i18n(script.i18n)能本地化
-// 这些 const 上下文,本版本刻意不依赖未经确认的 API。
+// 注意:Pine 的 input 标题/分组、plotshape 的 text 都是编译期 const string,
+// 无法用运行时变量切换语言:输入项标签保持中文。策略 alert() 与 order
+// alert_message 使用运行时字符串,包含实际事件、方向、模式和成交占位符。
 
 lang = input.string("zh", "语言 / Language", options = ["zh", "en"], group = "⑫ 语言与版本 / Language & Version")
 
@@ -38,7 +38,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "2.0.0"
+string SCRIPT_VERSION = "3.0.0"
 
 
 // ============================================================================
@@ -153,6 +153,7 @@ requireCandleConfirm = input.bool(true, "要求K线方向确认", group = "⑨ �
 requireBandReclaim = input.bool(true, "要求价格重新进入Z区间", group = "⑨ 入场确认")
 
 cooldownBars = input.int(3, "退出后冷却 K 数", minval = 0, maxval = 24, group = "⑨ 入场确认")
+trimPct = input.float(50.0, "T减退出仓位 (%)", minval = 1.0, maxval = 99.0, step = 1.0, group = "⑨ 入场确认")
 
 
 // ============================================================================
@@ -169,7 +170,10 @@ balancedWeight = input.float(0.50, "Balanced统计止损权重", minval = 0.0, m
 
 moveStopToBE = input.bool(true, "T减后启用保本保护", group = "⑩ 风险控制")
 
-costBps = input.float(3.0, "每边成本(手续费+滑点) bp", minval = 0.0, step = 0.5, group = "⑩ 风险控制")
+// strategy() 只能接受编译期的 commission/slippage 默认值;这两个输入用于
+// BE 价格估算,应与 Strategy Tester -> Properties 中的设置保持一致。
+commissionBps = input.float(3.0, "Strategy Tester 手续费(bp/边)", minval = 0.0, step = 0.5, group = "⑩ 风险控制")
+slippageTicks = input.int(0, "Strategy Tester 滑点(ticks/边)", minval = 0, group = "⑩ 风险控制")
 
 
 // ============================================================================
@@ -410,16 +414,19 @@ zCrossUnderPosShock = ta.crossunder(z, shockEntryZ)
 // State
 // ============================================================================
 // 所有可变状态收敛到一个对象,方向用 ±1 表达。
-// 多空镜像逻辑由 f_enter / f_exit / f_manage 以 dir 参数统一,消除复制粘贴。
+// 多空镜像逻辑由 f_enter / f_initializeTrade / f_exit / f_manage 以 dir 参数统一,
+// 消除复制粘贴;Strategy Tester 持仓是实际交易状态的最终来源。
 
 type MRState
     int    pos           = 0     // 0 空仓 / +1 多头 / -1 空头
     bool   partialTaken  = false
+    int    partialBar    = na    // T减实际成交的 bar_index
     int    setupBar      = na    // 活跃 Setup 的 bar_index
     int    setupDir      = 0     // Setup 方向:+1 / -1
     int    setupMode     = 0     // 0 无 / 1 Range / 2 Shock
     int    entryBar      = na
     float  entryPrice    = na
+    float  entrySize     = na    // Entry 成交后的初始仓位数量
     float  mean          = na
     float  std           = na
     float  atr           = na
@@ -428,15 +435,33 @@ type MRState
     float  baseStop      = na
     int    timeStop      = na
     int    tradeMode     = 0     // 0 无 / 1 Range / 2 Shock
-    float  cost          = 0.0   // 往返成本(价格单位)
+    float  cost          = 0.0   // 往返成本估算(价格单位),仅用于 BE
+    float  netProfitAtEntry = na // Strategy Tester netprofit 快照
     int    lastExitBar   = na
+    int    exitReasonPending = 0 // Trend/Time market close 等待实际成交
+    bool   exitRequested = false
+    bool   marketClosePlaced = false
+
+    // Market order 在信号 bar 收盘生成,下一可成交时点才建立持仓。
+    int    pendingDir    = 0
+    int    pendingMode   = 0
+    int    pendingBar    = na
+    float  pendingMean   = na
+    float  pendingStd    = na
+    float  pendingAtr    = na
+    int    pendingTimeStop = na
+
+    // Range / Shock 辅助统计;正式绩效仍由 Strategy Tester 提供。
+    int    rangeTrades   = 0
+    int    shockTrades   = 0
+    int    rangeWins     = 0
+    int    shockWins     = 0
+
     int    eventKind     = 0     // 本 bar 事件:0 无 / 1 进场 / 2 T减 / 3 退出
     int    eventDir      = 0     // 事件方向:+1 / -1
     int    eventReason   = 0     // 退出原因(仅 eventKind == 3)
-    int    tradeCount    = 0
-    float  sumPnlATR     = 0.0
-    float  lastPnlATR    = na
-    float  lastPnlPct    = na
+    int    eventMode     = 0     // 事件模式:1 Range / 2 Shock
+    float  eventPrice    = na
 
 var MRState t = MRState.new()
 
@@ -456,10 +481,13 @@ bool exitEvent       = false
 int  exitEventDir    = 0
 int  exitReason      = 0
 
-// 每 bar 重置 t 的事件捕获字段(函数通过 t 传出事件)
+// 每次脚本执行重置 t 的事件捕获字段(函数通过 t 传出事件)。策略开启
+// calc_on_order_fills 后,同一根 K 线可能执行多次;事件只在实际成交的执行中产生。
 t.eventKind := 0
 t.eventDir := 0
 t.eventReason := 0
+t.eventMode := 0
+t.eventPrice := na
 
 // 退出原因枚举
 int R_STOP  = 1
@@ -475,14 +503,14 @@ if not na(t.lastExitBar)
     barsSinceExit := bar_index - t.lastExitBar
 
 requiredCooldown = math.max(cooldownBars, 1)
-canEnter = na(t.lastExitBar) or barsSinceExit >= requiredCooldown
+canEnter = strategy.position_size == 0.0 and t.pos == 0 and t.pendingDir == 0 and (na(t.lastExitBar) or barsSinceExit >= requiredCooldown)
 
 
 // ============================================================================
 // 创建 Setup (Shock 优先于 Range;方向反转允许替换对侧 Setup)
 // ============================================================================
 
-if barstate.isconfirmed and t.pos == 0 and canEnter
+if barstate.isconfirmed and canEnter
 
     bool noSameLong  = na(t.setupBar) or t.setupDir != 1
     bool noSameShort = na(t.setupBar) or t.setupDir != -1
@@ -568,15 +596,21 @@ if t.setupDir == 1
 else if t.setupDir == -1
     zReclaim := t.setupMode == 2 ? zCrossUnderPosShock : zCrossUnderPosRange
 
-bool bandOK = false
+// requireBandReclaim 不再重复检查 z 的同一条边界。它要求价格残差相对
+// 前一根 K 线向均值收敛; requireCandleConfirm 则只检查原始收盘价方向,
+// 两个开关因此分别控制不同的确认逻辑。
+bool priceBandReclaim = false
 
 if t.setupDir == 1
-    bandOK := not requireBandReclaim or close > mean15 - entryZ * safeStd
+    priceBandReclaim := residual > residual[1]
 else if t.setupDir == -1
-    bandOK := not requireBandReclaim or close < mean15 + entryZ * safeStd
+    priceBandReclaim := residual < residual[1]
 
-bool longEntrySignal = barstate.isconfirmed and t.pos == 0 and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
-bool shortEntrySignal = barstate.isconfirmed and t.pos == 0 and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+bool bandOK = not requireBandReclaim or priceBandReclaim
+
+bool flatForEntry = strategy.position_size == 0.0 and t.pos == 0 and t.pendingDir == 0
+bool longEntrySignal = barstate.isconfirmed and flatForEntry and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+bool shortEntrySignal = barstate.isconfirmed and flatForEntry and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
 
 
 // ============================================================================
@@ -593,40 +627,55 @@ f_activeStop(int dir) =>
 
 
 // ============================================================================
-// Enter (方向参数化,dir = +1 多 / -1 空)
+// Alert / cost helpers
 // ============================================================================
 
+// TradingView Strategy Tester 的 commission/slippage 是 strategy() 的
+// 编译期属性,不能由 input 动态改写。这里的估算只服务于 T减后的 BE 价格;
+// 正式净利润、胜率与回撤全部读取 strategy.*。
+f_roundTripCost(float price) =>
+    float commissionCost = price * (2.0 * commissionBps) / 10000.0
+    float slippageCost = 2.0 * slippageTicks * syminfo.mintick
+    commissionCost + slippageCost
+
+f_modeName(int mode) =>
+    mode == 2 ? "Shock" : "Range"
+
+f_directionName(int dir) =>
+    dir == 1 ? "Long" : "Short"
+
+f_orderMessage(int dir, string eventName, int mode, float price) =>
+    "MR-T|direction=" + f_directionName(dir) + "|event=" + eventName + "|mode=" + f_modeName(mode) + "|price=" + str.tostring(price, format.mintick)
+
+f_exitName(int reason) =>
+    reason == R_FINAL ? "Final Exit" : reason == R_TREND ? "Trend Fail" : reason == R_TIME ? "Timeout" : reason == R_BE ? "Breakeven" : "Stop"
+
+f_recentExitPrice(float fallback) =>
+    float exitPrice = fallback
+
+    if strategy.closedtrades > 0
+        int lastTrade = strategy.closedtrades - 1
+
+        if strategy.closedtrades.exit_bar_index(lastTrade) == bar_index
+            exitPrice := strategy.closedtrades.exit_price(lastTrade)
+
+    exitPrice
+
+
+// ============================================================================
+// Entry lifecycle
+// ============================================================================
+// 信号 bar 只提交市场订单并冻结信号上下文。订单在下一可成交时点成交后,
+// 才用 strategy.position_avg_price 初始化实际交易;目标/止损因此不再把 close
+// 当作成交价的唯一事实来源。
+
 f_enter(int dir) =>
-    t.pos := dir
-    t.partialTaken := false
-    t.entryPrice := close
-    t.mean := mean15
-    t.std := safeStd
-    t.atr := safeATR
-    t.entryBar := bar_index
-
-    bool shock = t.setupMode == 2
-    t.tradeMode := shock ? 2 : 1
-
-    float pz = shock ? shockPartialZ : rangePartialZ
-    float ez = shock ? shockExitZ : rangeExitZ
-
-    // 目标价统一表达为 mean - dir * Z * std
-    t.partialTarget := t.mean - dir * pz * t.std
-    t.finalTarget   := t.mean - dir * ez * t.std
-
-    float atrStop   = t.entryPrice - dir * hardStopATR * t.atr
-    float statStop  = t.mean - dir * stopZ * t.std
-    float tightStop = dir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
-    float looseStop = dir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
-    float balStop   = looseStop + (tightStop - looseStop) * balancedWeight
-
-    if stopMode == "Tight"
-        t.baseStop := tightStop
-    else if stopMode == "Loose"
-        t.baseStop := looseStop
-    else
-        t.baseStop := balStop
+    t.pendingDir := dir
+    t.pendingMode := t.setupMode
+    t.pendingBar := bar_index
+    t.pendingMean := mean15
+    t.pendingStd := safeStd
+    t.pendingAtr := safeATR
 
     float rawTimeStop = fallbackTimeStopBars
 
@@ -635,40 +684,106 @@ f_enter(int dir) =>
 
     float limitedTimeStop = math.max(minTimeStopBars, rawTimeStop)
     limitedTimeStop := math.min(maxTimeStopBars, limitedTimeStop)
-
-    t.timeStop := int(math.round(limitedTimeStop))
-
-    // 往返成本(价格单位),用于保本偏移与 P&L 结算
-    t.cost := t.entryPrice * (2.0 * costBps) / 10000.0
+    t.pendingTimeStop := int(math.round(limitedTimeStop))
 
     t.setupBar := na
     t.setupDir := 0
     t.setupMode := 0
 
+f_initializeTrade(int dir) =>
+    float filledPrice = strategy.position_avg_price
+
+    t.pos := dir
+    t.partialTaken := false
+    t.partialBar := na
+    t.entryBar := bar_index
+    t.entryPrice := filledPrice
+    t.entrySize := math.abs(strategy.position_size)
+    t.mean := t.pendingMean
+    t.std := t.pendingStd
+    t.atr := t.pendingAtr
+    t.tradeMode := t.pendingMode
+    t.timeStop := t.pendingTimeStop
+
+    float pz = t.tradeMode == 2 ? shockPartialZ : rangePartialZ
+    float ez = t.tradeMode == 2 ? shockExitZ : rangeExitZ
+
+    // 目标价统一表达为 mean - dir * Z * std,并在真实 Entry 建立后冻结。
+    t.partialTarget := t.mean - dir * pz * t.std
+    t.finalTarget := t.mean - dir * ez * t.std
+
+    float atrStop = t.entryPrice - dir * hardStopATR * t.atr
+    float statStop = t.mean - dir * stopZ * t.std
+    float tightStop = dir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
+    float looseStop = dir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
+    float balStop = looseStop + (tightStop - looseStop) * balancedWeight
+
+    if stopMode == "Tight"
+        t.baseStop := tightStop
+    else if stopMode == "Loose"
+        t.baseStop := looseStop
+    else
+        t.baseStop := balStop
+
+    t.cost := f_roundTripCost(t.entryPrice)
+    t.netProfitAtEntry := strategy.netprofit
+    t.exitReasonPending := 0
+    t.exitRequested := false
+    t.marketClosePlaced := false
+
+    if t.tradeMode == 1
+        t.rangeTrades += 1
+    else
+        t.shockTrades += 1
+
+    t.pendingDir := 0
+    t.pendingMode := 0
+    t.pendingBar := na
+    t.pendingMean := na
+    t.pendingStd := na
+    t.pendingAtr := na
+    t.pendingTimeStop := na
+
     t.eventKind := 1
     t.eventDir := dir
+    t.eventMode := t.tradeMode
+    t.eventPrice := t.entryPrice
 
+f_markPartial(int dir) =>
+    t.partialTaken := true
+    t.partialBar := bar_index
+    t.eventKind := 2
+    t.eventDir := dir
+    t.eventMode := t.tradeMode
+    t.eventPrice := f_recentExitPrice(t.partialTarget)
 
-// ============================================================================
-// Exit (方向参数化;结算虚拟 P&L,扣除往返成本)
-// ============================================================================
+f_reasonFromExitId(string exitId) =>
+    int reason = R_STOP
+
+    if exitId == "MR-L-FINAL" or exitId == "MR-S-FINAL"
+        reason := R_FINAL
+
+    reason
 
 f_exit(int dir, int reason) =>
-    float rawPnl = (close - t.entryPrice) * dir
-    float costVal = t.entryPrice * (2.0 * costBps) / 10000.0
-    float pnlNet = rawPnl - costVal
+    int finishedMode = t.tradeMode
+    float tradeNetProfit = na(t.netProfitAtEntry) ? 0.0 : strategy.netprofit - t.netProfitAtEntry
+    bool winningTrade = tradeNetProfit > 0.0
+    float finishedPrice = f_recentExitPrice(close)
 
-    t.lastPnlATR := pnlNet / t.atr
-    t.lastPnlPct := pnlNet / t.entryPrice * 100.0
-    t.sumPnlATR += t.lastPnlATR
-    t.tradeCount += 1
+    if finishedMode == 1 and winningTrade
+        t.rangeWins += 1
+    else if finishedMode == 2 and winningTrade
+        t.shockWins += 1
 
     t.lastExitBar := bar_index
     t.pos := 0
     t.partialTaken := false
+    t.partialBar := na
 
     t.entryBar := na
     t.entryPrice := na
+    t.entrySize := na
     t.mean := na
     t.std := na
     t.atr := na
@@ -678,6 +793,10 @@ f_exit(int dir, int reason) =>
     t.timeStop := na
     t.tradeMode := 0
     t.cost := 0.0
+    t.netProfitAtEntry := na
+    t.exitReasonPending := 0
+    t.exitRequested := false
+    t.marketClosePlaced := false
 
     t.setupBar := na
     t.setupDir := 0
@@ -686,62 +805,128 @@ f_exit(int dir, int reason) =>
     t.eventKind := 3
     t.eventDir := dir
     t.eventReason := reason
+    t.eventMode := finishedMode
+    t.eventPrice := finishedPrice
 
 
 // ============================================================================
 // Manage (方向参数化)
 // ============================================================================
-// 退出优先级:止损 → 趋势失效 → 超时 → T减 → T平。
-// 关键修复:T平(T final)以「先 T减」为前提,同根 K 线同时触达 T减/T平时,
-// 先记 T减,下一根才允许 T平 —— 生命周期不再跳级。
+// 价格目标与止损由同一 OCA reduce 组的 strategy.order 作为真实订单维护。Trend Fail / Timeout
+// 使用 strategy.close 市价退出;退出优先级仍为风险线 → 趋势失效 → 超时,
+// 而 T平只在实际 T减成交并进入第二阶段后提交。
 
 f_manage(int dir) =>
-    bool canManage = t.pos == dir and not na(t.entryBar) and bar_index > t.entryBar
+    bool canManage = t.pos == dir and strategy.position_size * dir > 0.0 and not na(t.entryBar) and bar_index > t.entryBar
 
-    if barstate.isconfirmed and canManage
-        float activeStop = f_activeStop(dir)
-
-        bool stopHit = not na(activeStop) and (dir == 1 ? close <= activeStop : close >= activeStop)
+    if barstate.isconfirmed and canManage and not t.exitRequested
         bool trendFailed = dir * htfSlopeATR <= -vetoHtfSlope or dir * localSlopeATR <= -vetoLocalSlope
         bool timeFailed = not na(t.timeStop) and (bar_index - t.entryBar) >= t.timeStop
-        bool partialReached = not t.partialTaken and not na(t.partialTarget) and (dir == 1 ? close >= t.partialTarget : close <= t.partialTarget)
-        bool finalReached = t.partialTaken and not na(t.finalTarget) and (dir == 1 ? close >= t.finalTarget : close <= t.finalTarget)
 
-        if stopHit
-            // T减后且启用保本 → 保本退出;否则统计/硬止损退出
-            bool isBE = t.partialTaken and moveStopToBE
-
-            if isBE
-                f_exit(dir, R_BE)
-            else
-                f_exit(dir, R_STOP)
-
-        else if trendFailed
-            f_exit(dir, R_TREND)
-
+        if trendFailed
+            t.exitRequested := true
+            t.exitReasonPending := R_TREND
         else if timeFailed
-            f_exit(dir, R_TIME)
-
-        else if partialReached
-            t.partialTaken := true
-            t.eventKind := 2
-            t.eventDir := dir
-
-        else if finalReached
-            f_exit(dir, R_FINAL)
+            t.exitRequested := true
+            t.exitReasonPending := R_TIME
 
 
 // ============================================================================
-// 执行入口 / 管理
+// 执行入口 / 状态同步 / 订单管理
 // ============================================================================
 
 if longEntrySignal
     f_enter(1)
+    strategy.entry("MR-L", strategy.long, alert_message = f_orderMessage(1, "Long Entry", t.pendingMode, close))
+    alert(f_orderMessage(1, "Long Entry", t.pendingMode, close), alert.freq_all)
 else if shortEntrySignal
     f_enter(-1)
+    strategy.entry("MR-S", strategy.short, alert_message = f_orderMessage(-1, "Short Entry", t.pendingMode, close))
+    alert(f_orderMessage(-1, "Short Entry", t.pendingMode, close), alert.freq_all)
+
+// 市场订单在下一可成交时点建立后,同步 Strategy Tester 的真实持仓。
+bool positionFilled = t.pendingDir != 0 and strategy.position_size * t.pendingDir > 0.0 and not na(strategy.position_avg_price)
+
+if positionFilled
+    f_initializeTrade(t.pendingDir)
+
+// 只有真实仓位数量减少后才标记 T减,因此 partialTaken 不再由 close 触碰目标线
+// 虚拟设置;策略订单的实际成交是这一状态的唯一来源。
+bool partialFilled = t.pos != 0 and strategy.position_size * t.pos > 0.0 and not t.partialTaken and not na(t.entrySize) and math.abs(strategy.position_size) < t.entrySize
+
+if partialFilled
+    f_markPartial(t.pos)
 
 f_manage(1)
 f_manage(-1)
+
+// Trend Fail / Timeout 取消剩余价格单后提交对应的市价平仓单。
+if t.pos == 1 and strategy.position_size > 0.0 and t.exitRequested and not t.marketClosePlaced
+    strategy.cancel("MR-L-TRIM")
+    strategy.cancel("MR-L-FINAL")
+    strategy.cancel("MR-L-STOP")
+    string longCloseEvent = t.exitReasonPending == R_TREND ? "Trend Fail" : "Timeout"
+    strategy.close("MR-L", comment = longCloseEvent, alert_message = f_orderMessage(1, longCloseEvent, t.tradeMode, close))
+    t.marketClosePlaced := true
+
+if t.pos == -1 and strategy.position_size < 0.0 and t.exitRequested and not t.marketClosePlaced
+    strategy.cancel("MR-S-TRIM")
+    strategy.cancel("MR-S-FINAL")
+    strategy.cancel("MR-S-STOP")
+    string shortCloseEvent = t.exitReasonPending == R_TREND ? "Trend Fail" : "Timeout"
+    strategy.close("MR-S", comment = shortCloseEvent, alert_message = f_orderMessage(-1, shortCloseEvent, t.tradeMode, close))
+    t.marketClosePlaced := true
+
+// 价格型订单使用冻结的 partial/final/risk levels。T减前只提交第一目标与全仓
+// 风险线;T减实际成交后,取消第一目标,下一根 K 线才提交 T平剩余仓位。
+if t.pos == 1 and strategy.position_size > 0.0 and not t.exitRequested
+    float longRisk = f_activeStop(1)
+    float longExitQty = t.partialTaken ? math.abs(strategy.position_size) : t.entrySize
+    string longStopEvent = t.partialTaken and moveStopToBE ? "Breakeven" : "Stop"
+    strategy.order("MR-L-STOP", strategy.short, stop = longRisk, qty = longExitQty, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, longStopEvent, t.tradeMode, longRisk))
+
+    if not t.partialTaken
+        strategy.cancel("MR-L-FINAL")
+        strategy.order("MR-L-TRIM", strategy.short, limit = t.partialTarget, qty = t.entrySize * trimPct / 100.0, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Trim", t.tradeMode, t.partialTarget))
+    else
+        strategy.cancel("MR-L-TRIM")
+
+        if bar_index > t.partialBar
+            strategy.order("MR-L-FINAL", strategy.short, limit = t.finalTarget, qty = math.abs(strategy.position_size), oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Final Exit", t.tradeMode, t.finalTarget))
+        else
+            strategy.cancel("MR-L-FINAL")
+
+if t.pos == -1 and strategy.position_size < 0.0 and not t.exitRequested
+    float shortRisk = f_activeStop(-1)
+    float shortExitQty = t.partialTaken ? math.abs(strategy.position_size) : t.entrySize
+    string shortStopEvent = t.partialTaken and moveStopToBE ? "Breakeven" : "Stop"
+    strategy.order("MR-S-STOP", strategy.long, stop = shortRisk, qty = shortExitQty, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, shortStopEvent, t.tradeMode, shortRisk))
+
+    if not t.partialTaken
+        strategy.cancel("MR-S-FINAL")
+        strategy.order("MR-S-TRIM", strategy.long, limit = t.partialTarget, qty = t.entrySize * trimPct / 100.0, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Trim", t.tradeMode, t.partialTarget))
+    else
+        strategy.cancel("MR-S-TRIM")
+
+        if bar_index > t.partialBar
+            strategy.order("MR-S-FINAL", strategy.long, limit = t.finalTarget, qty = math.abs(strategy.position_size), oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Final Exit", t.tradeMode, t.finalTarget))
+        else
+            strategy.cancel("MR-S-FINAL")
+
+// 识别真实持仓归零,再 reset MRState。这样 Strategy Tester 的订单生命周期
+// 与图表状态不会因“信号触发”而提前脱钩。
+bool positionClosed = t.pos != 0 and strategy.position_size == 0.0
+
+if positionClosed
+    int actualReason = t.exitReasonPending
+
+    if actualReason == 0 and strategy.closedtrades > 0
+        actualReason := f_reasonFromExitId(strategy.closedtrades.exit_id(strategy.closedtrades - 1))
+
+    if actualReason == R_STOP and t.partialTaken and moveStopToBE
+        actualReason := R_BE
+
+    f_exit(t.pos, actualReason)
 
 // 派生一次性显示事件(全局作用域写全局变量是允许的)
 entryEvent := t.eventKind == 1
@@ -751,6 +936,8 @@ partialEventDir := t.eventDir
 exitEvent := t.eventKind == 3
 exitEventDir := t.eventDir
 exitReason := t.eventReason
+int eventMode = t.eventMode
+float eventPrice = t.eventPrice
 
 
 // ============================================================================
@@ -899,14 +1086,17 @@ plot(localER, "15m ER", display = display.data_window)
 plot(htfER, "1H ER", display = display.data_window)
 plot(localSlopeATR, "15m Slope", display = display.data_window)
 plot(htfSlopeATR, "1H Slope", display = display.data_window)
-plot(t.sumPnlATR, "Cum P&L (ATR)", display = display.data_window)
+plot(strategy.netprofit, "Strategy Tester Net P&L", display = display.data_window)
+plot(strategy.position_avg_price, "Strategy Position Avg Price", display = display.data_window)
+plot(t.rangeTrades, "Range Trades", display = display.data_window)
+plot(t.shockTrades, "Shock Trades", display = display.data_window)
 
 
 // ============================================================================
 // Panel
 // ============================================================================
 
-var table panel = table.new(position.top_right, 2, 12, border_width = 1)
+var table panel = table.new(position.top_right, 2, 17, border_width = 1)
 
 if showPanel and barstate.islast
 
@@ -920,7 +1110,7 @@ if showPanel and barstate.islast
         envText := "Shock Only"
         envColor := color.purple
 
-    string stateText = t.pos == 1 ? f_tr("T多", "Long") : t.pos == -1 ? f_tr("T空", "Short") : f_tr("空仓", "Flat")
+    string stateText = t.pos == 1 ? f_tr("T多", "Long") : t.pos == -1 ? f_tr("T空", "Short") : t.pendingDir == 1 ? f_tr("待多头成交", "Pending Long") : t.pendingDir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("空仓", "Flat")
 
     string setupText = f_tr("无", "None")
 
@@ -936,11 +1126,21 @@ if showPanel and barstate.islast
     string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
     string shockText = str.tostring(shockMove, "#.00") + " ATR"
     string scoreText = str.tostring(regimeScore, "#")
-    string modeText = t.pos == 0 ? "-" : t.tradeMode == 2 ? "Shock" : "Range"
+    string modeText = t.pos != 0 ? f_modeName(t.tradeMode) : t.pendingDir != 0 ? f_modeName(t.pendingMode) : "-"
     string stopText = stopMode
-
-    string pnlText = na(t.lastPnlATR) ? "-" : str.tostring(t.lastPnlATR, "#.00") + " ATR / " + str.tostring(t.lastPnlPct, "#.00") + "%"
-    string cumText = str.tostring(t.sumPnlATR, "#.00") + " ATR (" + str.tostring(t.tradeCount, "#") + f_tr("笔", " trades") + ")"
+    string phaseText = t.pos == 0 ? t.pendingDir != 0 ? f_tr("等待成交", "Entry pending") : "-" : t.partialTaken ? f_tr("T减后", "Final phase") : f_tr("等待T减", "Trim phase")
+    string entryText = t.pos == 0 ? "-" : str.tostring(t.entryPrice, format.mintick)
+    string trimText = t.pos == 0 ? "-" : str.tostring(t.partialTarget, format.mintick)
+    string finalText = t.pos == 0 ? "-" : str.tostring(t.finalTarget, format.mintick)
+    string riskText = t.pos == 0 ? "-" : str.tostring(f_activeStop(t.pos), format.mintick)
+    float testerProfitFactor = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    string testerPLText = str.tostring(strategy.netprofit, format.mintick) + " / DD " + str.tostring(strategy.max_drawdown, format.mintick) + " / PF " + (na(testerProfitFactor) ? "-" : str.tostring(testerProfitFactor, "#.00"))
+    float testerWinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
+    string testerTradeText = str.tostring(strategy.closedtrades, "#") + " / " + (na(testerWinRate) ? "-" : str.tostring(testerWinRate, "#.0") + "%")
+    float rangeWinRate = t.rangeTrades > 0 ? t.rangeWins / t.rangeTrades * 100.0 : na
+    float shockWinRate = t.shockTrades > 0 ? t.shockWins / t.shockTrades * 100.0 : na
+    string rangeStatsText = str.tostring(t.rangeTrades, "#") + " / " + str.tostring(t.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
+    string shockStatsText = str.tostring(t.shockTrades, "#") + " / " + str.tostring(t.shockWins, "#") + " (" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
 
     table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
     table.cell(panel, 1, 0, "15m")
@@ -969,31 +1169,51 @@ if showPanel and barstate.islast
     table.cell(panel, 0, 8, f_tr("模式", "Mode"))
     table.cell(panel, 1, 8, modeText)
 
-    table.cell(panel, 0, 9, "Stop")
-    table.cell(panel, 1, 9, stopText)
+    table.cell(panel, 0, 9, f_tr("阶段", "Phase"))
+    table.cell(panel, 1, 9, phaseText)
 
-    table.cell(panel, 0, 10, f_tr("本笔P&L", "Last P&L"))
-    table.cell(panel, 1, 10, pnlText)
+    table.cell(panel, 0, 10, f_tr("成交均价", "Entry avg"))
+    table.cell(panel, 1, 10, entryText)
 
-    table.cell(panel, 0, 11, f_tr("累计P&L", "Cum P&L"))
-    table.cell(panel, 1, 11, cumText)
+    table.cell(panel, 0, 11, f_tr("T减 / T平", "Trim / Final"))
+    table.cell(panel, 1, 11, trimText + " / " + finalText)
+
+    table.cell(panel, 0, 12, "Risk")
+    table.cell(panel, 1, 12, riskText + " (" + stopText + ")")
+
+    table.cell(panel, 0, 13, f_tr("Tester 净利/回撤/PF", "Tester P&L/DD/PF"))
+    table.cell(panel, 1, 13, testerPLText)
+
+    table.cell(panel, 0, 14, f_tr("Tester 交易 / 胜率", "Tester trades / win"))
+    table.cell(panel, 1, 14, testerTradeText)
+
+    table.cell(panel, 0, 15, "Range trades / wins")
+    table.cell(panel, 1, 15, rangeStatsText)
+
+    table.cell(panel, 0, 16, "Shock trades / wins")
+    table.cell(panel, 1, 16, shockStatsText)
 
 
 if not showPanel and barstate.islast
-    table.clear(panel, 0, 0, 1, 11)
+    table.clear(panel, 0, 0, 1, 16)
 
 
 // ============================================================================
 // Alerts
 // ============================================================================
 
-alertcondition(setupEvent and setupEventMode == 1, "MR-T Range观察 / Range obs", "Mean Reversion T: Range模式出现均值偏离 / mean deviation in Range mode")
-alertcondition(setupEvent and setupEventMode == 2, "MR-T Shock观察 / Shock obs", "Mean Reversion T: 出现异常价格冲击并开始减速 / abnormal shock with deceleration")
-alertcondition(entryEvent and entryEventDir == 1, "MR-T T买 / T Long", "Mean Reversion T: 出现T买确认 / long entry confirmed")
-alertcondition(entryEvent and entryEventDir == -1, "MR-T T空 / T Short", "Mean Reversion T: 出现T空确认 / short entry confirmed")
-alertcondition(partialEvent, "MR-T T减 / T Trim", "Mean Reversion T: 完成第一阶段回归 / first-stage reversion done")
-alertcondition(exitEvent and exitReason == R_FINAL, "MR-T T平 / T Close", "Mean Reversion T: 主要均值回归完成 / main reversion complete")
-alertcondition(exitEvent and exitReason == R_STOP, "MR-T T止损 / T Stop", "Mean Reversion T: 触发风险线 / risk line hit")
-alertcondition(exitEvent and exitReason == R_TREND, "MR-T 趋势失效 / Trend fail", "Mean Reversion T: 市场已发展为趋势环境 / market turned trending")
-alertcondition(exitEvent and exitReason == R_TIME, "MR-T T超时 / T Timeout", "Mean Reversion T: 回归时间超过预期 / reversion timed out")
-alertcondition(exitEvent and exitReason == R_BE, "MR-T T保本 / T BE", "Mean Reversion T: 第一目标后触发保本保护 / BE protection after first target")
+if setupEvent
+    string setupEventName = setupEventMode == 2 ? "Shock Setup" : "Range Setup"
+    alert(f_orderMessage(setupEventDir, setupEventName, setupEventMode, close), alert.freq_all)
+
+if entryEvent
+    alert(f_orderMessage(entryEventDir, "Entry Fill", eventMode, eventPrice), alert.freq_all)
+
+if partialEvent
+    alert(f_orderMessage(partialEventDir, "Trim", eventMode, eventPrice), alert.freq_all)
+
+    if moveStopToBE
+        alert(f_orderMessage(partialEventDir, "Breakeven Armed", eventMode, eventPrice), alert.freq_all)
+
+if exitEvent
+    alert(f_orderMessage(exitEventDir, f_exitName(exitReason), eventMode, eventPrice), alert.freq_all)

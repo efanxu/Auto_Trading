@@ -2,11 +2,11 @@
 
 English · [简体中文](README.zh-CN.md)
 
-一个**生产级的均值回归"做T"信号指标**,运行于 TradingView,Pine Script v6 编写。面向 **15 分钟图**与 **A 股 T+0 日内做T**。防重绘。运行时界面中英双语。
+一个**生产级的均值回归"做T"策略**,运行于 TradingView,用 Pine Script v6 编写。MR-T v3 已从信号指标升级为可直接回测的 `strategy()`,使用真实 Strategy Tester 订单。面向 **15 分钟图**与 **A 股 T+0 日内做T**。信号逻辑防重绘,运行时界面中英双语。
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.0-informational)](CHANGELOG.md)
 
 ---
 
@@ -18,7 +18,7 @@ English · [简体中文](README.zh-CN.md)
 - 存在**硬趋势**时拒绝进场(斜率 + 效率比率双重否决)。
 - 区分**温和漂移**(Range 引擎)与**正在衰竭的异常冲击**(Shock 引擎)。
 - 用 **Ornstein-Uhlenbeck 半衰期**估计每笔交易的合理时长,长时间走不出结果就按时间止损,不任其流血。
-- 跟踪**扣除成本后的虚拟盈亏**,让"保本"真正意味着扣掉手续费和滑点后的保本。
+- 向 TradingView Broker Emulator 发送**真实策略订单**:T减平掉可配置比例,T平管理剩余仓位。
 
 ## 特性
 
@@ -27,8 +27,10 @@ English · [简体中文](README.zh-CN.md)
 | 双引擎 | Range 回归(温和 Z 偏离)+ Shock 反转(异常冲击 + 减速/拒绝) |
 | 硬趋势否决 | 1H 与 15m 的斜率 + 效率比率守卫,拒绝趋势环境 |
 | 半衰期计时 | OU 过程半衰期估计回归应耗时多久;无法估计时退化为固定值 |
-| 成本感知盈亏 | 面板显示单笔/累计虚拟 P&L,已扣除往返成本 |
-| 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;警报消息与输入项标签为双语静态(Pine 把它们钉死在编译期 `const string`) |
+| Strategy Tester | 真实 `strategy.entry`、OCA 价格退出与 `strategy.close` 市价退出;正式 P&L 来自 Strategy Tester |
+| 真实分批退出 | `trimPct` 控制 T减比例(默认 50%);T平退出剩余仓位 |
+| 成本感知保本 | Strategy Tester 手续费/滑点是正式成本来源;匹配输入用于计算 T减后的保本位 |
+| 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;输入项标签是编译期静态文本,策略警报使用结构化动态消息 |
 | 防重绘 | 信号门控于已确认 K 线;高周期数据取上一根已确认的 1H bar;目标价进场时冻结 |
 | 版本化 | 语义化版本(见 `CHANGELOG.md`),版本号显示在面板 |
 
@@ -56,7 +58,7 @@ flowchart TD
 
 ### 生命周期(每笔)
 
-`观察` → `T买 / T空` → `T减`(部分了结,止损上移保本)→ `T平`(完全回归)。
+`观察` → `T买 / T空` → `T减`(真实部分退出,剩余止损上移保本)→ `T平`(退出剩余仓位,完全回归)。
 异常退出:`T止损`(统计或 ATR 风险线)、`趋势失效`(市场转为趋势)、`T超时`(超过半衰期)、`T保本`(首目标后触发)。
 
 ---
@@ -73,16 +75,24 @@ flowchart TD
 1. 打开 TradingView Pine 编辑器,粘贴 [`MRT.pine`](MRT.pine) 内容,*添加到图表*。
 2. 或 clone 本仓库,用编辑器打开 `MRT.pine`。
 
-> 它是 **indicator**,不是 strategy —— 不会下单。请用它的警报辅助你自己的决策。
+> MR-T v3 是 **strategy**,不是 indicator —— 会维护单方向仓位并可在 Strategy Tester 中回测。
 
 ---
 
 ## 使用
 
 - **市场**:主要用于 A 股 T+0 日内做T,15 分钟周期。换品种 / 周期前必须**重新评估全部参数**。
-- **语言**:将 *⑫ 语言与版本 → 语言* 设为 `zh` 或 `en`,切换面板、图表标签与报错。警报消息与输入项*标签*为双语静态文本(Pine 限制,见 *局限*)。
-- **成本**:将 *⑩ 风险控制 → 每边成本(bp)* 设为你真实的往返成本(佣金 + 滑点 + 印花税,按每边)。默认 `3.0 bp/边` 是保守估计;仅影响虚拟盈亏与保本偏移。
-- **警报**:内置 10 个 `MR-T ...` 警报条件——在警报面板新建并选择对应条件即可。
+- **语言**:将 *⑫ 语言与版本 → 语言* 设为 `zh` 或 `en`,切换面板、图表标签与报错。输入项*标签*为双语静态文本(Pine 限制),策略警报使用结构化动态文本(见 *局限*)。
+- **成本**:将 `commissionBps` 与 `slippageTicks` 设为和 Strategy Tester **Properties** 一致。代码默认每边手续费 `3.0 bp`、滑点 `0` tick,`strategy()` 中的默认值也相同;输入用于 T减后的保本估算。
+- **警报**:使用 `Any alert() function call` 接收观察/成交生命周期消息,或使用 `Order fills only` 配合 `{{strategy.order.alert_message}}` 接收可执行订单事件。消息包含 `MR-T`、方向、事件、模式与价格。
+
+### 回测流程
+
+1. 将 `MRT.pine` 添加到 **15m** 图表。脚本会拒绝其它图表周期。
+2. 打开 **Strategy Tester -> Properties**,确认手续费为每笔订单 `0.03%`(3 bp),滑点为 `0` tick;若修改,同步修改代码输入。
+3. 确认 `Pyramiding` 为 `0`,并在 Properties 选择默认订单大小。脚本默认单仓位使用 100% equity。
+4. 检查策略成交标记:已确认信号后下一可成交时点入场;T减按 `trimPct` 减少仓位;T平退出剩余仓位。
+5. 用图表上的 Risk/T减/T平线与面板中的 Tester 行检查状态。Strategy Tester 中的净利润、胜率、回撤、Profit Factor 和交易数量才是正式结果。
 
 ---
 
@@ -167,8 +177,9 @@ flowchart TD
 | `rangeSetupBars` | int | 16 | Range Setup 有效 K 数 |
 | `shockSetupBars` | int | 8 | Shock Setup 有效 K 数 |
 | `requireCandleConfirm` | bool | true | 要求 K 线方向确认 |
-| `requireBandReclaim` | bool | true | 要求价格重新进入 Z 区间 |
+| `requireBandReclaim` | bool | true | 除 Z reclaim 外,要求价格残差继续向均值移动 |
 | `cooldownBars` | int | 3 | 退出后冷却 K 数 |
+| `trimPct` | float | 50 | T减时退出的初始仓位比例 |
 
 ### ⑩ 风险控制
 | 输入 | 类型 | 默认 | 含义 |
@@ -178,7 +189,8 @@ flowchart TD
 | `stopMode` | string | Balanced | `Tight` / `Balanced` / `Loose` 止损模式 |
 | `balancedWeight` | float | 0.50 | 统计止损与 ATR 止损的权重(0=宽松,1=收紧) |
 | `moveStopToBE` | bool | true | T减后启用保本 |
-| `costBps` | float | 3.0 | 每边往返成本(bp)——影响盈亏与保本偏移 |
+| `commissionBps` | float | 3.0 | 每边手续费(bp),需与 Strategy Tester Properties 一致 |
+| `slippageTicks` | int | 0 | 每边滑点(ticks),需与 Strategy Tester Properties 一致 |
 
 ### ⑪ 显示 / ⑫ 语言
 | 输入 | 类型 | 默认 | 含义 |
@@ -192,34 +204,30 @@ flowchart TD
 
 ---
 
-## 成本模型与盈亏面板
+## 成本模型与 Strategy Tester 面板
 
-面板(右上角)显示最近一笔已平仓交易与累计:
+Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 T减后的保本估算使用相同假设。
 
-- **本笔 P&L** —— 最近一笔交易的净盈亏,以 `ATR` 和 `%` 表示,已扣除 `2 × costBps` 往返成本。
-- **累计 P&L** —— 累计净盈亏(ATR)与已平虚拟交易笔数。
+启用 `moveStopToBE` 后,真实 T减成交后剩余仓位的止损移动到 `entry +/- transaction cost`。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值,不再使用旧的虚拟 P&L 计数器。Range/Shock 次数是轻量辅助分类;每笔完整仓位结束时,根据 Strategy Tester 净利润变化判断是否盈利。
 
-T减后的保本位放在 `entry ± 往返成本`,因此"T保本"是真正扣掉成本后的打平。
-
-**模型的诚实局限:**
-
-- 退出按**收盘价**判定,不是盘中触发——真实止损可能在单根 K 线内被击穿又收回;本指标按收盘报告。
-- 盈亏按**全额仓位**从入场到出场计算,忽略了 T减这一步的仓位权重。
-- 成本是固定 bp 估算,真实成交会有出入。把面板当作 sanity 信号,不是记账系统。
+Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于请求价的价格成交,Trend Fail/Timeout 的市价单在下一可成交时点执行。
 
 ---
 
 ## 防重绘
 
-- 所有信号 / 事件写入都门控于 `barstate.isconfirmed`。
+- Setup 与入场决策门控于 `barstate.isconfirmed`;成交 / 退出事件只在策略真实状态变化时发出。
 - 高周期数据取**上一根已确认的 1H bar**(`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`)——无未来数据泄漏。
-- 目标价 / 止损**进场时冻结**(`MRState` 中的交易上下文)。
+- 已确认信号 bar 先排队订单;成交后从真实 `strategy.position_avg_price` 与信号 bar 环境上下文冻结目标 / 止损。
 - 半衰期估计只用历史数据。
+
+策略启用 `calc_on_order_fills = true`,让 Broker Emulator 提供真实成交均价后立即挂出第一组保护性价格订单。历史结果仍应结合 Strategy Tester 的成交假设与 Bar Magnifier 设置检查。
 
 ## 局限与边界
 
 - **硬编码 15 分钟契约。** 脚本拒绝在其它周期运行。这是刻意的(窗口长度以 K 数计,且是在 15m 上调出来的);换周期必须重新调参。
-- **输入项标签与警报消息为双语静态文本。** Pine 的 input 标题与 `alertcondition` 消息是编译期 `const string`,运行时语言开关无法本地化,故以中英双语写出。面板、图表标签与报错随 `lang` 输入切换。
+- **输入项标签为双语静态文本。** Pine 的 input 标题要求编译期 `const string`,运行时语言开关无法本地化。面板、图表标签与报错随 `lang` 输入切换;策略成交消息动态包含真实成交占位符。
+- **成本有两个设置界面。** Pine 要求 `strategy()` 中的 Strategy Tester 手续费 / 滑点默认值为编译期常量。`commissionBps` 与 `slippageTicks` 用于保持 BE 计算一致,但修改输入不会自动改写 Properties。
 - **A 股 T+0 偏好。** 引擎假设针对持有仓位做日内回归。不做重调参就套到趋势性强的加密 / 外汇上,会很失望。
 - **不构成投资建议。** 不做任何明示或暗示的业绩承诺。
 

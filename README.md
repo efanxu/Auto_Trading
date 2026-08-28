@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md) · English
 
-A production-grade **mean-reversion "T" (intraday swing) signal indicator** for TradingView, written in Pine Script v6. Designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Repaint-safe. Bilingual runtime UI (中文 / English).
+A production-grade **mean-reversion "T" strategy** for TradingView, written in Pine Script v6. MR-T v3 is a directly backtestable `strategy()` with real Strategy Tester orders, designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Repaint-safe signal logic. Bilingual runtime UI (中文 / English).
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.0-informational)](CHANGELOG.md)
 
 ---
 
@@ -18,7 +18,7 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 - It refuses to enter when a **hard trend** is present (slope and efficiency-ratio vetoes).
 - It distinguishes a **gentle drift** (Range engine) from a **violent shock that is exhausting itself** (Shock engine).
 - It sizes every exit by an **Ornstein-Uhlenbeck half-life** estimate, so a trade that has gone nowhere long enough is killed on time, not left to bleed.
-- It tracks **cost-adjusted virtual P&L**, so "breakeven" actually means breakeven after fees and slippage.
+- It sends **real strategy orders** to the TradingView broker emulator: T-trim closes a configurable percentage, and T-close manages the remainder.
 
 ## Features
 
@@ -27,8 +27,10 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Dual engine | Range reversion (mild Z deviation) + Shock reversal (abnormal impulse + deceleration/rejection) |
 | Hard Trend Veto | 1H and 15m slope + efficiency-ratio guards against trend environments |
 | Half-life time stop | OU-process half-life estimates how long a reversion should take; fallback when unmeasurable |
-| Cost-aware P&L | Virtual per-trade and cumulative P&L, round-trip cost deducted, shown in the panel |
-| Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; alert messages and input labels are bilingual-static (Pine pins those to compile-time `const string`) |
+| Strategy Tester | Real `strategy.entry`, OCA price exits, and `strategy.close` market exits; formal P&L comes from Strategy Tester |
+| Partial exits | Configurable `trimPct` (default 50%) for T-trim; T-close exits the remaining position |
+| Cost-aware breakeven | Strategy Tester commission/slippage are the formal cost source; matching inputs size the post-trim breakeven estimate |
+| Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; input labels are compile-time static, while alerts use structured dynamic messages |
 | Repaint-safe | Signals gated on confirmed bars; higher-timeframe data uses the last confirmed 1H bar; trade targets are frozen at entry |
 | Versioned | Semantic versioning (see `CHANGELOG.md`), version shown in the panel |
 
@@ -56,7 +58,7 @@ flowchart TD
 
 ### Lifecycle (per trade)
 
-`Observe` -> `T-buy / T-short` -> `T-trim` (partial, moves stop to breakeven) -> `T-close` (full reversion).
+`Observe` -> `T-buy / T-short` -> `T-trim` (real partial exit, moves the remaining stop to breakeven) -> `T-close` (remaining position, full reversion).
 Abnormal exits: `T-stop` (statistical or ATR risk line), `Trend-fail` (market turned trending), `T-timeout` (half-life exceeded), `T-BE` (breakeven after the first target).
 
 ---
@@ -73,16 +75,24 @@ Abnormal exits: `T-stop` (statistical or ATR risk line), `Trend-fail` (market tu
 1. Open the Pine Editor on TradingView, paste the contents of [`MRT.pine`](MRT.pine), then *Add to chart*.
 2. Or clone this repo and open `MRT.pine` in your editor.
 
-> It is an **indicator**, not a strategy - it does not place orders. Use its alerts to inform your own decisions.
+> MR-T v3 is a **strategy**, not an indicator. It creates one-direction-at-a-time orders and can be evaluated in Strategy Tester.
 
 ---
 
 ## Usage
 
 - **Market**: primarily A-share T+0 intraday (做T) on 15m. Re-validate **all** parameters before applying to another market or timeframe.
-- **Language**: set the *Language & Version -> Language* input to `zh` or `en`. This switches the panel, chart labels, and error messages. Alert messages and input *labels* are bilingual-static — Pine pins their text to compile-time `const string` (see *Limitations*).
-- **Cost**: set *Risk Control -> Cost per side (bp)* to your real round-trip cost (commission + slippage + stamp duty, per side). Default `3.0 bp/side` is a conservative estimate; it only affects the virtual P&L and breakeven offset.
-- **Alerts**: 10 built-in alert conditions (`MR-T ...`) - create alerts from the Alerts panel and select an `MR-T` condition.
+- **Language**: set the *Language & Version -> Language* input to `zh` or `en`. This switches the panel, chart labels, and error messages. Input *labels* are bilingual-static — Pine pins their text to compile-time `const string`; alert messages use structured dynamic fields (see *Limitations*).
+- **Costs**: set `commissionBps` and `slippageTicks` to match the Strategy Tester **Properties** tab. The code defaults to `3.0 bp/side` commission and `0` ticks, which are also the defaults declared in `strategy()`; the inputs are used for the post-trim breakeven estimate.
+- **Alerts**: use `Any alert() function call` for setup/fill lifecycle messages, or `Order fills only` with `{{strategy.order.alert_message}}` for executable order events. The built-in strategy alert template also appends `{{strategy.order.price}}` as the actual fill price. Messages include `MR-T`, direction, event, mode, and price.
+
+### Backtest workflow
+
+1. Add `MRT.pine` to a **15m** chart. The script intentionally errors on other chart timeframes.
+2. Open **Strategy Tester -> Properties** and confirm commission is `0.03%` per order (3 bp) and slippage is `0` ticks, or change both the Properties values and the matching script inputs.
+3. Confirm `Pyramiding` is `0` and choose the desired default order size in Properties. The script defaults to 100% of equity for a single position.
+4. Verify the tester trade markers: entry fills on the next available tick after a confirmed signal; T-trim reduces the position by `trimPct`; T-close exits the remainder.
+5. Use the chart’s Risk/Trim/Final lines and the panel’s Tester rows for inspection. Net profit, win rate, drawdown, profit factor, and trade count in Strategy Tester are the formal results.
 
 ---
 
@@ -167,8 +177,9 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 | `rangeSetupBars` | int | 16 | Range setup validity window (bars) |
 | `shockSetupBars` | int | 8 | Shock setup validity window (bars) |
 | `requireCandleConfirm` | bool | true | Require candle direction confirmation |
-| `requireBandReclaim` | bool | true | Require price to re-enter the Z band |
+| `requireBandReclaim` | bool | true | Require residual/price movement toward the mean in addition to Z reclaim |
 | `cooldownBars` | int | 3 | Cooldown after exit |
+| `trimPct` | float | 50 | Percentage of the initial position closed at T-trim |
 
 ### 10. Risk Control
 | Input | Type | Default | Meaning |
@@ -178,7 +189,8 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 | `stopMode` | string | Balanced | `Tight` / `Balanced` / `Loose` stop selection |
 | `balancedWeight` | float | 0.50 | Weight between statistical & ATR stops (0=loose, 1=tight) |
 | `moveStopToBE` | bool | true | Move stop to breakeven after trim |
-| `costBps` | float | 3.0 | Round-trip cost per side (bp) - P&L and BE offset |
+| `commissionBps` | float | 3.0 | Commission per side in basis points; match Strategy Tester Properties |
+| `slippageTicks` | int | 0 | Slippage per side in ticks; match Strategy Tester Properties |
 
 ### 11. Display / 12. Language
 | Input | Type | Default | Meaning |
@@ -192,34 +204,30 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 
 ---
 
-## Cost model & P&L panel
+## Cost model & Strategy Tester panel
 
-The panel (right-top) reports, for the most recent closed trade and cumulatively:
+Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the post-trim breakeven estimate uses the same assumptions.
 
-- **Last P&L** - net P&L of the last trade in `ATR` units and `%`, after deducting `2 x costBps` round-trip cost.
-- **Cum P&L** - cumulative net P&L in `ATR` units and the number of closed virtual trades.
+After a real T-trim fill, the remaining stop is moved to `entry +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock counts are lightweight auxiliary classifications, with wins determined from the Strategy Tester net-profit change for each completed position.
 
-Breakeven (after a trim) is placed at `entry +/- round-trip cost`, so a "T-BE" exit is genuinely flat after costs.
-
-**Honest limitations of the model:**
-
-- Exits are evaluated on **bar close**, not intrabar - a real stop can be hit and recovered within the same bar; this indicator reports on close.
-- P&L is computed on the **full position** from entry to exit and ignores the size weighting of the trim step.
-- Costs are a flat bps estimate; real fills vary. Treat the panel as a sanity signal, not an accounting system.
+The broker emulator uses standard order handling. Price orders can fill at better or worse prices than their requested levels, and market orders from Trend Fail/Timeout fill on the next available tick.
 
 ---
 
 ## Repaint safety
 
-- All signal/event writes are gated on `barstate.isconfirmed`.
+- Setup and entry decisions are gated on `barstate.isconfirmed`; fill/exit events are emitted from actual strategy state changes.
 - Higher-timeframe values are the **last confirmed 1H bar** (`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`) - no future leak.
-- Targets/stops are **frozen at entry** (the trade context in `MRState`).
+- The confirmed signal bar queues an order; after the fill, targets/stops are **frozen from the actual `strategy.position_avg_price`** and the signal-bar regime context.
 - The half-life estimate uses only past data.
+
+The strategy uses `calc_on_order_fills = true` so it can place the first protective price orders immediately after the broker emulator exposes the actual fill average. Historical results should still be checked with the Strategy Tester’s order-fill assumptions and Bar Magnifier settings.
 
 ## Limitations & scope
 
 - **Hard-coded 15m contract.** The script refuses to run on other timeframes. This is deliberate (window lengths are in bars and were tuned on 15m); rescaling to other timeframes requires re-tuning.
-- **Input labels and alert messages are bilingual-static.** Pine input titles and `alertcondition` messages are compile-time `const string`; a runtime language toggle cannot localize them, so they ship with both languages baked in. The panel, chart labels and error messages follow the `lang` input.
+- **Input labels are bilingual-static.** Pine input titles are compile-time `const string`; a runtime language toggle cannot localize them. The panel, chart labels and error messages follow the `lang` input. Strategy order messages are dynamic and the default alert template includes the actual fill-price placeholder.
+- **Costs have two settings surfaces.** Pine requires the Strategy Tester commission/slippage defaults in `strategy()` to be compile-time values. The `commissionBps` and `slippageTicks` inputs keep BE calculations aligned, but changing them does not rewrite the Properties tab automatically.
 - **A-shares T+0 bias.** The engine assumes intraday reversion against a held position. Applying it to trending crypto/forex without re-tuning will disappoint.
 - **Not financial advice.** No performance guarantees, express or implied.
 
