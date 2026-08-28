@@ -1,0 +1,999 @@
+//@version=6
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
+// GitHub: https://github.com/Ye-Yu-Mo
+indicator("Mean Reversion T", overlay = true, max_labels_count = 500)
+
+// ============================================================================
+// Mean Reversion T (MR-T) · Production v2.0.0
+//
+// 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
+//
+// 双引擎 / Dual Engine
+//   1. Range Reversion   市场适合震荡回归 → 温和 Z 偏离即可观察
+//   2. Shock Reversal    市场不一定横盘 → 异常冲击 + 减速/拒绝 + 回归确认
+// 共同保护 / Guard        Hard Trend Veto (1H + 15m 斜率与 Efficiency Ratio)
+// 生命周期 / Lifecycle    观察 → T买/T空 → T减 → T平
+// 异常退出 / Exits        T止损 / 趋势失效 / T超时 / T保本
+//
+// 定位 / Scope: 纯 indicator,虚拟持仓,不自动交易,不构成投资建议。
+// 设计用于 A 股 T+0 日内做 T;换品种/周期前请重新评估全部参数。
+//
+// 版本 / Version: v2.0.0 —— 生产重构。变更见 CHANGELOG.md。
+// ============================================================================
+
+
+// ============================================================================
+// ⑫ 语言与版本 / ⑫ Language & Version
+// ============================================================================
+// 运行时 UI(面板 / 图表标签 / 报错)随 lang 切换中英文。
+// 注意:Pine 的 input 标题/分组、plotshape 的 text、alertcondition 的 message
+// 都是编译期 const string,无法用运行时变量切换语言:输入项标签保持中文,
+// 警报消息用双语静态文本。只有 TradingView 原生 i18n(script.i18n)能本地化
+// 这些 const 上下文,本版本刻意不依赖未经确认的 API。
+
+lang = input.string("zh", "语言 / Language", options = ["zh", "en"], group = "⑫ 语言与版本 / Language & Version")
+
+f_tr(simple string zh, simple string en) =>
+    lang == "zh" ? zh : en
+
+string SCRIPT_NAME = "MR-T"
+string SCRIPT_VERSION = "2.0.0"
+
+
+// ============================================================================
+// ① 交易方向
+// ============================================================================
+
+allowLong = input.bool(true, "允许T买", group = "① 交易方向")
+allowShort = input.bool(true, "允许T空", group = "① 交易方向")
+
+
+// ============================================================================
+// ② 均值与 Z-score
+// ============================================================================
+
+meanLen = input.int(32, "15m 局部均值 EMA", minval = 10, group = "② 均值与Z-score")
+zLen = input.int(32, "Z-score 周期", minval = 10, group = "② 均值与Z-score")
+
+rangeEntryZ = input.float(1.65, "Range模式观察 Z", minval = 1.0, step = 0.05, group = "② 均值与Z-score")
+shockEntryZ = input.float(2.00, "Shock模式观察 Z", minval = 1.2, step = 0.05, group = "② 均值与Z-score")
+
+rangePartialZ = input.float(0.80, "Range T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+rangeExitZ = input.float(0.25, "Range T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+shockPartialZ = input.float(1.00, "Shock T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+shockExitZ = input.float(0.50, "Shock T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+stopZ = input.float(3.25, "极端统计失效 Z", minval = 2.2, step = 0.25, group = "② 均值与Z-score")
+
+
+// ============================================================================
+// ③ 1H 市场状态
+// ============================================================================
+
+htfTf = input.timeframe("60", "市场状态周期", group = "③ 1H 市场状态")
+htfMeanLen = input.int(20, "1H 均值 EMA", minval = 5, group = "③ 1H 市场状态")
+htfSlopeLookback = input.int(4, "1H 斜率周期", minval = 1, group = "③ 1H 市场状态")
+
+idealHtfSlope = input.float(0.10, "1H 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "③ 1H 市场状态")
+
+htfERLen = input.int(10, "1H Efficiency Ratio 周期", minval = 3, group = "③ 1H 市场状态")
+idealHtfER = input.float(0.50, "1H 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "③ 1H 市场状态")
+
+
+// ============================================================================
+// ④ 15m 市场状态
+// ============================================================================
+
+localSlopeLookback = input.int(8, "15m 斜率周期", minval = 2, group = "④ 15m 市场状态")
+idealLocalSlope = input.float(0.12, "15m 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "④ 15m 市场状态")
+
+localERLen = input.int(16, "15m Efficiency Ratio 周期", minval = 3, group = "④ 15m 市场状态")
+idealLocalER = input.float(0.60, "15m 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "④ 15m 市场状态")
+
+
+// ============================================================================
+// ⑤ Regime Score
+// ============================================================================
+
+rangeMinScore = input.float(50.0, "Range模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+shockMinScore = input.float(45.0, "Shock模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+
+regimeSmoothLen = input.int(3, "环境分平滑周期", minval = 1, maxval = 8, group = "⑤ Regime Score")
+
+
+// ============================================================================
+// ⑥ Hard Trend Veto
+// ============================================================================
+
+vetoHtfSlope = input.float(0.18, "1H 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalSlope = input.float(0.23, "15m 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+
+vetoHtfER = input.float(0.75, "1H 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalER = input.float(0.80, "15m 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+
+
+// ============================================================================
+// ⑦ Shock Engine
+// ============================================================================
+
+shockLookback = input.int(2, "Shock 检测 K 数", minval = 1, maxval = 4, group = "⑦ Shock Engine")
+minShockATR = input.float(0.80, "最小 Shock 强度 ATR", minval = 0.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireShockDeceleration = input.bool(true, "Shock要求冲击减速", group = "⑦ Shock Engine")
+decelerationRatio = input.float(0.85, "Shock减速比例", minval = 0.30, maxval = 1.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireRejection = input.bool(true, "Shock要求拒绝/反向K线", group = "⑦ Shock Engine")
+
+minWickRatio = input.float(0.30, "最低拒绝影线比例", minval = 0.0, maxval = 0.8, step = 0.05, group = "⑦ Shock Engine")
+
+
+// ============================================================================
+// ⑧ Half-Life / Time Stop
+// ============================================================================
+
+halfLifeLookback = input.int(80, "Half-Life 样本长度", minval = 30, group = "⑧ Half-Life")
+
+timeStopMultiplier = input.float(3.0, "Time Stop = Half-Life ×", minval = 1.0, step = 0.25, group = "⑧ Half-Life")
+
+minTimeStopBars = input.int(8, "最短 Time Stop", minval = 2, group = "⑧ Half-Life")
+maxTimeStopBars = input.int(40, "最长 Time Stop", minval = 8, group = "⑧ Half-Life")
+fallbackTimeStopBars = input.int(24, "Half-Life无效时 Time Stop", minval = 4, group = "⑧ Half-Life")
+
+
+// ============================================================================
+// ⑨ Setup / Confirmation
+// ============================================================================
+
+rangeSetupBars = input.int(16, "Range Setup 有效 K 数", minval = 2, maxval = 48, group = "⑨ 入场确认")
+shockSetupBars = input.int(8, "Shock Setup 有效 K 数", minval = 2, maxval = 24, group = "⑨ 入场确认")
+
+requireCandleConfirm = input.bool(true, "要求K线方向确认", group = "⑨ 入场确认")
+requireBandReclaim = input.bool(true, "要求价格重新进入Z区间", group = "⑨ 入场确认")
+
+cooldownBars = input.int(3, "退出后冷却 K 数", minval = 0, maxval = 24, group = "⑨ 入场确认")
+
+
+// ============================================================================
+// ⑩ 风险控制
+// ============================================================================
+
+atrLen = input.int(14, "ATR 周期", minval = 1, group = "⑩ 风险控制")
+
+hardStopATR = input.float(2.50, "ATR 紧急止损", minval = 0.50, step = 0.25, group = "⑩ 风险控制")
+
+stopMode = input.string("Balanced", "止损模式", options = ["Tight", "Balanced", "Loose"], group = "⑩ 风险控制")
+
+balancedWeight = input.float(0.50, "Balanced统计止损权重", minval = 0.0, maxval = 1.0, step = 0.05, group = "⑩ 风险控制")
+
+moveStopToBE = input.bool(true, "T减后启用保本保护", group = "⑩ 风险控制")
+
+costBps = input.float(3.0, "每边成本(手续费+滑点) bp", minval = 0.0, step = 0.5, group = "⑩ 风险控制")
+
+
+// ============================================================================
+// ⑪ 显示
+// ============================================================================
+
+showBands = input.bool(true, "显示均值回归区间", group = "⑪ 显示")
+showBackground = input.bool(true, "显示做T环境", group = "⑪ 显示")
+showSetup = input.bool(true, "显示观察信号", group = "⑪ 显示")
+showPanel = input.bool(true, "显示状态面板", group = "⑪ 显示")
+showTradeLevels = input.bool(true, "显示本轮目标/风险", group = "⑪ 显示")
+
+
+// ============================================================================
+// 参数检查
+// ============================================================================
+
+if shockEntryZ <= rangeEntryZ
+    runtime.error("Shock模式 Z 必须高于 Range模式 Z。/ Shock mode Z must be higher than Range mode Z.")
+
+if rangeExitZ >= rangePartialZ
+    runtime.error("Range T平目标必须小于 Range T减目标。/ Range exit Z must be below Range partial Z.")
+
+if shockExitZ >= shockPartialZ
+    runtime.error("Shock T平目标必须小于 Shock T减目标。/ Shock exit Z must be below Shock partial Z.")
+
+if rangePartialZ >= rangeEntryZ
+    runtime.error("Range T减目标必须小于 Range观察 Z。/ Range partial Z must be below Range entry Z.")
+
+if shockPartialZ >= shockEntryZ
+    runtime.error("Shock T减目标必须小于 Shock观察 Z。/ Shock partial Z must be below Shock entry Z.")
+
+if stopZ <= shockEntryZ
+    runtime.error("Stop Z 必须高于 Shock Entry Z。/ Stop Z must be above Shock entry Z.")
+
+
+// ============================================================================
+// 周期保护
+// ============================================================================
+
+chartSeconds = timeframe.in_seconds(timeframe.period)
+requiredSeconds = timeframe.in_seconds("15")
+htfSeconds = timeframe.in_seconds(htfTf)
+
+if chartSeconds != requiredSeconds
+    runtime.error("Mean Reversion T 设计用于15分钟图。/ Designed for the 15-minute chart.")
+
+if htfSeconds <= chartSeconds
+    runtime.error("高周期必须高于15分钟,默认使用60分钟。/ Higher timeframe must be above 15m. Default is 60m.")
+
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Kaufman Efficiency Ratio, 路径用平均单根位移近似。
+f_er(int length) =>
+    float absMove = math.abs(ta.change(close))
+    float avgMove = ta.sma(absMove, length)
+    float path = avgMove * length
+    float net = math.abs(close - close[length])
+    path > 0.0 ? net / path : 0.0
+
+// 上一根(高周期)已确认的 ER —— 防重绘。需在 request.security 内求值。
+f_erPrev(int length) =>
+    f_er(length)[1]
+
+// 归一化斜率:EMA 位移 / ATR / lookback。
+f_slopeATR(int emaLength, int atrLength, int lookback) =>
+    float m = ta.ema(close, emaLength)
+    float a = math.max(ta.atr(atrLength), syminfo.mintick)
+    (m - m[lookback]) / a / lookback
+
+// 上一根(高周期)已确认的斜率 —— 防重绘。需在 request.security 内求值。
+f_slopeATRPrev(int emaLength, int atrLength, int lookback) =>
+    f_slopeATR(emaLength, atrLength, lookback)[1]
+
+// 单维度环境分:25 分满分,随 |value|/ideal 衰减,截断到 [0, 25]。
+f_score(float value, float idealLimit) =>
+    float ratio = idealLimit > 0.0 ? math.abs(value) / idealLimit : 10.0
+    float rawScore = 25.0 * (1.0 - ratio)
+    float floorScore = math.max(rawScore, 0.0)
+    math.min(floorScore, 25.0)
+
+
+// ============================================================================
+// Mean / ATR
+// ============================================================================
+
+mean15 = ta.ema(close, meanLen)
+atr15 = ta.atr(atrLen)
+safeATR = math.max(atr15, syminfo.mintick)
+
+
+// ============================================================================
+// Residual / Z-score
+// ============================================================================
+
+residual = close - mean15
+residualStd = ta.stdev(residual, zLen)
+safeStd = math.max(nz(residualStd), syminfo.mintick)
+z = residual / safeStd
+
+
+// ============================================================================
+// 动态区间
+// ============================================================================
+
+upperRangeBand = mean15 + rangeEntryZ * safeStd
+lowerRangeBand = mean15 - rangeEntryZ * safeStd
+
+upperShockBand = mean15 + shockEntryZ * safeStd
+lowerShockBand = mean15 - shockEntryZ * safeStd
+
+upperStopBand = mean15 + stopZ * safeStd
+lowerStopBand = mean15 - stopZ * safeStd
+
+
+// ============================================================================
+// Local Regime (15m)
+// ============================================================================
+
+localSlopeATR = (mean15 - mean15[localSlopeLookback]) / safeATR / localSlopeLookback
+localER = f_er(localERLen)
+
+
+// ============================================================================
+// Confirmed 1H Regime (防重绘:取上一根已确认的 1H bar 值)
+// ============================================================================
+
+htfSlopeATR = request.security(syminfo.tickerid, htfTf, f_slopeATRPrev(htfMeanLen, atrLen, htfSlopeLookback), lookahead = barmerge.lookahead_on)
+htfER = request.security(syminfo.tickerid, htfTf, f_erPrev(htfERLen), lookahead = barmerge.lookahead_on)
+
+
+// ============================================================================
+// Regime Score
+// ============================================================================
+
+htfSlopeScore = f_score(htfSlopeATR, idealHtfSlope)
+htfERScore = f_score(htfER, idealHtfER)
+localSlopeScore = f_score(localSlopeATR, idealLocalSlope)
+localERScore = f_score(localER, idealLocalER)
+
+rawRegimeScore = htfSlopeScore + htfERScore + localSlopeScore + localERScore
+regimeScore = ta.sma(rawRegimeScore, regimeSmoothLen)
+
+
+// ============================================================================
+// Hard Trend Veto
+// ============================================================================
+
+htfSlopeVeto = math.abs(htfSlopeATR) >= vetoHtfSlope
+localSlopeVeto = math.abs(localSlopeATR) >= vetoLocalSlope
+htfERVeto = htfER >= vetoHtfER
+localERVeto = localER >= vetoLocalER
+
+hardTrendVeto = htfSlopeVeto or localSlopeVeto or htfERVeto or localERVeto
+
+rangeEnvironment = not hardTrendVeto and regimeScore >= rangeMinScore
+shockEnvironment = not hardTrendVeto and regimeScore >= shockMinScore
+
+
+// ============================================================================
+// Shock Detection
+// ============================================================================
+// Shock 强度:最近 N 根走了多少 ATR。
+
+shockMove = (close - close[shockLookback]) / safeATR
+shockUp = shockMove >= minShockATR
+shockDown = shockMove <= -minShockATR
+
+// 当前冲击 vs 前一段冲击:开始减弱 → 更像过冲结束。
+previousShockMove = (close[shockLookback] - close[shockLookback * 2]) / safeATR
+shockDecelerating = math.abs(shockMove) <= math.abs(previousShockMove) * decelerationRatio
+decelerationOK = not requireShockDeceleration or shockDecelerating
+
+
+// ============================================================================
+// Candle / Wick Rejection
+// ============================================================================
+
+barRange = math.max(high - low, syminfo.mintick)
+
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+lowerWickRatio = lowerWick / barRange
+upperWickRatio = upperWick / barRange
+
+bullishCandle = close > open
+bearishCandle = close < open
+
+longRejection = bullishCandle or lowerWickRatio >= minWickRatio
+shortRejection = bearishCandle or upperWickRatio >= minWickRatio
+
+longRejectionOK = not requireRejection or longRejection
+shortRejectionOK = not requireRejection or shortRejection
+
+
+// ============================================================================
+// Half-Life
+// ============================================================================
+// 对 d(residual) ~ beta * residual[-1] 回归,Half-Life = -ln(2) / beta。
+// beta 为正(动量)或无效时,退化到 fallbackTimeStopBars。
+
+residualLag = residual[1]
+residualDelta = residual - residual[1]
+
+hlCorr = ta.correlation(residualDelta, residualLag, halfLifeLookback)
+hlDeltaStd = ta.stdev(residualDelta, halfLifeLookback)
+hlLagStd = ta.stdev(residualLag, halfLifeLookback)
+
+bool betaOK = not na(hlCorr) and not na(hlDeltaStd) and not na(hlLagStd) and hlLagStd > 0.0
+
+float hlBeta = na
+
+if betaOK
+    hlBeta := hlCorr * hlDeltaStd / hlLagStd
+
+float halfLife = na
+
+if not na(hlBeta) and hlBeta < -0.000001
+    halfLife := -math.log(2.0) / hlBeta
+
+
+// ============================================================================
+// 全局 Cross
+// ============================================================================
+
+zCrossOverNegRange = ta.crossover(z, -rangeEntryZ)
+zCrossUnderPosRange = ta.crossunder(z, rangeEntryZ)
+
+zCrossOverNegShock = ta.crossover(z, -shockEntryZ)
+zCrossUnderPosShock = ta.crossunder(z, shockEntryZ)
+
+
+// ============================================================================
+// State
+// ============================================================================
+// 所有可变状态收敛到一个对象,方向用 ±1 表达。
+// 多空镜像逻辑由 f_enter / f_exit / f_manage 以 dir 参数统一,消除复制粘贴。
+
+type MRState
+    int    pos           = 0     // 0 空仓 / +1 多头 / -1 空头
+    bool   partialTaken  = false
+    int    setupBar      = na    // 活跃 Setup 的 bar_index
+    int    setupDir      = 0     // Setup 方向:+1 / -1
+    int    setupMode     = 0     // 0 无 / 1 Range / 2 Shock
+    int    entryBar      = na
+    float  entryPrice    = na
+    float  mean          = na
+    float  std           = na
+    float  atr           = na
+    float  partialTarget = na
+    float  finalTarget   = na
+    float  baseStop      = na
+    int    timeStop      = na
+    int    tradeMode     = 0     // 0 无 / 1 Range / 2 Shock
+    float  cost          = 0.0   // 往返成本(价格单位)
+    int    lastExitBar   = na
+    int    eventKind     = 0     // 本 bar 事件:0 无 / 1 进场 / 2 T减 / 3 退出
+    int    eventDir      = 0     // 事件方向:+1 / -1
+    int    eventReason   = 0     // 退出原因(仅 eventKind == 3)
+    int    tradeCount    = 0
+    float  sumPnlATR     = 0.0
+    float  lastPnlATR    = na
+    float  lastPnlPct    = na
+
+var MRState t = MRState.new()
+
+// 一次性事件:Pine 禁止在函数内重赋任何全局变量(CE10088),函数只能改对象字段。
+// 因此事件先写入 t 的捕获字段,全局作用域再派生为这些变量。
+bool setupEvent      = false
+int  setupEventDir   = 0
+int  setupEventMode  = 0
+
+bool entryEvent      = false
+int  entryEventDir   = 0
+
+bool partialEvent    = false
+int  partialEventDir = 0
+
+bool exitEvent       = false
+int  exitEventDir    = 0
+int  exitReason      = 0
+
+// 每 bar 重置 t 的事件捕获字段(函数通过 t 传出事件)
+t.eventKind := 0
+t.eventDir := 0
+t.eventReason := 0
+
+// 退出原因枚举
+int R_STOP  = 1
+int R_TREND = 2
+int R_TIME  = 3
+int R_FINAL = 4
+int R_BE    = 5
+
+// 冷却
+int barsSinceExit = 100000
+
+if not na(t.lastExitBar)
+    barsSinceExit := bar_index - t.lastExitBar
+
+requiredCooldown = math.max(cooldownBars, 1)
+canEnter = na(t.lastExitBar) or barsSinceExit >= requiredCooldown
+
+
+// ============================================================================
+// 创建 Setup (Shock 优先于 Range;方向反转允许替换对侧 Setup)
+// ============================================================================
+
+if barstate.isconfirmed and t.pos == 0 and canEnter
+
+    bool noSameLong  = na(t.setupBar) or t.setupDir != 1
+    bool noSameShort = na(t.setupBar) or t.setupDir != -1
+
+    bool longShockSetup = allowLong and shockEnvironment and shockDown and z <= -shockEntryZ and decelerationOK and longRejectionOK and noSameLong
+    bool shortShockSetup = allowShort and shockEnvironment and shockUp and z >= shockEntryZ and decelerationOK and shortRejectionOK and noSameShort
+    bool longRangeSetup = allowLong and rangeEnvironment and z <= -rangeEntryZ and noSameLong
+    bool shortRangeSetup = allowShort and rangeEnvironment and z >= rangeEntryZ and noSameShort
+
+    if longShockSetup
+        t.setupBar := bar_index
+        t.setupDir := 1
+        t.setupMode := 2
+        setupEvent := true
+        setupEventDir := 1
+        setupEventMode := 2
+
+    else if shortShockSetup
+        t.setupBar := bar_index
+        t.setupDir := -1
+        t.setupMode := 2
+        setupEvent := true
+        setupEventDir := -1
+        setupEventMode := 2
+
+    else if longRangeSetup
+        t.setupBar := bar_index
+        t.setupDir := 1
+        t.setupMode := 1
+        setupEvent := true
+        setupEventDir := 1
+        setupEventMode := 1
+
+    else if shortRangeSetup
+        t.setupBar := bar_index
+        t.setupDir := -1
+        t.setupMode := 1
+        setupEvent := true
+        setupEventDir := -1
+        setupEventMode := 1
+
+
+// ============================================================================
+// Setup Expiry
+// ============================================================================
+
+if not na(t.setupBar)
+    int allowedAge = t.setupMode == 2 ? shockSetupBars : rangeSetupBars
+
+    if bar_index - t.setupBar > allowedAge
+        t.setupBar := na
+        t.setupDir := 0
+        t.setupMode := 0
+
+
+// ============================================================================
+// Setup 提前失败 (Z 走极端)
+// ============================================================================
+
+if not na(t.setupBar) and t.setupDir * z <= -stopZ
+    t.setupBar := na
+    t.setupDir := 0
+    t.setupMode := 0
+
+
+// ============================================================================
+// Entry Confirmation
+// ============================================================================
+
+float entryZ = t.setupMode == 2 ? shockEntryZ : rangeEntryZ
+
+bool candleOK = false
+
+if t.setupDir == 1
+    candleOK := not requireCandleConfirm or close > close[1]
+else if t.setupDir == -1
+    candleOK := not requireCandleConfirm or close < close[1]
+
+bool zReclaim = false
+
+if t.setupDir == 1
+    zReclaim := t.setupMode == 2 ? zCrossOverNegShock : zCrossOverNegRange
+else if t.setupDir == -1
+    zReclaim := t.setupMode == 2 ? zCrossUnderPosShock : zCrossUnderPosRange
+
+bool bandOK = false
+
+if t.setupDir == 1
+    bandOK := not requireBandReclaim or close > mean15 - entryZ * safeStd
+else if t.setupDir == -1
+    bandOK := not requireBandReclaim or close < mean15 + entryZ * safeStd
+
+bool longEntrySignal = barstate.isconfirmed and t.pos == 0 and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+bool shortEntrySignal = barstate.isconfirmed and t.pos == 0 and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+
+
+// ============================================================================
+// 活跃止损 (含 T减后保本偏移 —— 单一事实来源,管理逻辑与绘图共用)
+// ============================================================================
+
+f_activeStop(int dir) =>
+    float s = t.baseStop
+
+    if moveStopToBE and t.partialTaken
+        s := dir == 1 ? math.max(s, t.entryPrice + t.cost) : math.min(s, t.entryPrice - t.cost)
+
+    s
+
+
+// ============================================================================
+// Enter (方向参数化,dir = +1 多 / -1 空)
+// ============================================================================
+
+f_enter(int dir) =>
+    t.pos := dir
+    t.partialTaken := false
+    t.entryPrice := close
+    t.mean := mean15
+    t.std := safeStd
+    t.atr := safeATR
+    t.entryBar := bar_index
+
+    bool shock = t.setupMode == 2
+    t.tradeMode := shock ? 2 : 1
+
+    float pz = shock ? shockPartialZ : rangePartialZ
+    float ez = shock ? shockExitZ : rangeExitZ
+
+    // 目标价统一表达为 mean - dir * Z * std
+    t.partialTarget := t.mean - dir * pz * t.std
+    t.finalTarget   := t.mean - dir * ez * t.std
+
+    float atrStop   = t.entryPrice - dir * hardStopATR * t.atr
+    float statStop  = t.mean - dir * stopZ * t.std
+    float tightStop = dir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
+    float looseStop = dir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
+    float balStop   = looseStop + (tightStop - looseStop) * balancedWeight
+
+    if stopMode == "Tight"
+        t.baseStop := tightStop
+    else if stopMode == "Loose"
+        t.baseStop := looseStop
+    else
+        t.baseStop := balStop
+
+    float rawTimeStop = fallbackTimeStopBars
+
+    if not na(halfLife)
+        rawTimeStop := halfLife * timeStopMultiplier
+
+    float limitedTimeStop = math.max(minTimeStopBars, rawTimeStop)
+    limitedTimeStop := math.min(maxTimeStopBars, limitedTimeStop)
+
+    t.timeStop := int(math.round(limitedTimeStop))
+
+    // 往返成本(价格单位),用于保本偏移与 P&L 结算
+    t.cost := t.entryPrice * (2.0 * costBps) / 10000.0
+
+    t.setupBar := na
+    t.setupDir := 0
+    t.setupMode := 0
+
+    t.eventKind := 1
+    t.eventDir := dir
+
+
+// ============================================================================
+// Exit (方向参数化;结算虚拟 P&L,扣除往返成本)
+// ============================================================================
+
+f_exit(int dir, int reason) =>
+    float rawPnl = (close - t.entryPrice) * dir
+    float costVal = t.entryPrice * (2.0 * costBps) / 10000.0
+    float pnlNet = rawPnl - costVal
+
+    t.lastPnlATR := pnlNet / t.atr
+    t.lastPnlPct := pnlNet / t.entryPrice * 100.0
+    t.sumPnlATR += t.lastPnlATR
+    t.tradeCount += 1
+
+    t.lastExitBar := bar_index
+    t.pos := 0
+    t.partialTaken := false
+
+    t.entryBar := na
+    t.entryPrice := na
+    t.mean := na
+    t.std := na
+    t.atr := na
+    t.partialTarget := na
+    t.finalTarget := na
+    t.baseStop := na
+    t.timeStop := na
+    t.tradeMode := 0
+    t.cost := 0.0
+
+    t.setupBar := na
+    t.setupDir := 0
+    t.setupMode := 0
+
+    t.eventKind := 3
+    t.eventDir := dir
+    t.eventReason := reason
+
+
+// ============================================================================
+// Manage (方向参数化)
+// ============================================================================
+// 退出优先级:止损 → 趋势失效 → 超时 → T减 → T平。
+// 关键修复:T平(T final)以「先 T减」为前提,同根 K 线同时触达 T减/T平时,
+// 先记 T减,下一根才允许 T平 —— 生命周期不再跳级。
+
+f_manage(int dir) =>
+    bool canManage = t.pos == dir and not na(t.entryBar) and bar_index > t.entryBar
+
+    if barstate.isconfirmed and canManage
+        float activeStop = f_activeStop(dir)
+
+        bool stopHit = not na(activeStop) and (dir == 1 ? close <= activeStop : close >= activeStop)
+        bool trendFailed = dir * htfSlopeATR <= -vetoHtfSlope or dir * localSlopeATR <= -vetoLocalSlope
+        bool timeFailed = not na(t.timeStop) and (bar_index - t.entryBar) >= t.timeStop
+        bool partialReached = not t.partialTaken and not na(t.partialTarget) and (dir == 1 ? close >= t.partialTarget : close <= t.partialTarget)
+        bool finalReached = t.partialTaken and not na(t.finalTarget) and (dir == 1 ? close >= t.finalTarget : close <= t.finalTarget)
+
+        if stopHit
+            // T减后且启用保本 → 保本退出;否则统计/硬止损退出
+            bool isBE = t.partialTaken and moveStopToBE
+
+            if isBE
+                f_exit(dir, R_BE)
+            else
+                f_exit(dir, R_STOP)
+
+        else if trendFailed
+            f_exit(dir, R_TREND)
+
+        else if timeFailed
+            f_exit(dir, R_TIME)
+
+        else if partialReached
+            t.partialTaken := true
+            t.eventKind := 2
+            t.eventDir := dir
+
+        else if finalReached
+            f_exit(dir, R_FINAL)
+
+
+// ============================================================================
+// 执行入口 / 管理
+// ============================================================================
+
+if longEntrySignal
+    f_enter(1)
+else if shortEntrySignal
+    f_enter(-1)
+
+f_manage(1)
+f_manage(-1)
+
+// 派生一次性显示事件(全局作用域写全局变量是允许的)
+entryEvent := t.eventKind == 1
+entryEventDir := t.eventDir
+partialEvent := t.eventKind == 2
+partialEventDir := t.eventDir
+exitEvent := t.eventKind == 3
+exitEventDir := t.eventDir
+exitReason := t.eventReason
+
+
+// ============================================================================
+// Plot Mean
+// ============================================================================
+
+plot(mean15, "Local Mean", color = color.yellow, linewidth = 2)
+
+
+// ============================================================================
+// Bands
+// ============================================================================
+
+pRangeUpper = plot(showBands ? upperRangeBand : na, "Range +Z", color = color.new(color.orange, 35))
+pRangeLower = plot(showBands ? lowerRangeBand : na, "Range -Z", color = color.new(color.aqua, 35))
+
+pShockUpper = plot(showBands ? upperShockBand : na, "Shock +Z", color = color.new(color.red, 35))
+pShockLower = plot(showBands ? lowerShockBand : na, "Shock -Z", color = color.new(color.green, 35))
+
+pStopUpper = plot(showBands ? upperStopBand : na, "Extreme +Z", color = color.new(color.red, 75))
+pStopLower = plot(showBands ? lowerStopBand : na, "Extreme -Z", color = color.new(color.red, 75))
+
+fill(pShockUpper, pStopUpper, color = showBands ? color.new(color.red, 94) : na)
+fill(pShockLower, pStopLower, color = showBands ? color.new(color.green, 94) : na)
+
+
+// ============================================================================
+// Background
+// ============================================================================
+
+color bgCol = na
+
+if showBackground
+    if rangeEnvironment
+        bgCol := color.new(color.blue, 92)
+    else if shockEnvironment
+        bgCol := color.new(color.purple, 94)
+
+bgcolor(bgCol, title = "Mean Reversion Environment")
+
+
+// ============================================================================
+// Active Trade Lines
+// ============================================================================
+
+float activePartialLine = na
+float activeFinalLine = na
+float activeRiskLine = na
+
+if t.pos != 0
+    activePartialLine := t.partialTarget
+    activeFinalLine := t.finalTarget
+    activeRiskLine := f_activeStop(t.pos)
+
+plot(showTradeLevels ? activePartialLine : na, "T减目标 / Trim", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeFinalLine : na, "T平目标 / Target", color = color.white, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeRiskLine : na, "风险线 / Risk", color = color.red, linewidth = 2, style = plot.style_linebr)
+
+
+// ============================================================================
+// Setup Labels
+// ============================================================================
+// 用 label.new 而非 plotshape:plotshape 的 text 是 const string,无法随
+// lang 切换;label.new 的 text 是 series string,可接 f_tr()。
+
+if showSetup and setupEvent and setupEventMode == 1 and setupEventDir == 1
+    label.new(bar_index, low, f_tr("R观察", "R obs"), style = label.style_label_up, color = color.new(color.green, 55), textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 1 and setupEventDir == -1
+    label.new(bar_index, high, f_tr("R观察", "R obs"), style = label.style_label_down, color = color.new(color.red, 55), textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 2 and setupEventDir == 1
+    label.new(bar_index, low, f_tr("S观察", "S obs"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 2 and setupEventDir == -1
+    label.new(bar_index, high, f_tr("S观察", "S obs"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// Entry
+// ============================================================================
+
+if entryEvent and entryEventDir == 1
+    label.new(bar_index, low, f_tr("T买", "T Long"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small)
+
+if entryEvent and entryEventDir == -1
+    label.new(bar_index, high, f_tr("T空", "T Short"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+
+
+// ============================================================================
+// Partial
+// ============================================================================
+
+if partialEvent and partialEventDir == 1
+    label.new(bar_index, high, f_tr("T减", "T Trim"), style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
+
+if partialEvent and partialEventDir == -1
+    label.new(bar_index, low, f_tr("T减", "T Trim"), style = label.style_label_up, color = color.aqua, textcolor = color.black, size = size.tiny)
+
+
+// ============================================================================
+// Exits (Final / Stop / Trend / Time / BE)
+// ============================================================================
+
+if exitEvent and exitReason == R_FINAL and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T平", "T Close"), style = label.style_label_down, color = color.lime, textcolor = color.black, size = size.small)
+
+if exitEvent and exitReason == R_FINAL and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T平", "T Close"), style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+
+if exitEvent and exitReason == R_STOP and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T止损", "T Stop"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_STOP and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T止损", "T Stop"), style = label.style_label_up, color = color.red, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TREND and exitEventDir == 1
+    label.new(bar_index, high, f_tr("趋势失效", "Trend fail"), style = label.style_label_down, color = color.purple, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TREND and exitEventDir == -1
+    label.new(bar_index, low, f_tr("趋势失效", "Trend fail"), style = label.style_label_up, color = color.purple, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TIME and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T超时", "T Timeout"), style = label.style_label_down, color = color.gray, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TIME and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T超时", "T Timeout"), style = label.style_label_up, color = color.gray, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_BE and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T保本", "T BE"), style = label.style_label_down, color = color.gray, textcolor = color.white, size = size.tiny)
+
+if exitEvent and exitReason == R_BE and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T保本", "T BE"), style = label.style_label_up, color = color.gray, textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// Data Window
+// ============================================================================
+
+plot(z, "Z-score", display = display.data_window)
+plot(regimeScore, "Regime Score", display = display.data_window)
+plot(halfLife, "Half-Life", display = display.data_window)
+plot(shockMove, "Shock ATR", display = display.data_window)
+plot(previousShockMove, "Previous Shock ATR", display = display.data_window)
+plot(localER, "15m ER", display = display.data_window)
+plot(htfER, "1H ER", display = display.data_window)
+plot(localSlopeATR, "15m Slope", display = display.data_window)
+plot(htfSlopeATR, "1H Slope", display = display.data_window)
+plot(t.sumPnlATR, "Cum P&L (ATR)", display = display.data_window)
+
+
+// ============================================================================
+// Panel
+// ============================================================================
+
+var table panel = table.new(position.top_right, 2, 12, border_width = 1)
+
+if showPanel and barstate.islast
+
+    string envText = f_tr("禁做T", "No T")
+    color envColor = color.gray
+
+    if rangeEnvironment
+        envText := "Range"
+        envColor := color.aqua
+    else if shockEnvironment
+        envText := "Shock Only"
+        envColor := color.purple
+
+    string stateText = t.pos == 1 ? f_tr("T多", "Long") : t.pos == -1 ? f_tr("T空", "Short") : f_tr("空仓", "Flat")
+
+    string setupText = f_tr("无", "None")
+
+    if t.setupMode == 1 and t.setupDir == 1
+        setupText := f_tr("R等T买", "Range→Long")
+    else if t.setupMode == 2 and t.setupDir == 1
+        setupText := f_tr("S等T买", "Shock→Long")
+    else if t.setupMode == 1 and t.setupDir == -1
+        setupText := f_tr("R等T空", "Range→Short")
+    else if t.setupMode == 2 and t.setupDir == -1
+        setupText := f_tr("S等T空", "Shock→Short")
+
+    string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
+    string shockText = str.tostring(shockMove, "#.00") + " ATR"
+    string scoreText = str.tostring(regimeScore, "#")
+    string modeText = t.pos == 0 ? "-" : t.tradeMode == 2 ? "Shock" : "Range"
+    string stopText = stopMode
+
+    string pnlText = na(t.lastPnlATR) ? "-" : str.tostring(t.lastPnlATR, "#.00") + " ATR / " + str.tostring(t.lastPnlPct, "#.00") + "%"
+    string cumText = str.tostring(t.sumPnlATR, "#.00") + " ATR (" + str.tostring(t.tradeCount, "#") + f_tr("笔", " trades") + ")"
+
+    table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
+    table.cell(panel, 1, 0, "15m")
+
+    table.cell(panel, 0, 1, f_tr("环境", "Env"))
+    table.cell(panel, 1, 1, envText, text_color = envColor)
+
+    table.cell(panel, 0, 2, "Score")
+    table.cell(panel, 1, 2, scoreText)
+
+    table.cell(panel, 0, 3, f_tr("状态", "State"))
+    table.cell(panel, 1, 3, stateText)
+
+    table.cell(panel, 0, 4, "Setup")
+    table.cell(panel, 1, 4, setupText)
+
+    table.cell(panel, 0, 5, "Z")
+    table.cell(panel, 1, 5, str.tostring(z, "#.00"))
+
+    table.cell(panel, 0, 6, "Shock")
+    table.cell(panel, 1, 6, shockText)
+
+    table.cell(panel, 0, 7, "Half-Life")
+    table.cell(panel, 1, 7, hlText)
+
+    table.cell(panel, 0, 8, f_tr("模式", "Mode"))
+    table.cell(panel, 1, 8, modeText)
+
+    table.cell(panel, 0, 9, "Stop")
+    table.cell(panel, 1, 9, stopText)
+
+    table.cell(panel, 0, 10, f_tr("本笔P&L", "Last P&L"))
+    table.cell(panel, 1, 10, pnlText)
+
+    table.cell(panel, 0, 11, f_tr("累计P&L", "Cum P&L"))
+    table.cell(panel, 1, 11, cumText)
+
+
+if not showPanel and barstate.islast
+    table.clear(panel, 0, 0, 1, 11)
+
+
+// ============================================================================
+// Alerts
+// ============================================================================
+
+alertcondition(setupEvent and setupEventMode == 1, "MR-T Range观察 / Range obs", "Mean Reversion T: Range模式出现均值偏离 / mean deviation in Range mode")
+alertcondition(setupEvent and setupEventMode == 2, "MR-T Shock观察 / Shock obs", "Mean Reversion T: 出现异常价格冲击并开始减速 / abnormal shock with deceleration")
+alertcondition(entryEvent and entryEventDir == 1, "MR-T T买 / T Long", "Mean Reversion T: 出现T买确认 / long entry confirmed")
+alertcondition(entryEvent and entryEventDir == -1, "MR-T T空 / T Short", "Mean Reversion T: 出现T空确认 / short entry confirmed")
+alertcondition(partialEvent, "MR-T T减 / T Trim", "Mean Reversion T: 完成第一阶段回归 / first-stage reversion done")
+alertcondition(exitEvent and exitReason == R_FINAL, "MR-T T平 / T Close", "Mean Reversion T: 主要均值回归完成 / main reversion complete")
+alertcondition(exitEvent and exitReason == R_STOP, "MR-T T止损 / T Stop", "Mean Reversion T: 触发风险线 / risk line hit")
+alertcondition(exitEvent and exitReason == R_TREND, "MR-T 趋势失效 / Trend fail", "Mean Reversion T: 市场已发展为趋势环境 / market turned trending")
+alertcondition(exitEvent and exitReason == R_TIME, "MR-T T超时 / T Timeout", "Mean Reversion T: 回归时间超过预期 / reversion timed out")
+alertcondition(exitEvent and exitReason == R_BE, "MR-T T保本 / T BE", "Mean Reversion T: 第一目标后触发保本保护 / BE protection after first target")
