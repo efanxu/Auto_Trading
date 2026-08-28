@@ -6,7 +6,7 @@
 strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v3.0.0
+// Mean Reversion T (MR-T) · Strategy v3.0.1
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -20,7 +20,7 @@ strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
 // 收盘确认信号 → 下一可成交时点执行;换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v3.0.0 —— Strategy Tester 回测版本。变更见 CHANGELOG.md。
+// 版本 / Version: v3.0.1 —— Strategy Tester 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -38,7 +38,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "3.0.0"
+string SCRIPT_VERSION = "3.0.1"
 
 
 // ============================================================================
@@ -452,9 +452,11 @@ type MRState
     int    pendingTimeStop = na
 
     // Range / Shock 辅助统计;正式绩效仍由 Strategy Tester 提供。
-    int    rangeTrades   = 0
-    int    shockTrades   = 0
+    int    rangeEntries  = 0
+    int    rangeClosed   = 0
     int    rangeWins     = 0
+    int    shockEntries  = 0
+    int    shockClosed   = 0
     int    shockWins     = 0
 
     int    eventKind     = 0     // 本 bar 事件:0 无 / 1 进场 / 2 T减 / 3 退出
@@ -505,12 +507,22 @@ if not na(t.lastExitBar)
 requiredCooldown = math.max(cooldownBars, 1)
 canEnter = strategy.position_size == 0.0 and t.pos == 0 and t.pendingDir == 0 and (na(t.lastExitBar) or barsSinceExit >= requiredCooldown)
 
+// Fill synchronization is inferred from actual Strategy Tester position transitions.
+// calc_on_order_fills executions may see the historical bar's final OHLC values, so
+// they may synchronize fills and maintain protective orders, but must not make
+// confirmed-bar trading decisions. barstate.isconfirmed alone is not sufficient.
+bool positionFilled = t.pendingDir != 0 and strategy.position_size * t.pendingDir > 0.0 and not na(strategy.position_avg_price)
+bool partialFilled = t.pos != 0 and strategy.position_size * t.pos > 0.0 and not t.partialTaken and not na(t.entrySize) and math.abs(strategy.position_size) < t.entrySize
+bool positionClosed = t.pos != 0 and strategy.position_size == 0.0
+bool isFillSynchronizationExecution = positionFilled or partialFilled or positionClosed
+bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution
+
 
 // ============================================================================
 // 创建 Setup (Shock 优先于 Range;方向反转允许替换对侧 Setup)
 // ============================================================================
 
-if barstate.isconfirmed and canEnter
+if allowBarCloseDecision and canEnter
 
     bool noSameLong  = na(t.setupBar) or t.setupDir != 1
     bool noSameShort = na(t.setupBar) or t.setupDir != -1
@@ -557,7 +569,7 @@ if barstate.isconfirmed and canEnter
 // Setup Expiry
 // ============================================================================
 
-if not na(t.setupBar)
+if allowBarCloseDecision and not na(t.setupBar)
     int allowedAge = t.setupMode == 2 ? shockSetupBars : rangeSetupBars
 
     if bar_index - t.setupBar > allowedAge
@@ -570,7 +582,7 @@ if not na(t.setupBar)
 // Setup 提前失败 (Z 走极端)
 // ============================================================================
 
-if not na(t.setupBar) and t.setupDir * z <= -stopZ
+if allowBarCloseDecision and not na(t.setupBar) and t.setupDir * z <= -stopZ
     t.setupBar := na
     t.setupDir := 0
     t.setupMode := 0
@@ -609,8 +621,8 @@ else if t.setupDir == -1
 bool bandOK = not requireBandReclaim or priceBandReclaim
 
 bool flatForEntry = strategy.position_size == 0.0 and t.pos == 0 and t.pendingDir == 0
-bool longEntrySignal = barstate.isconfirmed and flatForEntry and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
-bool shortEntrySignal = barstate.isconfirmed and flatForEntry and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+bool longEntrySignal = allowBarCloseDecision and flatForEntry and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
+bool shortEntrySignal = allowBarCloseDecision and flatForEntry and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
 
 
 // ============================================================================
@@ -732,9 +744,9 @@ f_initializeTrade(int dir) =>
     t.marketClosePlaced := false
 
     if t.tradeMode == 1
-        t.rangeTrades += 1
+        t.rangeEntries += 1
     else
-        t.shockTrades += 1
+        t.shockEntries += 1
 
     t.pendingDir := 0
     t.pendingMode := 0
@@ -771,10 +783,16 @@ f_exit(int dir, int reason) =>
     bool winningTrade = tradeNetProfit > 0.0
     float finishedPrice = f_recentExitPrice(close)
 
-    if finishedMode == 1 and winningTrade
-        t.rangeWins += 1
-    else if finishedMode == 2 and winningTrade
-        t.shockWins += 1
+    if finishedMode == 1
+        t.rangeClosed += 1
+
+        if winningTrade
+            t.rangeWins += 1
+    else if finishedMode == 2
+        t.shockClosed += 1
+
+        if winningTrade
+            t.shockWins += 1
 
     t.lastExitBar := bar_index
     t.pos := 0
@@ -816,10 +834,11 @@ f_exit(int dir, int reason) =>
 // 使用 strategy.close 市价退出;退出优先级仍为风险线 → 趋势失效 → 超时,
 // 而 T平只在实际 T减成交并进入第二阶段后提交。
 
-f_manage(int dir) =>
+f_manage(int dir, bool allowBarCloseDecision) =>
     bool canManage = t.pos == dir and strategy.position_size * dir > 0.0 and not na(t.entryBar) and bar_index > t.entryBar
 
-    if barstate.isconfirmed and canManage and not t.exitRequested
+    // Only the normal confirmed-bar execution may evaluate close-based exits.
+    if allowBarCloseDecision and canManage and not t.exitRequested
         bool trendFailed = dir * htfSlopeATR <= -vetoHtfSlope or dir * localSlopeATR <= -vetoLocalSlope
         bool timeFailed = not na(t.timeStop) and (bar_index - t.entryBar) >= t.timeStop
 
@@ -845,20 +864,16 @@ else if shortEntrySignal
     alert(f_orderMessage(-1, "Short Entry", t.pendingMode, close), alert.freq_all)
 
 // 市场订单在下一可成交时点建立后,同步 Strategy Tester 的真实持仓。
-bool positionFilled = t.pendingDir != 0 and strategy.position_size * t.pendingDir > 0.0 and not na(strategy.position_avg_price)
-
 if positionFilled
     f_initializeTrade(t.pendingDir)
 
 // 只有真实仓位数量减少后才标记 T减,因此 partialTaken 不再由 close 触碰目标线
 // 虚拟设置;策略订单的实际成交是这一状态的唯一来源。
-bool partialFilled = t.pos != 0 and strategy.position_size * t.pos > 0.0 and not t.partialTaken and not na(t.entrySize) and math.abs(strategy.position_size) < t.entrySize
-
 if partialFilled
     f_markPartial(t.pos)
 
-f_manage(1)
-f_manage(-1)
+f_manage(1, allowBarCloseDecision)
+f_manage(-1, allowBarCloseDecision)
 
 // Trend Fail / Timeout 取消剩余价格单后提交对应的市价平仓单。
 if t.pos == 1 and strategy.position_size > 0.0 and t.exitRequested and not t.marketClosePlaced
@@ -915,8 +930,6 @@ if t.pos == -1 and strategy.position_size < 0.0 and not t.exitRequested
 
 // 识别真实持仓归零,再 reset MRState。这样 Strategy Tester 的订单生命周期
 // 与图表状态不会因“信号触发”而提前脱钩。
-bool positionClosed = t.pos != 0 and strategy.position_size == 0.0
-
 if positionClosed
     int actualReason = t.exitReasonPending
 
@@ -1088,8 +1101,12 @@ plot(localSlopeATR, "15m Slope", display = display.data_window)
 plot(htfSlopeATR, "1H Slope", display = display.data_window)
 plot(strategy.netprofit, "Strategy Tester Net P&L", display = display.data_window)
 plot(strategy.position_avg_price, "Strategy Position Avg Price", display = display.data_window)
-plot(t.rangeTrades, "Range Trades", display = display.data_window)
-plot(t.shockTrades, "Shock Trades", display = display.data_window)
+plot(t.rangeEntries, "Range Entries", display = display.data_window)
+plot(t.rangeClosed, "Range Closed", display = display.data_window)
+plot(t.rangeWins, "Range Wins", display = display.data_window)
+plot(t.shockEntries, "Shock Entries", display = display.data_window)
+plot(t.shockClosed, "Shock Closed", display = display.data_window)
+plot(t.shockWins, "Shock Wins", display = display.data_window)
 
 
 // ============================================================================
@@ -1137,10 +1154,10 @@ if showPanel and barstate.islast
     string testerPLText = str.tostring(strategy.netprofit, format.mintick) + " / DD " + str.tostring(strategy.max_drawdown, format.mintick) + " / PF " + (na(testerProfitFactor) ? "-" : str.tostring(testerProfitFactor, "#.00"))
     float testerWinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
     string testerTradeText = str.tostring(strategy.closedtrades, "#") + " / " + (na(testerWinRate) ? "-" : str.tostring(testerWinRate, "#.0") + "%")
-    float rangeWinRate = t.rangeTrades > 0 ? t.rangeWins / t.rangeTrades * 100.0 : na
-    float shockWinRate = t.shockTrades > 0 ? t.shockWins / t.shockTrades * 100.0 : na
-    string rangeStatsText = str.tostring(t.rangeTrades, "#") + " / " + str.tostring(t.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
-    string shockStatsText = str.tostring(t.shockTrades, "#") + " / " + str.tostring(t.shockWins, "#") + " (" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
+    float rangeWinRate = t.rangeClosed > 0 ? t.rangeWins / t.rangeClosed * 100.0 : na
+    float shockWinRate = t.shockClosed > 0 ? t.shockWins / t.shockClosed * 100.0 : na
+    string rangeStatsText = "E " + str.tostring(t.rangeEntries, "#") + " / C " + str.tostring(t.rangeClosed, "#") + " / W " + str.tostring(t.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
+    string shockStatsText = "E " + str.tostring(t.shockEntries, "#") + " / C " + str.tostring(t.shockClosed, "#") + " / W " + str.tostring(t.shockWins, "#") + " (" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
 
     table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
     table.cell(panel, 1, 0, "15m")
@@ -1187,10 +1204,10 @@ if showPanel and barstate.islast
     table.cell(panel, 0, 14, f_tr("Tester 交易 / 胜率", "Tester trades / win"))
     table.cell(panel, 1, 14, testerTradeText)
 
-    table.cell(panel, 0, 15, "Range trades / wins")
+    table.cell(panel, 0, 15, f_tr("Range 进场 / 已平 / 盈利", "Range entries / closed / wins"))
     table.cell(panel, 1, 15, rangeStatsText)
 
-    table.cell(panel, 0, 16, "Shock trades / wins")
+    table.cell(panel, 0, 16, f_tr("Shock 进场 / 已平 / 盈利", "Shock entries / closed / wins"))
     table.cell(panel, 1, 16, shockStatsText)
 
 

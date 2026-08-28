@@ -6,7 +6,7 @@ A production-grade **mean-reversion "T" strategy** for TradingView, written in P
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.1-informational)](CHANGELOG.md)
 
 ---
 
@@ -60,6 +60,8 @@ flowchart TD
 
 `Observe` -> `T-buy / T-short` -> `T-trim` (real partial exit, moves the remaining stop to breakeven) -> `T-close` (remaining position, full reversion).
 Abnormal exits: `T-stop` (statistical or ATR risk line), `Trend-fail` (market turned trending), `T-timeout` (half-life exceeded), `T-BE` (breakeven after the first target).
+
+There is no session-end liquidation. Positions and pending mean-reversion setups may naturally remain active across trading dates.
 
 ---
 
@@ -208,7 +210,7 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 
 Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the post-trim breakeven estimate uses the same assumptions.
 
-After a real T-trim fill, the remaining stop is moved to `entry +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock counts are lightweight auxiliary classifications, with wins determined from the Strategy Tester net-profit change for each completed position.
+After a real T-trim fill, the remaining stop is moved to `entry +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock are lightweight auxiliary classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
 
 The broker emulator uses standard order handling. Price orders can fill at better or worse prices than their requested levels, and market orders from Trend Fail/Timeout fill on the next available tick.
 
@@ -216,12 +218,17 @@ The broker emulator uses standard order handling. Price orders can fill at bette
 
 ## Repaint safety
 
-- Setup and entry decisions are gated on `barstate.isconfirmed`; fill/exit events are emitted from actual strategy state changes.
+- Setup, entry, Trend-fail, and Timeout decisions are gated on the normal confirmed-bar decision phase; fill/exit events are emitted from actual strategy state changes.
+- `calc_on_order_fills` executions are reserved for synchronizing actual Entry/Trim/Exit state and maintaining protective orders. Historical fill executions can still have `barstate.isconfirmed = true`, so that flag is not used by itself to identify a normal bar-close decision.
 - Higher-timeframe values are the **last confirmed 1H bar** (`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`) - no future leak.
 - The confirmed signal bar queues an order; after the fill, targets/stops are **frozen from the actual `strategy.position_avg_price`** and the signal-bar regime context.
 - The half-life estimate uses only past data.
 
-The strategy uses `calc_on_order_fills = true` so it can place the first protective price orders immediately after the broker emulator exposes the actual fill average. Historical results should still be checked with the Strategy Tester’s order-fill assumptions and Bar Magnifier settings.
+The strategy uses `calc_on_order_fills = true` so it can place the first protective price orders immediately after the broker emulator exposes the actual fill average. A fill recalculation cannot create a new setup or entry, or trigger Trend-fail/Timeout from the current bar’s final OHLC values. Historical results should still be checked with the Strategy Tester’s order-fill assumptions and Bar Magnifier settings.
+
+### v3.0.1 validation checklist
+
+After compiling in TradingView, verify Long Entry, Short Entry, Trim, breakeven stop, Stop, Trend Fail, Timeout, and Final behavior. In particular, confirm that a Trim fill does not immediately trigger a Trend Fail on the same fill recalculation, and compare results with Bar Magnifier off and on.
 
 ## Limitations & scope
 

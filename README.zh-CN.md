@@ -6,7 +6,7 @@ English · [简体中文](README.zh-CN.md)
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.1-informational)](CHANGELOG.md)
 
 ---
 
@@ -60,6 +60,8 @@ flowchart TD
 
 `观察` → `T买 / T空` → `T减`(真实部分退出,剩余止损上移保本)→ `T平`(退出剩余仓位,完全回归)。
 异常退出:`T止损`(统计或 ATR 风险线)、`趋势失效`(市场转为趋势)、`T超时`(超过半衰期)、`T保本`(首目标后触发)。
+
+策略没有日终强制清仓。持仓与等待均值回归的 Setup 可以自然跨越交易日。
 
 ---
 
@@ -208,7 +210,7 @@ flowchart TD
 
 Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 T减后的保本估算使用相同假设。
 
-启用 `moveStopToBE` 后,真实 T减成交后剩余仓位的止损移动到 `entry +/- transaction cost`。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值,不再使用旧的虚拟 P&L 计数器。Range/Shock 次数是轻量辅助分类;每笔完整仓位结束时,根据 Strategy Tester 净利润变化判断是否盈利。
+启用 `moveStopToBE` 后,真实 T减成交后剩余仓位的止损移动到 `entry +/- transaction cost`。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值,不再使用旧的虚拟 P&L 计数器。Range/Shock 是轻量辅助分类,面板分别显示进场 / 已平 / 盈利数量,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
 
 Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于请求价的价格成交,Trend Fail/Timeout 的市价单在下一可成交时点执行。
 
@@ -216,12 +218,17 @@ Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于�
 
 ## 防重绘
 
-- Setup 与入场决策门控于 `barstate.isconfirmed`;成交 / 退出事件只在策略真实状态变化时发出。
+- Setup、入场、趋势失效与超时决策只允许在正常的 confirmed-bar 决策阶段运行;成交 / 退出事件只在策略真实状态变化时发出。
+- `calc_on_order_fills` 触发的执行只用于同步真实 Entry/T减/T平状态与维护保护订单。历史成交重算中 `barstate.isconfirmed` 仍可能为 `true`,因此不能单独用它识别正常收盘决策。
 - 高周期数据取**上一根已确认的 1H bar**(`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`)——无未来数据泄漏。
 - 已确认信号 bar 先排队订单;成交后从真实 `strategy.position_avg_price` 与信号 bar 环境上下文冻结目标 / 止损。
 - 半衰期估计只用历史数据。
 
-策略启用 `calc_on_order_fills = true`,让 Broker Emulator 提供真实成交均价后立即挂出第一组保护性价格订单。历史结果仍应结合 Strategy Tester 的成交假设与 Bar Magnifier 设置检查。
+策略启用 `calc_on_order_fills = true`,让 Broker Emulator 提供真实成交均价后立即挂出第一组保护性价格订单。成交重算不能创建新的 Setup / Entry,也不能使用本根最终 OHLC 立即触发趋势失效 / 超时。历史结果仍应结合 Strategy Tester 的成交假设与 Bar Magnifier 设置检查。
+
+### v3.0.1 验收清单
+
+在 TradingView 编译后,依次检查 Long Entry、Short Entry、T减、保本止损、Stop、Trend Fail、Timeout 与 Final。重点确认 T减成交后的额外重算不会在同一次执行中立即触发 Trend Fail,并比较 Bar Magnifier 关闭 / 开启时的结果。
 
 ## 局限与边界
 

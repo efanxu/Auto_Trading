@@ -2,6 +2,21 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.1] — Correctness patch
+
+This release is a correctness patch for the Strategy Tester execution lifecycle. The trading strategy and its parameters are unchanged.
+
+### Fixed
+
+- **Isolated fill synchronization from bar-close decisions** — with `calc_on_order_fills = true`, executions caused by actual Entry, Trim, or final Exit fills now synchronize Strategy Tester state and maintain protective orders only. Setup, Entry Confirmation, Trend Fail, and Timeout decisions require the normal confirmed-bar decision phase; `barstate.isconfirmed` alone is not treated as sufficient on historical fill executions.
+- **Range/Shock attribution denominators** — auxiliary statistics now track Entries, Closed positions, and Wins separately. Range/Shock win rates use `Wins / Closed`, while formal Net Profit, Max Drawdown, Profit Factor, Win Rate, and Closed Trades remain Strategy Tester values.
+
+### Unchanged behavior
+
+- Positions and pending mean-reversion setups may continue across trading dates; there is no session-end or new-day forced exit.
+- Both Long (`MR-L`) and Short (`MR-S`) remain enabled by default.
+- Range and Shock engines, real staged exits, OCA reduce orders, post-Trim breakeven protection, and the next-bar-before-Final rule remain in place.
+
 ## [3.0.0] — Strategy Tester release
 
 MR-T is upgraded from a signal indicator with virtual position bookkeeping to a directly backtestable TradingView `strategy()`.
