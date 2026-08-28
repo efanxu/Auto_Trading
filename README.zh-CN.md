@@ -6,7 +6,7 @@ English · [简体中文](README.zh-CN.md)
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.2-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.3-informational)](CHANGELOG.md)
 
 ---
 
@@ -31,6 +31,8 @@ English · [简体中文](README.zh-CN.md)
 | 真实分批退出 | `trimPct` 控制 T减比例(默认 50%);T平退出剩余仓位 |
 | 成本感知保本 | Strategy Tester 手续费/滑点是正式成本来源;匹配输入用于计算 T减后的保本位 |
 | 同 bar 成交状态 | 专用 `varip` fill state 跨多次 `calc_on_order_fills` execution 跟踪真实仓位变化,不改变信号规则 |
+| Broker / FillState 一致性 | 分类空仓、等待成交、stale、方向冲突、孤儿仓位与直接反向;无效上下文会清理或安全平仓 |
+| 保护性数量守卫 | STOP/TRIM/FINAL 的 qty 以当前真实 `strategy.position_size` 为上限,防止过期 entry size 反向开仓 |
 | 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;输入项标签是编译期静态文本,策略警报使用结构化动态消息 |
 | 防重绘 | 信号门控于已确认 K 线;高周期数据取上一根已确认的 1H bar;目标价进场时冻结 |
 | 版本化 | 语义化版本(见 `CHANGELOG.md`),版本号显示在面板 |
@@ -215,6 +217,27 @@ Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(�
 
 Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于请求价的价格成交,Trend Fail/Timeout 的市价单在下一可成交时点执行。
 
+### v3.0.3 Broker / FillState 一致性
+
+`strategy.position_size` 与 `strategy.position_avg_price` 是 Broker Emulator 的最终事实来源。`MRFillState` 只保存冻结的信号上下文、生命周期阶段、退出原因与辅助统计。Data Window 暴露以下数值一致性分类器:
+
+| 编码 | 状态 | 含义 |
+|---:|---|---|
+| 0 | `OK_FLAT` | Broker 与生命周期均为空仓 |
+| 1 / 2 | `OK_LONG` / `OK_SHORT` | 活跃生命周期与 Broker 方向一致 |
+| 3 | `PENDING_ENTRY` | 已排队入场或正处于该入场的成交 transition |
+| 4 | `STALE_ACTIVE_FLAT` | 生命周期仍 active,但 Broker 空仓且不是当前 Full Exit transition |
+| 5 | `DIRECTION_MISMATCH` | Broker 方向与 active/pending 生命周期方向冲突 |
+| 6 | `ORPHAN_BROKER` | Broker 有仓位,但没有 active 或 pending 生命周期 |
+| 7 | `DIRECT_REVERSAL` | 本次 execution 从 Long 直接变为 Short,或反向 |
+| 8 / 9 | `STALE_PENDING` / `INVALID_CONTEXT` | pending 或冻结上下文已不安全,不能继续管理 |
+
+Stale 上下文会被清除,不会增加 Range/Shock 的 Closed 或 Wins。孤儿仓位与直接反向会取消全部未成交 MR 订单,再用 `strategy.close_all()` 安全收口;绝不会用当前 mean/std 伪造为新交易。保护性订单继续采用分阶段的 `strategy.order` + `strategy.oca.reduce`,因为第一阶段必须同时存在全仓 STOP 与部分 TRIM。每次提交的 STOP/TRIM/FINAL qty 都限制在当前真实 broker 仓位绝对值以内;只有 `tradeContextValid` 为真时才绘制交易线。
+
+Data Window 中 `Latest Closed Exit ID Code` 的编码为 `1 = MR-L-TRIM`、`2 = MR-S-TRIM`、`3 = MR-L-FINAL`、`4 = MR-S-FINAL`、`5 = 其它/未知退出`、`0 = 尚无记录`。
+
+面板增加 `Broker Position`、`Broker Avg Price`、`FillState Position` 与 `Consistency`。如果 Short 的当前价格明显高于 Risk,或 Long 的当前价格明显低于 Risk,Strategy Tester 不应继续保持旧的 T 状态;它必须已经由保护订单退出,或进入明确的 recovery 路径。
+
 ---
 
 ## 防重绘
@@ -227,7 +250,7 @@ Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于�
 
 策略启用 `calc_on_order_fills = true`,让 Broker Emulator 提供真实成交均价后立即挂出第一组保护性价格订单。成交重算不能创建新的 Setup / Entry,也不能使用本根最终 OHLC 立即触发趋势失效 / 超时。历史结果仍应结合 Strategy Tester 的成交假设与 Bar Magnifier 设置检查。
 
-### v3.0.2 TradingView 验收清单
+### v3.0.3 TradingView 验收清单
 
 在 15 分钟图于 TradingView 编译后:
 
@@ -240,7 +263,10 @@ Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于�
 7. 确认 Trade Mode 只初始化一次,并在所有成交之间保持不变。
 8. 确认 T减所在 bar 不提交 Final,从下一根 bar 起才允许提交。
 9. 对照 `strategy.position_size`、Range/Shock 统计、T减/退出标签和订单列表,检查 Data Window 中的 Previous Execution Position Size、Current Strategy Position Size、Fill Event Type、Intrabar Trade Active、Intrabar Partial Taken。
-10. 对比 Bar Magnifier 关闭与开启时的结果。
+10. 确认 Data Window 还显示 FillState Direction、Consistency State、Direction Reversal Detected、Consistency Recovery Count、Active STOP/TRIM/FINAL Qty 与 Latest Closed Exit ID Code。
+11. 构造或定位 stale active-flat、orphan broker、`-100 -> +20` 与 `+100 -> -20` transition;确认显示 `STATE ERROR`,不再绘制旧交易线,不重新初始化旧生命周期,也不会留下直接反向仓位。
+12. 对 Short 将价格明确推过 Risk,对 Long 将价格明确压过 Risk;确认 Strategy Tester 已退出,而不是继续显示旧的 T 状态。
+13. 对比 Bar Magnifier 关闭与开启时的结果。
 
 源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 

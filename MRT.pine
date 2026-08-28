@@ -6,7 +6,7 @@
 strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v3.0.2
+// Mean Reversion T (MR-T) · Strategy v3.0.3
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -20,7 +20,7 @@ strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
 // 收盘确认信号 → 下一可成交时点执行;换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v3.0.2 —— Strategy Tester 回测版本。变更见 CHANGELOG.md。
+// 版本 / Version: v3.0.3 —— Strategy Tester 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -38,7 +38,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "3.0.2"
+string SCRIPT_VERSION = "3.0.3"
 
 
 // ============================================================================
@@ -477,6 +477,14 @@ type MRFillState
     varip bool   partialTaken = false
     varip int    partialBar = na
 
+    // Broker/fill-state recovery is separate from the normal trade lifecycle.
+    // A recovery never contributes to Range/Shock Closed or Wins statistics.
+    varip bool   consistencyRecoveryPending = false
+    varip bool   consistencyRecoveryClosePlaced = false
+    varip int    consistencyRecoveryState = 0
+    varip int    consistencyRecoveryCount = 0
+    varip int    latestClosedExitCode = 0
+
     // Range / Shock auxiliary statistics; formal performance remains Strategy Tester.
     varip int    rangeEntries = 0
     varip int    rangeClosed = 0
@@ -502,6 +510,44 @@ f_clearPendingSignal() =>
     t.pendingStd := na
     t.pendingAtr := na
     t.pendingTimeStop := na
+
+f_clearTradeContext() =>
+    fillState.active := false
+    fillState.pos := 0
+    fillState.partialTaken := false
+    fillState.partialBar := na
+    fillState.trimOrderActive := false
+
+    fillState.entryBar := na
+    fillState.entryPrice := na
+    fillState.entrySize := na
+    fillState.mean := na
+    fillState.std := na
+    fillState.atr := na
+    fillState.partialTarget := na
+    fillState.finalTarget := na
+    fillState.baseStop := na
+    fillState.timeStop := na
+    fillState.tradeMode := 0
+    fillState.cost := 0.0
+    fillState.netProfitAtEntry := na
+    fillState.exitReasonPending := 0
+    fillState.exitRequested := false
+    fillState.marketClosePlaced := false
+
+    fillState.pendingEntry := false
+    fillState.pendingDir := 0
+    fillState.pendingMode := 0
+    fillState.pendingBar := na
+    fillState.pendingMean := na
+    fillState.pendingStd := na
+    fillState.pendingAtr := na
+    fillState.pendingTimeStop := na
+    f_clearPendingSignal()
+
+    t.setupBar := na
+    t.setupDir := 0
+    t.setupMode := 0
 
 // 一次性事件:Pine 禁止在函数内重赋任何全局变量(CE10088),函数只能改对象字段。
 // 因此成交事件先写入 fillState 的捕获字段,全局作用域再派生为这些变量。
@@ -533,6 +579,33 @@ int R_TREND = 2
 int R_TIME  = 3
 int R_FINAL = 4
 int R_BE    = 5
+int R_STATE_RECOVERY = 6
+
+// Broker/fill-state consistency classifier.  The broker position remains the
+// final source of truth; these states describe whether the frozen lifecycle can
+// safely manage it.
+int CONSISTENCY_OK_FLAT = 0
+int CONSISTENCY_OK_LONG = 1
+int CONSISTENCY_OK_SHORT = 2
+int CONSISTENCY_PENDING_ENTRY = 3
+int CONSISTENCY_STALE_ACTIVE_FLAT = 4
+int CONSISTENCY_DIRECTION_MISMATCH = 5
+int CONSISTENCY_ORPHAN_BROKER = 6
+int CONSISTENCY_DIRECT_REVERSAL = 7
+int CONSISTENCY_STALE_PENDING = 8
+int CONSISTENCY_INVALID_CONTEXT = 9
+
+f_consistencyName(int state) =>
+    state == CONSISTENCY_OK_FLAT ? "OK_FLAT" : state == CONSISTENCY_OK_LONG ? "OK_LONG" : state == CONSISTENCY_OK_SHORT ? "OK_SHORT" : state == CONSISTENCY_PENDING_ENTRY ? "PENDING_ENTRY" : state == CONSISTENCY_STALE_ACTIVE_FLAT ? "STALE_ACTIVE_FLAT" : state == CONSISTENCY_DIRECTION_MISMATCH ? "DIRECTION_MISMATCH" : state == CONSISTENCY_ORPHAN_BROKER ? "ORPHAN_BROKER" : state == CONSISTENCY_DIRECT_REVERSAL ? "DIRECT_REVERSAL" : state == CONSISTENCY_STALE_PENDING ? "STALE_PENDING" : "INVALID_CONTEXT"
+
+f_exitIdCode(string exitId) =>
+    exitId == "MR-L-TRIM" ? 1 : exitId == "MR-S-TRIM" ? 2 : exitId == "MR-L-FINAL" ? 3 : exitId == "MR-S-FINAL" ? 4 : exitId == "" ? 0 : 5
+
+// Keep every price-order quantity within the broker's current absolute size.
+// The configured Entry size remains a planning/statistics value only.
+f_safeExitQty(float configuredQty, float brokerPositionSize) =>
+    float requestedQty = math.max(nz(configuredQty, 0.0), 0.0)
+    math.min(requestedQty, math.abs(brokerPositionSize))
 
 // --------------------------------------------------------------------------
 // Execution-to-execution position transition detection.
@@ -560,6 +633,7 @@ bool positionClosed = positionSampleReady and previousExecutionPositionSize != 0
 bool sameDirectionPosition = positionSampleReady and previousExecutionPositionSize != 0.0 and currentPositionSize != 0.0 and previousExecutionPositionSize * currentPositionSize > 0.0
 bool positionReduced = sameDirectionPosition and math.abs(currentPositionSize) < math.abs(previousExecutionPositionSize)
 bool positionChanged = positionSampleReady and currentPositionSize != previousExecutionPositionSize
+int previousPositionDir = previousExecutionPositionSize > 0.0 ? 1 : previousExecutionPositionSize < 0.0 ? -1 : 0
 int currentPositionDir = currentPositionSize > 0.0 ? 1 : currentPositionSize < 0.0 ? -1 : 0
 
 // A closed-trade exit ID is authoritative when the broker emulator exposes a
@@ -573,6 +647,9 @@ bool trimIdConfirmed = hasNewClosedTrade and latestClosedExitId == expectedTrimI
 bool trimIdRejected = hasNewClosedTrade and latestClosedExitId != expectedTrimId
 bool trimSizeMatches = false
 
+if hasNewClosedTrade
+    fillState.latestClosedExitCode := f_exitIdCode(latestClosedExitId)
+
 if positionReduced and not na(fillState.entrySize) and fillState.entrySize > 0.0
     float expectedTrimQty = fillState.entrySize * trimPct / 100.0
     float observedReducedQty = math.abs(previousExecutionPositionSize) - math.abs(currentPositionSize)
@@ -582,13 +659,96 @@ if positionReduced and not na(fillState.entrySize) and fillState.entrySize > 0.0
 bool trimFilled = positionReduced and fillState.active and not fillState.partialTaken and fillState.trimOrderActive and (trimIdConfirmed or (not trimIdRejected and trimSizeMatches))
 bool entryFilled = positionEntered and not fillState.active
 bool entryContextAvailable = fillState.pendingEntry and fillState.pendingDir == currentPositionDir
-bool fullExitFilled = positionClosed and fillState.active
+bool fullExitFilled = positionClosed and fillState.active and fillState.pos != 0
+
+// Classify the broker/fill-state relationship before any new lifecycle work.
+// Direct reversals have priority over all other mismatches because they prove
+// that an exit order crossed zero and must never be treated as a new Entry.
+bool directionReversed = positionSampleReady and previousExecutionPositionSize * currentPositionSize < 0.0
+bool priorBrokerDirectionMismatch = positionSampleReady and previousPositionDir != 0 and fillState.active and previousPositionDir != fillState.pos
+bool staleActiveFlat = currentPositionSize == 0.0 and (fillState.active or fillState.pos != 0) and (not fullExitFilled or priorBrokerDirectionMismatch)
+bool brokerDirectionMismatch = currentPositionSize != 0.0 and fillState.active and currentPositionDir != fillState.pos
+bool pendingDirectionMismatch = currentPositionSize != 0.0 and fillState.pendingEntry and currentPositionDir != fillState.pendingDir
+bool stalePendingEntry = currentPositionSize != 0.0 and fillState.pendingEntry and not positionEntered
+bool activePendingConflict = (fillState.active or fillState.pos != 0) and fillState.pendingEntry
+bool orphanBrokerPosition = currentPositionSize != 0.0 and not fillState.active and not fillState.pendingEntry
+bool frozenContextInvalid = fillState.active and (na(fillState.entryPrice) or na(fillState.entrySize) or fillState.entrySize <= 0.0 or na(fillState.partialTarget) or na(fillState.finalTarget) or na(fillState.baseStop))
+bool unexpectedSameDirectionReduction = positionReduced and fillState.active and not fillState.partialTaken and not trimFilled
+bool unexpectedSameDirectionIncrease = sameDirectionPosition and math.abs(currentPositionSize) > math.abs(previousExecutionPositionSize) and fillState.active
+
+int consistencyState = currentPositionSize == 0.0 ? CONSISTENCY_OK_FLAT : CONSISTENCY_ORPHAN_BROKER
+bool consistencyRecoveryRequired = false
+
+if fillState.consistencyRecoveryPending
+    if currentPositionSize == 0.0
+        f_clearTradeContext()
+        fillState.consistencyRecoveryPending := false
+        fillState.consistencyRecoveryClosePlaced := false
+        consistencyState := CONSISTENCY_OK_FLAT
+    else
+        consistencyState := fillState.consistencyRecoveryState
+        consistencyRecoveryRequired := true
+else if directionReversed
+    consistencyState := CONSISTENCY_DIRECT_REVERSAL
+    consistencyRecoveryRequired := true
+else if priorBrokerDirectionMismatch
+    consistencyState := CONSISTENCY_DIRECTION_MISMATCH
+    consistencyRecoveryRequired := true
+else if staleActiveFlat
+    consistencyState := CONSISTENCY_STALE_ACTIVE_FLAT
+    consistencyRecoveryRequired := true
+else if activePendingConflict or brokerDirectionMismatch or pendingDirectionMismatch
+    consistencyState := CONSISTENCY_DIRECTION_MISMATCH
+    consistencyRecoveryRequired := true
+else if frozenContextInvalid
+    consistencyState := CONSISTENCY_INVALID_CONTEXT
+    consistencyRecoveryRequired := true
+else if unexpectedSameDirectionReduction or unexpectedSameDirectionIncrease
+    consistencyState := CONSISTENCY_INVALID_CONTEXT
+    consistencyRecoveryRequired := true
+else if stalePendingEntry
+    consistencyState := CONSISTENCY_STALE_PENDING
+    consistencyRecoveryRequired := true
+else if orphanBrokerPosition
+    consistencyState := CONSISTENCY_ORPHAN_BROKER
+    consistencyRecoveryRequired := true
+else if fillState.pendingEntry
+    consistencyState := CONSISTENCY_PENDING_ENTRY
+else if currentPositionSize != 0.0 and fillState.active and currentPositionDir == fillState.pos
+    consistencyState := currentPositionDir == 1 ? CONSISTENCY_OK_LONG : CONSISTENCY_OK_SHORT
+
+// Recovery is an explicit state repair, not a normal Stop/Final/Trend exit.
+// Cancel every outstanding MR order before clearing the frozen context; if a
+// broker position remains, close the unknown/reversed net position once.
+if consistencyRecoveryRequired
+    bool startingRecovery = not fillState.consistencyRecoveryPending
+
+    if startingRecovery
+        fillState.consistencyRecoveryCount += 1
+        fillState.consistencyRecoveryState := consistencyState
+        fillState.consistencyRecoveryClosePlaced := false
+        strategy.cancel_all()
+
+    fillState.eventReason := R_STATE_RECOVERY
+    f_clearTradeContext()
+    fillState.lastExitBar := bar_index
+
+    if currentPositionSize != 0.0
+        fillState.consistencyRecoveryPending := true
+
+        if not fillState.consistencyRecoveryClosePlaced
+            string recoveryDirection = currentPositionDir == 1 ? "Long" : "Short"
+            strategy.close_all(comment = "MR-T State Recovery", alert_message = "MR-T|direction=" + recoveryDirection + "|event=State Recovery|price=" + str.tostring(close, format.mintick))
+            fillState.consistencyRecoveryClosePlaced := true
+    else
+        fillState.consistencyRecoveryPending := false
+        fillState.consistencyRecoveryClosePlaced := false
 
 // Fill recalculations may see confirmed historical OHLC values, so they may
 // synchronize real fills and maintain orders, but may not make bar-close
 // trading decisions. barstate.isconfirmed alone is not sufficient.
 bool isFillSynchronizationExecution = positionChanged
-bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution
+bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution and not consistencyRecoveryRequired
 
 // 冷却
 int barsSinceExit = 100000
@@ -597,7 +757,7 @@ if not na(fillState.lastExitBar)
     barsSinceExit := bar_index - fillState.lastExitBar
 
 int requiredCooldown = math.max(cooldownBars, 1)
-bool canEnter = currentPositionSize == 0.0 and not fillState.active and not fillState.pendingEntry and (na(fillState.lastExitBar) or barsSinceExit >= requiredCooldown)
+bool canEnter = not consistencyRecoveryRequired and currentPositionSize == 0.0 and not fillState.active and not fillState.pendingEntry and (na(fillState.lastExitBar) or barsSinceExit >= requiredCooldown)
 
 
 // ============================================================================
@@ -702,7 +862,7 @@ else if t.setupDir == -1
 
 bool bandOK = not requireBandReclaim or priceBandReclaim
 
-bool flatForEntry = currentPositionSize == 0.0 and not fillState.active and not fillState.pendingEntry
+bool flatForEntry = not consistencyRecoveryRequired and currentPositionSize == 0.0 and not fillState.active and not fillState.pendingEntry
 bool longEntrySignal = allowBarCloseDecision and flatForEntry and not hardTrendVeto and t.setupDir == 1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
 bool shortEntrySignal = allowBarCloseDecision and flatForEntry and not hardTrendVeto and t.setupDir == -1 and not na(t.setupBar) and zReclaim and bandOK and candleOK
 
@@ -895,42 +1055,7 @@ f_exit(int dir, int reason) =>
                 fillState.shockWins += 1
 
         fillState.lastExitBar := bar_index
-        fillState.active := false
-        fillState.pos := 0
-        fillState.partialTaken := false
-        fillState.partialBar := na
-        fillState.trimOrderActive := false
-
-        fillState.entryBar := na
-        fillState.entryPrice := na
-        fillState.entrySize := na
-        fillState.mean := na
-        fillState.std := na
-        fillState.atr := na
-        fillState.partialTarget := na
-        fillState.finalTarget := na
-        fillState.baseStop := na
-        fillState.timeStop := na
-        fillState.tradeMode := 0
-        fillState.cost := 0.0
-        fillState.netProfitAtEntry := na
-        fillState.exitReasonPending := 0
-        fillState.exitRequested := false
-        fillState.marketClosePlaced := false
-
-        fillState.pendingEntry := false
-        fillState.pendingDir := 0
-        fillState.pendingMode := 0
-        fillState.pendingBar := na
-        fillState.pendingMean := na
-        fillState.pendingStd := na
-        fillState.pendingAtr := na
-        fillState.pendingTimeStop := na
-        f_clearPendingSignal()
-
-        t.setupBar := na
-        t.setupDir := 0
-        t.setupMode := 0
+        f_clearTradeContext()
 
         fillState.eventKind := 3
         fillState.eventDir := dir
@@ -942,12 +1067,16 @@ f_exit(int dir, int reason) =>
 // ============================================================================
 // Manage (方向参数化)
 // ============================================================================
-// 价格目标与止损由同一 OCA reduce 组的 strategy.order 作为真实订单维护。Trend Fail / Timeout
-// 使用 strategy.close 市价退出;退出优先级仍为风险线 → 趋势失效 → 超时,
-// 而 T平只在实际 T减成交并进入第二阶段后提交。
+// 价格目标与止损由同一 OCA reduce 组的 strategy.order 作为真实订单维护。
+// 这里保留 strategy.order 而不是拆成多个 strategy.exit: Pine 会为多个
+// strategy.exit 调用预留仓位,从而无法同时表达“全仓 STOP + 部分 TRIM”的
+// 第一阶段。OCA reduce 负责正常成交后的数量缩减;每次提交仍由
+// f_safeExitQty 限制在当前 broker position 内,直接反向则走 recovery。
+// Trend Fail / Timeout 使用 strategy.close 市价退出;退出优先级仍为风险线 →
+// 趋势失效 → 超时,而 T平只在实际 T减成交并进入第二阶段后提交。
 
-f_manage(int dir, bool allowBarCloseDecision) =>
-    bool canManage = fillState.active and fillState.pos == dir and currentPositionSize * dir > 0.0 and not na(fillState.entryBar) and bar_index > fillState.entryBar
+f_manage(int dir, bool allowBarCloseDecision, bool tradeContextValid) =>
+    bool canManage = tradeContextValid and fillState.pos == dir and currentPositionSize * dir > 0.0 and not na(fillState.entryBar) and bar_index > fillState.entryBar
 
     // Only the normal confirmed-bar execution may evaluate close-based exits.
     if allowBarCloseDecision and canManage and not fillState.exitRequested
@@ -970,26 +1099,46 @@ if longEntrySignal
     f_enter(1)
     strategy.entry("MR-L", strategy.long, alert_message = f_orderMessage(1, "Long Entry", t.pendingMode, close))
     alert(f_orderMessage(1, "Long Entry", t.pendingMode, close), alert.freq_all)
+    consistencyState := CONSISTENCY_PENDING_ENTRY
 else if shortEntrySignal
     f_enter(-1)
     strategy.entry("MR-S", strategy.short, alert_message = f_orderMessage(-1, "Short Entry", t.pendingMode, close))
     alert(f_orderMessage(-1, "Short Entry", t.pendingMode, close), alert.freq_all)
+    consistencyState := CONSISTENCY_PENDING_ENTRY
 
 // 市场订单在下一可成交时点建立后,同步 Strategy Tester 的真实持仓。
 // Entry 的事实来源是 0 -> 非 0 的 broker position transition;pending state 只
 // 提供已经冻结的信号上下文,不能单独决定是否发生了成交。
-if entryFilled and entryContextAvailable
+if entryFilled and entryContextAvailable and not consistencyRecoveryRequired
     f_initializeTrade(currentPositionDir)
+    consistencyState := currentPositionDir == 1 ? CONSISTENCY_OK_LONG : CONSISTENCY_OK_SHORT
 
 // 只有真实 Trim 订单导致仓位减少后才标记 T减;未知的仓位减少不会伪造该状态。
-if trimFilled
+if trimFilled and not consistencyRecoveryRequired
     f_markPartial(fillState.pos)
 
-f_manage(1, allowBarCloseDecision)
-f_manage(-1, allowBarCloseDecision)
+// A valid trade context must agree with the broker direction and contain every
+// frozen level used by the protective orders. Invalid contexts never submit a
+// stale STOP/TRIM/FINAL order or draw old trade lines.
+bool tradeContextValid = not consistencyRecoveryRequired and not fillState.consistencyRecoveryPending and fillState.active and fillState.pos != 0 and currentPositionSize * fillState.pos > 0.0 and currentPositionDir == fillState.pos and not na(fillState.entryPrice) and not na(fillState.entrySize) and fillState.entrySize > 0.0 and not na(fillState.partialTarget) and not na(fillState.finalTarget) and not na(fillState.baseStop)
+
+f_manage(1, allowBarCloseDecision, tradeContextValid)
+f_manage(-1, allowBarCloseDecision, tradeContextValid)
+
+float activeStopQty = 0.0
+float activeTrimQty = 0.0
+float activeFinalQty = 0.0
+
+if tradeContextValid and not fillState.exitRequested
+    activeStopQty := f_safeExitQty(math.abs(currentPositionSize), currentPositionSize)
+
+    if not fillState.partialTaken
+        activeTrimQty := f_safeExitQty(fillState.entrySize * trimPct / 100.0, currentPositionSize)
+    else if not na(fillState.partialBar) and bar_index > fillState.partialBar
+        activeFinalQty := f_safeExitQty(math.abs(currentPositionSize), currentPositionSize)
 
 // Trend Fail / Timeout 取消剩余价格单后提交对应的市价平仓单。
-if fillState.pos == 1 and currentPositionSize > 0.0 and fillState.exitRequested and not fillState.marketClosePlaced
+if tradeContextValid and fillState.pos == 1 and fillState.exitRequested and not fillState.marketClosePlaced
     strategy.cancel("MR-L-TRIM")
     strategy.cancel("MR-L-FINAL")
     strategy.cancel("MR-L-STOP")
@@ -998,7 +1147,7 @@ if fillState.pos == 1 and currentPositionSize > 0.0 and fillState.exitRequested 
     fillState.trimOrderActive := false
     fillState.marketClosePlaced := true
 
-if fillState.pos == -1 and currentPositionSize < 0.0 and fillState.exitRequested and not fillState.marketClosePlaced
+if tradeContextValid and fillState.pos == -1 and fillState.exitRequested and not fillState.marketClosePlaced
     strategy.cancel("MR-S-TRIM")
     strategy.cancel("MR-S-FINAL")
     strategy.cancel("MR-S-STOP")
@@ -1009,45 +1158,57 @@ if fillState.pos == -1 and currentPositionSize < 0.0 and fillState.exitRequested
 
 // 价格型订单使用冻结的 partial/final/risk levels。T减前只提交第一目标与全仓
 // 风险线;T减实际成交后,取消第一目标,下一根 K 线才提交 T平剩余仓位。
-if fillState.pos == 1 and currentPositionSize > 0.0 and not fillState.exitRequested
+if tradeContextValid and fillState.pos == 1 and not fillState.exitRequested
     float longRisk = f_activeStop(1)
-    float longExitQty = fillState.partialTaken ? math.abs(currentPositionSize) : fillState.entrySize
     string longStopEvent = fillState.partialTaken and moveStopToBE ? "Breakeven" : "Stop"
-    strategy.order("MR-L-STOP", strategy.short, stop = longRisk, qty = longExitQty, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, longStopEvent, fillState.tradeMode, longRisk))
+    if activeStopQty > 0.0
+        strategy.order("MR-L-STOP", strategy.short, stop = longRisk, qty = activeStopQty, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, longStopEvent, fillState.tradeMode, longRisk))
 
     if not fillState.partialTaken
         strategy.cancel("MR-L-FINAL")
-        strategy.order("MR-L-TRIM", strategy.short, limit = fillState.partialTarget, qty = fillState.entrySize * trimPct / 100.0, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Trim", fillState.tradeMode, fillState.partialTarget))
-        fillState.trimOrderActive := true
+
+        if activeTrimQty > 0.0
+            strategy.order("MR-L-TRIM", strategy.short, limit = fillState.partialTarget, qty = activeTrimQty, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Trim", fillState.tradeMode, fillState.partialTarget))
+            fillState.trimOrderActive := true
+        else
+            strategy.cancel("MR-L-TRIM")
+            fillState.trimOrderActive := false
     else
         strategy.cancel("MR-L-TRIM")
+        fillState.trimOrderActive := false
 
-        if bar_index > fillState.partialBar
-            strategy.order("MR-L-FINAL", strategy.short, limit = fillState.finalTarget, qty = math.abs(currentPositionSize), oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Final Exit", fillState.tradeMode, fillState.finalTarget))
+        if activeFinalQty > 0.0
+            strategy.order("MR-L-FINAL", strategy.short, limit = fillState.finalTarget, qty = activeFinalQty, oca_name = "MR-L-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(1, "Final Exit", fillState.tradeMode, fillState.finalTarget))
         else
             strategy.cancel("MR-L-FINAL")
 
-if fillState.pos == -1 and currentPositionSize < 0.0 and not fillState.exitRequested
+if tradeContextValid and fillState.pos == -1 and not fillState.exitRequested
     float shortRisk = f_activeStop(-1)
-    float shortExitQty = fillState.partialTaken ? math.abs(currentPositionSize) : fillState.entrySize
     string shortStopEvent = fillState.partialTaken and moveStopToBE ? "Breakeven" : "Stop"
-    strategy.order("MR-S-STOP", strategy.long, stop = shortRisk, qty = shortExitQty, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, shortStopEvent, fillState.tradeMode, shortRisk))
+    if activeStopQty > 0.0
+        strategy.order("MR-S-STOP", strategy.long, stop = shortRisk, qty = activeStopQty, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, shortStopEvent, fillState.tradeMode, shortRisk))
 
     if not fillState.partialTaken
         strategy.cancel("MR-S-FINAL")
-        strategy.order("MR-S-TRIM", strategy.long, limit = fillState.partialTarget, qty = fillState.entrySize * trimPct / 100.0, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Trim", fillState.tradeMode, fillState.partialTarget))
-        fillState.trimOrderActive := true
+
+        if activeTrimQty > 0.0
+            strategy.order("MR-S-TRIM", strategy.long, limit = fillState.partialTarget, qty = activeTrimQty, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Trim", fillState.tradeMode, fillState.partialTarget))
+            fillState.trimOrderActive := true
+        else
+            strategy.cancel("MR-S-TRIM")
+            fillState.trimOrderActive := false
     else
         strategy.cancel("MR-S-TRIM")
+        fillState.trimOrderActive := false
 
-        if bar_index > fillState.partialBar
-            strategy.order("MR-S-FINAL", strategy.long, limit = fillState.finalTarget, qty = math.abs(currentPositionSize), oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Final Exit", fillState.tradeMode, fillState.finalTarget))
+        if activeFinalQty > 0.0
+            strategy.order("MR-S-FINAL", strategy.long, limit = fillState.finalTarget, qty = activeFinalQty, oca_name = "MR-S-BRACKET", oca_type = strategy.oca.reduce, alert_message = f_orderMessage(-1, "Final Exit", fillState.tradeMode, fillState.finalTarget))
         else
             strategy.cancel("MR-S-FINAL")
 
 // 识别真实持仓归零,再 reset fillState。这样 Strategy Tester 的订单生命周期
 // 与图表状态不会因“信号触发”而提前脱钩。
-if fullExitFilled
+if fullExitFilled and not consistencyRecoveryRequired
     int actualReason = fillState.exitReasonPending
 
     if actualReason == 0 and hasNewClosedTrade
@@ -1058,6 +1219,7 @@ if fullExitFilled
 
     int closedDir = fillState.pos
     f_exit(closedDir, actualReason)
+    consistencyState := CONSISTENCY_OK_FLAT
 
 // The broker position sample is committed only after all transitions have been
 // classified and the corresponding lifecycle state has been synchronized.
@@ -1123,7 +1285,7 @@ float activePartialLine = na
 float activeFinalLine = na
 float activeRiskLine = na
 
-if fillState.active
+if tradeContextValid
     activePartialLine := fillState.partialTarget
     activeFinalLine := fillState.finalTarget
     activeRiskLine := f_activeStop(fillState.pos)
@@ -1230,8 +1392,16 @@ plot(fillState.rangeWins, "Range Wins", display = display.data_window)
 plot(fillState.shockEntries, "Shock Entries", display = display.data_window)
 plot(fillState.shockClosed, "Shock Closed", display = display.data_window)
 plot(fillState.shockWins, "Shock Wins", display = display.data_window)
-plot(fillState.previousExecutionPositionSize, "Previous Execution Position Size", display = display.data_window)
+plot(previousExecutionPositionSize, "Previous Execution Position Size", display = display.data_window)
 plot(currentPositionSize, "Current Strategy Position Size", display = display.data_window)
+plot(fillState.pos, "FillState Direction", display = display.data_window)
+plot(consistencyState, "Consistency State", display = display.data_window)
+plot(directionReversed ? 1 : 0, "Direction Reversal Detected", display = display.data_window)
+plot(fillState.consistencyRecoveryCount, "Consistency Recovery Count", display = display.data_window)
+plot(activeStopQty, "Active STOP Qty", display = display.data_window)
+plot(activeTrimQty, "Active TRIM Qty", display = display.data_window)
+plot(activeFinalQty, "Active FINAL Qty", display = display.data_window)
+plot(fillState.latestClosedExitCode, "Latest Closed Exit ID Code", display = display.data_window)
 plot(fillState.eventKind, "Fill Event Type", display = display.data_window)
 plot(fillState.active ? 1 : 0, "Intrabar Trade Active", display = display.data_window)
 plot(fillState.partialTaken ? 1 : 0, "Intrabar Partial Taken", display = display.data_window)
@@ -1241,7 +1411,7 @@ plot(fillState.partialTaken ? 1 : 0, "Intrabar Partial Taken", display = display
 // Panel
 // ============================================================================
 
-var table panel = table.new(position.top_right, 2, 17, border_width = 1)
+var table panel = table.new(position.top_right, 2, 21, border_width = 1)
 
 if showPanel and barstate.islast
 
@@ -1255,7 +1425,14 @@ if showPanel and barstate.islast
         envText := "Shock Only"
         envColor := color.purple
 
-    string stateText = fillState.active and fillState.pos == 1 ? f_tr("T多", "Long") : fillState.active and fillState.pos == -1 ? f_tr("T空", "Short") : fillState.pendingEntry and fillState.pendingDir == 1 ? f_tr("待多头成交", "Pending Long") : fillState.pendingEntry and fillState.pendingDir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("空仓", "Flat")
+    bool consistencyError = consistencyState >= CONSISTENCY_STALE_ACTIVE_FLAT
+    string stateText = consistencyError ? f_tr("状态错误", "STATE ERROR") : fillState.active and fillState.pos == 1 ? f_tr("T多", "Long") : fillState.active and fillState.pos == -1 ? f_tr("T空", "Short") : fillState.pendingEntry and fillState.pendingDir == 1 ? f_tr("待多头成交", "Pending Long") : fillState.pendingEntry and fillState.pendingDir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("空仓", "Flat")
+
+    string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
+    string brokerAvgText = currentPositionSize == 0.0 ? "-" : str.tostring(strategy.position_avg_price, format.mintick)
+    string fillStatePositionText = fillState.active and fillState.pos == 1 ? f_tr("多头", "Long") : fillState.active and fillState.pos == -1 ? f_tr("空头", "Short") : fillState.pendingEntry and fillState.pendingDir == 1 ? f_tr("待多头", "Pending Long") : fillState.pendingEntry and fillState.pendingDir == -1 ? f_tr("待空头", "Pending Short") : f_tr("空仓", "Flat")
+    string consistencyText = f_consistencyName(consistencyState)
+    color consistencyColor = consistencyError ? color.red : color.lime
 
     string setupText = f_tr("无", "None")
 
@@ -1271,13 +1448,13 @@ if showPanel and barstate.islast
     string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
     string shockText = str.tostring(shockMove, "#.00") + " ATR"
     string scoreText = str.tostring(regimeScore, "#")
-    string modeText = fillState.active ? f_modeName(fillState.tradeMode) : fillState.pendingEntry ? f_modeName(fillState.pendingMode) : "-"
+    string modeText = tradeContextValid ? f_modeName(fillState.tradeMode) : fillState.pendingEntry ? f_modeName(fillState.pendingMode) : "-"
     string stopText = stopMode
-    string phaseText = not fillState.active ? fillState.pendingEntry ? f_tr("等待成交", "Entry pending") : "-" : fillState.partialTaken ? f_tr("T减后", "Final phase") : f_tr("等待T减", "Trim phase")
-    string entryText = not fillState.active ? "-" : str.tostring(fillState.entryPrice, format.mintick)
-    string trimText = not fillState.active ? "-" : str.tostring(fillState.partialTarget, format.mintick)
-    string finalText = not fillState.active ? "-" : str.tostring(fillState.finalTarget, format.mintick)
-    string riskText = not fillState.active ? "-" : str.tostring(f_activeStop(fillState.pos), format.mintick)
+    string phaseText = tradeContextValid ? fillState.partialTaken ? f_tr("T减后", "Final phase") : f_tr("等待T减", "Trim phase") : fillState.pendingEntry ? f_tr("等待成交", "Entry pending") : "-"
+    string entryText = not tradeContextValid ? "-" : str.tostring(fillState.entryPrice, format.mintick)
+    string trimText = not tradeContextValid ? "-" : str.tostring(fillState.partialTarget, format.mintick)
+    string finalText = not tradeContextValid ? "-" : str.tostring(fillState.finalTarget, format.mintick)
+    string riskText = not tradeContextValid ? "-" : str.tostring(f_activeStop(fillState.pos), format.mintick)
     float testerProfitFactor = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
     string testerPLText = str.tostring(strategy.netprofit, format.mintick) + " / DD " + str.tostring(strategy.max_drawdown, format.mintick) + " / PF " + (na(testerProfitFactor) ? "-" : str.tostring(testerProfitFactor, "#.00"))
     float testerWinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
@@ -1338,9 +1515,21 @@ if showPanel and barstate.islast
     table.cell(panel, 0, 16, f_tr("Shock 进场 / 已平 / 盈利", "Shock entries / closed / wins"))
     table.cell(panel, 1, 16, shockStatsText)
 
+    table.cell(panel, 0, 17, f_tr("Broker 仓位", "Broker Position"))
+    table.cell(panel, 1, 17, brokerPositionText)
+
+    table.cell(panel, 0, 18, f_tr("Broker 均价", "Broker Avg Price"))
+    table.cell(panel, 1, 18, brokerAvgText)
+
+    table.cell(panel, 0, 19, f_tr("FillState 仓位", "FillState Position"))
+    table.cell(panel, 1, 19, fillStatePositionText)
+
+    table.cell(panel, 0, 20, f_tr("一致性", "Consistency"))
+    table.cell(panel, 1, 20, consistencyText, text_color = consistencyColor)
+
 
 if not showPanel and barstate.islast
-    table.clear(panel, 0, 0, 1, 16)
+    table.clear(panel, 0, 0, 1, 20)
 
 
 // ============================================================================

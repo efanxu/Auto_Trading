@@ -6,7 +6,7 @@ A production-grade **mean-reversion "T" strategy** for TradingView, written in P
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.2-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.3-informational)](CHANGELOG.md)
 
 ---
 
@@ -31,6 +31,8 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Partial exits | Configurable `trimPct` (default 50%) for T-trim; T-close exits the remaining position |
 | Cost-aware breakeven | Strategy Tester commission/slippage are the formal cost source; matching inputs size the post-trim breakeven estimate |
 | Intrabar fill state | A dedicated `varip` fill state tracks real position transitions across repeated `calc_on_order_fills` executions without changing signal rules |
+| Broker/fill-state consistency | Classifies flat, pending, stale, mismatched, orphan, and direct-reversal states; invalid contexts are cleared or safely closed |
+| Protective quantity guards | STOP/TRIM/FINAL quantities are capped by the current `strategy.position_size`, preventing stale entry size from creating a reversal |
 | Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; input labels are compile-time static, while alerts use structured dynamic messages |
 | Repaint-safe | Signals gated on confirmed bars; higher-timeframe data uses the last confirmed 1H bar; trade targets are frozen at entry |
 | Versioned | Semantic versioning (see `CHANGELOG.md`), version shown in the panel |
@@ -215,6 +217,27 @@ After a real T-trim fill, the remaining stop is moved to `entry +/- transaction 
 
 The broker emulator uses standard order handling. Price orders can fill at better or worse prices than their requested levels, and market orders from Trend Fail/Timeout fill on the next available tick.
 
+### v3.0.3 broker/fill-state consistency
+
+`strategy.position_size` and `strategy.position_avg_price` are the broker emulator’s source of truth. `MRFillState` only stores the frozen signal context, lifecycle phase, exit reason, and auxiliary statistics. The script exposes a numeric consistency classifier in the Data Window:
+
+| Code | State | Meaning |
+|---:|---|---|
+| 0 | `OK_FLAT` | Broker and lifecycle are flat |
+| 1 / 2 | `OK_LONG` / `OK_SHORT` | Active lifecycle and broker position agree |
+| 3 | `PENDING_ENTRY` | A confirmed entry is queued or in its fill transition |
+| 4 | `STALE_ACTIVE_FLAT` | Lifecycle is active while the broker is flat without a current Full Exit transition |
+| 5 | `DIRECTION_MISMATCH` | Broker direction conflicts with active/pending lifecycle direction |
+| 6 | `ORPHAN_BROKER` | Broker has a position with neither an active nor pending lifecycle |
+| 7 | `DIRECT_REVERSAL` | The execution crossed from Long to Short or Short to Long |
+| 8 / 9 | `STALE_PENDING` / `INVALID_CONTEXT` | Pending or frozen context is no longer safe to manage |
+
+Stale context is cleared without incrementing Range/Shock Closed or Wins. An orphan or direct-reversal broker position cancels all unfilled MR orders and is closed with `strategy.close_all()`; it is never initialized as a new trade from current mean/std values. Protective orders continue to use the staged `strategy.order` + `strategy.oca.reduce` structure because the first phase needs a full-position STOP and a partial TRIM at the same time. Every submitted STOP/TRIM/FINAL qty is clamped to the current absolute broker position, and trade lines are shown only when `tradeContextValid` is true.
+
+The numeric `Latest Closed Exit ID Code` is `1 = MR-L-TRIM`, `2 = MR-S-TRIM`, `3 = MR-L-FINAL`, `4 = MR-S-FINAL`, `5 = another/unknown exit`, and `0 = none observed`.
+
+The panel shows `Broker Position`, `Broker Avg Price`, `FillState Position`, and `Consistency`. A short whose current market price is materially above its Risk line, or a long whose current market price is materially below its Risk line, must not remain as an old Strategy Tester position; it must have exited at the protective order or entered the explicit recovery path.
+
 ---
 
 ## Repaint safety
@@ -227,7 +250,7 @@ The broker emulator uses standard order handling. Price orders can fill at bette
 
 The strategy uses `calc_on_order_fills = true` so it can place the first protective price orders immediately after the broker emulator exposes the actual fill average. A fill recalculation cannot create a new setup or entry, or trigger Trend-fail/Timeout from the current bar’s final OHLC values. Historical results should still be checked with the Strategy Tester’s order-fill assumptions and Bar Magnifier settings.
 
-### v3.0.2 TradingView validation checklist
+### v3.0.3 TradingView validation checklist
 
 After compiling in TradingView on a 15-minute chart:
 
@@ -240,7 +263,10 @@ After compiling in TradingView on a 15-minute chart:
 7. Confirm the trade mode is initialized once and remains stable through all fills.
 8. Confirm Final is not submitted on the Trim bar and is eligible starting on the next bar.
 9. Compare `strategy.position_size`, Range/Shock counts, Trim/Exit labels, and the order list against the Data Window fields: Previous Execution Position Size, Current Strategy Position Size, Fill Event Type, Intrabar Trade Active, and Intrabar Partial Taken.
-10. Compare results with Bar Magnifier OFF and ON.
+10. Confirm Data Window also reports FillState Direction, Consistency State, Direction Reversal Detected, Consistency Recovery Count, Active STOP/TRIM/FINAL Qty, and Latest Closed Exit ID Code.
+11. Force or locate stale active-flat, orphan broker, and `-100 -> +20` / `+100 -> -20` transitions; confirm `STATE ERROR`, no stale trade lines, no old lifecycle reinitialization, and no direct reversal remains open.
+12. For a Short, move price clearly above Risk; for a Long, move price clearly below Risk. Confirm the Strategy Tester position exits rather than remaining in the old T state.
+13. Compare results with Bar Magnifier OFF and ON.
 
 The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 

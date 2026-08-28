@@ -2,6 +2,29 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.3] — Broker/fill-state consistency patch
+
+This release keeps the v3.0.2 fill-recalculation model and `varip MRFillState`, then adds strong consistency checks against the Strategy Tester broker position and hardens protective exit quantities.
+
+### Fixed
+
+- **Broker/lifecycle invariant** — `strategy.position_size` and `strategy.position_avg_price` remain the final broker facts; active, pending, and frozen lifecycle state is classified against them on every execution.
+- **Stale, orphan, and reversal recovery** — stale active-flat state is cleared without normal exit attribution; orphan broker positions and direct Long↔Short reversals cancel outstanding MR orders and close the unknown net position with `strategy.close_all()` instead of silently reinitializing it.
+- **Direct reversal detection** — cross-zero transitions such as `-100 -> +20` and `+100 -> -20` are explicit `DIRECT_REVERSAL` errors, not unhandled `positionChanged` events.
+- **Protective exit quantity correctness** — STOP, TRIM, and FINAL quantities are clamped to the current absolute broker position, so stale `entrySize` cannot independently over-exit or reverse the net position. The staged `strategy.order` + OCA reduce structure remains because the first stage needs a full STOP and partial TRIM concurrently; all order paths are gated by a valid frozen trade context.
+- **Truthful display and diagnostics** — T-trim/T-close/Risk lines disappear when broker and lifecycle state disagree. Panel and Data Window now expose broker position/average, FillState direction, consistency state, reversal detection, recovery count, active protective quantities, and a numeric latest closed exit ID.
+
+### Unchanged behavior
+
+- `allowLong = true`, `allowShort = true`, cross-date positions, Range/Shock engines, Regime Score, Hard Trend Veto, Half-Life, Trend Fail, Timeout, 50% default Trim, Final, BE, all existing strategy parameters, and `calc_on_order_fills = true` remain unchanged.
+- Range/Shock statistics count only normal lifecycle Entries, Full Exits, and Wins; state recovery does not add or duplicate Closed/Wins.
+
+### Verification
+
+- `tests/MRT-v3.0.3-consistency-harness.ps1` covers normal Long/Short, Stop, Trim→BE, stale, orphan, direct reversal, and protective-quantity scenarios.
+- Static review and `git diff --check` are required before release.
+- TradingView Pine v6 compilation, Strategy Tester runtime behavior, and Bar Magnifier OFF/ON comparison remain pending manual verification.
+
 ## [3.0.2] — Intrabar fill-state correctness patch
 
 This release fixes rollback-sensitive Strategy Tester fill synchronization. Trading
