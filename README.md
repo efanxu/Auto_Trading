@@ -6,7 +6,7 @@ A production-grade **mean-reversion "T" strategy** for TradingView, written in P
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.1-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.2-informational)](CHANGELOG.md)
 
 ---
 
@@ -30,6 +30,7 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Strategy Tester | Real `strategy.entry`, OCA price exits, and `strategy.close` market exits; formal P&L comes from Strategy Tester |
 | Partial exits | Configurable `trimPct` (default 50%) for T-trim; T-close exits the remaining position |
 | Cost-aware breakeven | Strategy Tester commission/slippage are the formal cost source; matching inputs size the post-trim breakeven estimate |
+| Intrabar fill state | A dedicated `varip` fill state tracks real position transitions across repeated `calc_on_order_fills` executions without changing signal rules |
 | Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; input labels are compile-time static, while alerts use structured dynamic messages |
 | Repaint-safe | Signals gated on confirmed bars; higher-timeframe data uses the last confirmed 1H bar; trade targets are frozen at entry |
 | Versioned | Semantic versioning (see `CHANGELOG.md`), version shown in the panel |
@@ -226,9 +227,22 @@ The broker emulator uses standard order handling. Price orders can fill at bette
 
 The strategy uses `calc_on_order_fills = true` so it can place the first protective price orders immediately after the broker emulator exposes the actual fill average. A fill recalculation cannot create a new setup or entry, or trigger Trend-fail/Timeout from the current bar’s final OHLC values. Historical results should still be checked with the Strategy Tester’s order-fill assumptions and Bar Magnifier settings.
 
-### v3.0.1 validation checklist
+### v3.0.2 TradingView validation checklist
 
-After compiling in TradingView, verify Long Entry, Short Entry, Trim, breakeven stop, Stop, Trend Fail, Timeout, and Final behavior. In particular, confirm that a Trim fill does not immediately trigger a Trend Fail on the same fill recalculation, and compare results with Bar Magnifier off and on.
+After compiling in TradingView on a 15-minute chart:
+
+1. Verify normal Long and Short entries.
+2. Confirm that a protective STOP and TRIM order appear immediately after Entry fill.
+3. Find an Entry -> Trim same-bar case and confirm the original entry price, size, mode, frozen mean/std/ATR, and targets remain unchanged.
+4. Find an Entry -> Stop same-bar case and confirm the trade resets without a stuck pending entry.
+5. Find a Trim -> BE same-bar case and confirm the exit is labeled Breakeven, not a plain Stop.
+6. Confirm Range/Shock Entries and Closed counts increase once per complete lifecycle, even when the Tester shows partial-trade fragments.
+7. Confirm the trade mode is initialized once and remains stable through all fills.
+8. Confirm Final is not submitted on the Trim bar and is eligible starting on the next bar.
+9. Compare `strategy.position_size`, Range/Shock counts, Trim/Exit labels, and the order list against the Data Window fields: Previous Execution Position Size, Current Strategy Position Size, Fill Event Type, Intrabar Trade Active, and Intrabar Partial Taken.
+10. Compare results with Bar Magnifier OFF and ON.
+
+The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 
 ## Limitations & scope
 
@@ -242,7 +256,7 @@ After compiling in TradingView, verify Long Entry, Short Entry, Trim, breakeven 
 
 ## Contributing
 
-Issues and PRs welcome. Keep changes backward-compatible, keep the state machine centralized in `MRState`, and bump `CHANGELOG.md` + `SCRIPT_VERSION` with each behavioral change.
+Issues and PRs welcome. Keep changes backward-compatible, keep confirmed-bar state in `MRState` and fill lifecycle state in `MRFillState`, and bump `CHANGELOG.md` + `SCRIPT_VERSION` with each behavioral change.
 
 ## License
 

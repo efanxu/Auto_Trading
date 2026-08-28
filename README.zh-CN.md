@@ -6,7 +6,7 @@ English · [简体中文](README.zh-CN.md)
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.1-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.2-informational)](CHANGELOG.md)
 
 ---
 
@@ -30,6 +30,7 @@ English · [简体中文](README.zh-CN.md)
 | Strategy Tester | 真实 `strategy.entry`、OCA 价格退出与 `strategy.close` 市价退出;正式 P&L 来自 Strategy Tester |
 | 真实分批退出 | `trimPct` 控制 T减比例(默认 50%);T平退出剩余仓位 |
 | 成本感知保本 | Strategy Tester 手续费/滑点是正式成本来源;匹配输入用于计算 T减后的保本位 |
+| 同 bar 成交状态 | 专用 `varip` fill state 跨多次 `calc_on_order_fills` execution 跟踪真实仓位变化,不改变信号规则 |
 | 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;输入项标签是编译期静态文本,策略警报使用结构化动态消息 |
 | 防重绘 | 信号门控于已确认 K 线;高周期数据取上一根已确认的 1H bar;目标价进场时冻结 |
 | 版本化 | 语义化版本(见 `CHANGELOG.md`),版本号显示在面板 |
@@ -226,9 +227,22 @@ Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于�
 
 策略启用 `calc_on_order_fills = true`,让 Broker Emulator 提供真实成交均价后立即挂出第一组保护性价格订单。成交重算不能创建新的 Setup / Entry,也不能使用本根最终 OHLC 立即触发趋势失效 / 超时。历史结果仍应结合 Strategy Tester 的成交假设与 Bar Magnifier 设置检查。
 
-### v3.0.1 验收清单
+### v3.0.2 TradingView 验收清单
 
-在 TradingView 编译后,依次检查 Long Entry、Short Entry、T减、保本止损、Stop、Trend Fail、Timeout 与 Final。重点确认 T减成交后的额外重算不会在同一次执行中立即触发 Trend Fail,并比较 Bar Magnifier 关闭 / 开启时的结果。
+在 15 分钟图于 TradingView 编译后:
+
+1. 检查正常 Long 与 Short 入场。
+2. 确认 Entry 成交后立即存在保护 STOP 与 TRIM 订单。
+3. 找到 Entry → 同 bar T减案例,确认原始 entry price、entry size、模式、冻结 mean/std/ATR 与目标价都没有改变。
+4. 找到 Entry → 同 bar Stop 案例,确认交易状态完整 reset,没有卡住的 pending entry。
+5. 找到 T减 → 同 bar BE 案例,确认退出标记为 Breakeven,而不是普通 Stop。
+6. 确认每笔完整生命周期的 Range/Shock Entries 与 Closed 只增加一次,即使 Tester 显示多个部分成交 fragment。
+7. 确认 Trade Mode 只初始化一次,并在所有成交之间保持不变。
+8. 确认 T减所在 bar 不提交 Final,从下一根 bar 起才允许提交。
+9. 对照 `strategy.position_size`、Range/Shock 统计、T减/退出标签和订单列表,检查 Data Window 中的 Previous Execution Position Size、Current Strategy Position Size、Fill Event Type、Intrabar Trade Active、Intrabar Partial Taken。
+10. 对比 Bar Magnifier 关闭与开启时的结果。
+
+源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 
 ## 局限与边界
 
@@ -242,7 +256,7 @@ Broker Emulator 使用标准订单处理。价格订单可能以优于或劣于�
 
 ## 贡献
 
-欢迎 issue 与 PR。请保持向后兼容,保持状态机集中在 `MRState`,每次行为变更都同步更新 `CHANGELOG.md` 与 `SCRIPT_VERSION`。
+欢迎 issue 与 PR。请保持向后兼容,将 confirmed-bar 状态放在 `MRState`,将成交生命周期状态放在 `MRFillState`,每次行为变更都同步更新 `CHANGELOG.md` 与 `SCRIPT_VERSION`。
 
 ## 许可证
 

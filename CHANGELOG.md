@@ -2,6 +2,43 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.0.2] — Intrabar fill-state correctness patch
+
+This release fixes rollback-sensitive Strategy Tester fill synchronization. Trading
+signals, parameters, order IDs, and strategy behavior are unchanged.
+
+### Fixed
+
+- **Rollback-safe repeated fill executions** — a dedicated `MRFillState` uses
+  field-level `varip` persistence for the real trade lifecycle, including frozen
+  context, BE state, pending close reason, and Range/Shock auxiliary statistics.
+- **Position-transition fill detection** — Entry, Trim, and Full Exit are derived
+  from adjacent `strategy.position_size` executions. `pendingDir` remains signal
+  context only and is no longer the final Entry-fill predicate.
+- **Trim / BE / Full Exit continuity** — Entry -> Trim, Entry -> Stop, and
+  Trim -> BE on the same bar preserve the original entry context, record one
+  lifecycle event each, and reset the trade state only after the real position
+  reaches zero.
+- **Trim attribution guard** — `strategy.closedtrades.exit_id()` is used when a
+  closed fragment is exposed; the fallback requires an active Trim order and the
+  exact configured Trim quantity, so an arbitrary position reduction is not
+  treated as T-trim.
+
+### Unchanged behavior
+
+- `calc_on_order_fills = true`, `process_orders_on_close = false`, `pyramiding = 0`,
+  both Long and Short directions, cross-date positions, and all existing default
+  parameters remain unchanged.
+- Range/Shock engines, Regime Score, Hard Trend Veto, Half-Life, Trend Fail,
+  Timeout, ATR/statistical stop, T-trim, T-close, BE, OCA reduce order groups,
+  fixed order IDs, and the next-bar-before-Final rule remain unchanged.
+
+### Verification
+
+- Static review and `git diff --check` are required before release.
+- TradingView Pine v6 compilation and Strategy Tester runtime verification remain
+  pending manual verification, including Bar Magnifier OFF / ON comparison.
+
 ## [3.0.1] — Correctness patch
 
 This release is a correctness patch for the Strategy Tester execution lifecycle. The trading strategy and its parameters are unchanged.
