@@ -900,7 +900,7 @@ Pass-Test 'Panel exposes most recent V3/V4 returns and trade number' {
 }
 
 Pass-Test 'Panel exposes most recent Trade Delta with result color' {
-    Assert-Match $source 'tradeDeltaText\s*=\s*shadow\.lastTradeNumber\s*>\s*0[\s\S]*?f_panelPct\(shadow\.lastDeltaPct,\s*true\)' 'recent Delta text'
+    Assert-Match $source 'tradeDeltaText\s*=\s*shadow\.lastTradeNumber\s*>\s*0[\s\S]*?f_panelPp\(shadow\.lastDeltaPct,\s*true\)' 'recent Delta text'
     Assert-Match $source 'table\.cell\(panel,\s*1,\s*15,\s*tradeDeltaText,\s*text_color\s*=\s*tradeDeltaColor\)' 'recent Delta panel cell'
 }
 
@@ -912,13 +912,13 @@ Pass-Test 'Panel exposes cumulative V3/V4 Net' {
 
 Pass-Test 'Panel exposes cumulative Delta' {
     Assert-Match $source 'cumulativeDelta\s*=\s*f_shadowVsReferencePct\(shadow\)' 'cumulative Delta function'
-    Assert-Match $source 'table\.cell\(panel,\s*0,\s*17,[\s\S]*?Cumulative Delta %' 'cumulative Delta label'
+    Assert-Match $source 'table\.cell\(panel,\s*0,\s*17,[\s\S]*?Cumulative Delta pp' 'cumulative Delta label'
     Assert-Match $source 'table\.cell\(panel,\s*1,\s*17,\s*cumulativeDeltaText' 'cumulative Delta panel cell'
 }
 
 Pass-Test 'Panel exposes V4 Profit Factor' {
     Assert-Match $source 'shadowPF\s*=\s*f_shadowProfitFactor\(shadow\)' 'Shadow PF function'
-    Assert-Match $source 'cumulativeDeltaText\s*=\s*[\s\S]*?" pp / PF "[\s\S]*?shadowPF' 'Shadow PF text'
+    Assert-Match $source 'cumulativeDeltaText\s*=\s*[\s\S]*?f_panelPp\([\s\S]*?" / PF "[\s\S]*?shadowPF' 'Shadow PF text'
 }
 
 Pass-Test 'Panel exposes V4 Win Rate' {

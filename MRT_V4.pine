@@ -761,6 +761,13 @@ f_panelPct(float value, bool signedValue) =>
         string sign = signedValue and value > 0.0 ? "+" : ""
         sign + str.tostring(value, "#.#####") + "%"
 
+f_panelPp(float value, bool signedValue) =>
+    if na(value)
+        "-"
+    else
+        string sign = signedValue and value > 0.0 ? "+" : ""
+        sign + str.tostring(value, "#.#####") + " pp"
+
 f_resultColor(float value) =>
     na(value) ? color.gray : value > 0.0 ? color.lime : value < 0.0 ? color.red : color.gray
 
@@ -1853,13 +1860,13 @@ if showPanel
     string riskText = logic.pos == 0 ? "-" : str.tostring(f_logicActiveStop(logic.pos), format.mintick)
     string exitReasonText = shadow.active ? "-" : shadow.lastTradeNumber > 0 ? f_exitName(shadow.lastExitReason) : "-"
     string recentTradeText = shadow.lastTradeNumber > 0 ? "#" + str.tostring(shadow.lastTradeNumber, "#") + " V3 " + f_panelPct(shadow.lastReferenceReturnPct, true) + " / V4 " + f_panelPct(shadow.lastTradeReturnPct, true) : "-"
-    string tradeDeltaText = shadow.lastTradeNumber > 0 ? f_panelPct(shadow.lastDeltaPct, true) : "-"
+    string tradeDeltaText = shadow.lastTradeNumber > 0 ? f_panelPp(shadow.lastDeltaPct, true) : "-"
     float shadowNet = f_shadowNetPct(shadow)
     float referenceNet = f_referenceNetPct(shadow)
     float cumulativeDelta = f_shadowVsReferencePct(shadow)
     float shadowPF = f_shadowProfitFactor(shadow)
     string cumulativeNetText = "V3 " + f_panelPct(referenceNet, false) + " / V4 " + f_panelPct(shadowNet, false)
-    string cumulativeDeltaText = f_panelPct(cumulativeDelta, true) + " pp / PF " + (na(shadowPF) ? "-" : str.tostring(shadowPF, "#.00"))
+    string cumulativeDeltaText = f_panelPp(cumulativeDelta, true) + " / PF " + (na(shadowPF) ? "-" : str.tostring(shadowPF, "#.00"))
     string shadowQualityText = f_panelPct(f_shadowWinRate(shadow), false) + " / " + f_panelPct(f_shadowUsagePct(shadow), false)
     string brokerSummaryText = brokerPositionText + " / " + brokerStateText + " / " + consistencyText
     float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
@@ -1915,13 +1922,13 @@ if showPanel
     table.cell(panel, 0, 14, f_tr("V3 / V4 最近收益 %", "V3 / V4 Last Return %"))
     table.cell(panel, 1, 14, recentTradeText)
 
-    table.cell(panel, 0, 15, f_tr("最近 Trade Delta %", "Last Trade Delta %"))
+    table.cell(panel, 0, 15, f_tr("最近 Trade Delta pp", "Last Trade Delta pp"))
     table.cell(panel, 1, 15, tradeDeltaText, text_color = tradeDeltaColor)
 
     table.cell(panel, 0, 16, f_tr("V3 / V4 累计 Net %", "V3 / V4 Cumulative Net %"))
     table.cell(panel, 1, 16, cumulativeNetText)
 
-    table.cell(panel, 0, 17, f_tr("累计 Delta % / V4 PF", "Cumulative Delta % / V4 PF"))
+    table.cell(panel, 0, 17, f_tr("累计 Delta pp / V4 PF", "Cumulative Delta pp / V4 PF"))
     table.cell(panel, 1, 17, cumulativeDeltaText, text_color = cumulativeDeltaColor)
 
     table.cell(panel, 0, 18, f_tr("V4 胜率 / PREPLAN 使用", "V4 Win Rate / PREPLAN Usage"))
