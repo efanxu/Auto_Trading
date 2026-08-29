@@ -449,6 +449,10 @@ type MRLogicState
     varip int    trimDecisionBar = na
     varip int    exitDecisionBar = na
 
+    // Confirmed-bar Logic scheduler cursor. Broker transitions never advance
+    // or suppress this V2 decision clock.
+    varip int    logicDecisionBar = na
+
     // Rollback-safe current-bar logic event snapshot.
     varip int    logicEventBar    = na
     varip int    logicEventKind   = 0
@@ -553,6 +557,14 @@ if na(logicSetupEventBar) or bar_index != logicSetupEventBar
     logicSetupEventBar := na
     logicSetupEventDir := 0
     logicSetupEventMode := 0
+
+// The first confirmed execution for a bar owns the V2 Logic decision. Any
+// later execution on that same bar (including calc_on_order_fills) is a
+// synchronization/render pass and cannot create a second Logic decision.
+bool isNewLogicDecisionBar = barstate.isconfirmed and (na(logic.logicDecisionBar) or bar_index != logic.logicDecisionBar)
+
+if isNewLogicDecisionBar
+    logic.logicDecisionBar := bar_index
 
 // 退出原因枚举
 int R_STOP  = 1
@@ -751,7 +763,7 @@ if consistencyRecoveryRequired
         broker.recoveryClosePlaced := true
 
 // Fill recalculation and confirmed-close decision execution are separate.
-bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution
+bool allowBarCloseDecision = isNewLogicDecisionBar
 
 // 冷却
 int barsSinceExit = 100000

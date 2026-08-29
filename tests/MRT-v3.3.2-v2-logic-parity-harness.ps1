@@ -130,6 +130,96 @@ function Get-Decision {
     return 'NONE'
 }
 
+function New-Execution {
+    param(
+        [int]$Bar,
+        [string]$Phase,
+        [double]$PositionSize,
+        [string]$Action = '',
+        [bool]$Confirmed = $true
+    )
+
+    [pscustomobject]@{
+        Bar = $Bar
+        Phase = $Phase
+        PositionSize = $PositionSize
+        Action = $Action
+        Confirmed = $Confirmed
+    }
+}
+
+function Invoke-ExecutionTimeline {
+    param(
+        [object[]]$Executions,
+        [bool]$UsePositionChangedGate
+    )
+
+    $state = [pscustomobject]@{
+        TrackerReady = $false
+        PreviousPositionSize = 0.0
+        LogicDecisionBar = $null
+        LogicPosition = 0
+        PartialTaken = $false
+        LastExitBar = $null
+        DecisionExecutions = [System.Collections.Generic.List[string]]::new()
+        Events = [System.Collections.Generic.List[string]]::new()
+    }
+
+    foreach ($execution in $Executions) {
+        $positionChanged = $state.TrackerReady -and $execution.PositionSize -ne $state.PreviousPositionSize
+
+        if (-not $state.TrackerReady) {
+            $state.PreviousPositionSize = $execution.PositionSize
+            $state.TrackerReady = $true
+            $positionChanged = $false
+        }
+
+        if ($UsePositionChangedGate) {
+            $allowBarCloseDecision = $execution.Confirmed -and -not $positionChanged
+        }
+        else {
+            $allowBarCloseDecision = $execution.Confirmed -and $state.LogicDecisionBar -ne $execution.Bar
+        }
+
+        if ($allowBarCloseDecision) {
+            $state.LogicDecisionBar = $execution.Bar
+            $state.DecisionExecutions.Add("$($execution.Bar):$($execution.Phase)")
+
+            if (-not [string]::IsNullOrWhiteSpace($execution.Action)) {
+                $action = $execution.Action
+
+                if ($action -eq 'SETUP') {
+                    $canEnter = $state.LogicPosition -eq 0 -and ($null -eq $state.LastExitBar -or $execution.Bar - $state.LastExitBar -ge 3)
+
+                    if ($canEnter) {
+                        $state.Events.Add("$($execution.Bar):$action")
+                    }
+                }
+                else {
+                    $state.Events.Add("$($execution.Bar):$action")
+
+                    if ($action -match '^ENTRY') {
+                        $state.LogicPosition = if ($action -match 'SHORT') { -1 } else { 1 }
+                        $state.PartialTaken = $false
+                    }
+                    elseif ($action -match '^TRIM') {
+                        $state.PartialTaken = $true
+                    }
+                    elseif ($action -match '^(FINAL|STOP|BE|TREND|TIME|EXIT)') {
+                        $state.LogicPosition = 0
+                        $state.PartialTaken = $false
+                        $state.LastExitBar = $execution.Bar
+                    }
+                }
+            }
+        }
+
+        $state.PreviousPositionSize = $execution.PositionSize
+    }
+
+    return $state
+}
+
 function Invoke-LifecycleCase {
     param(
         [int]$Dir,
@@ -205,6 +295,7 @@ Assert-NotMatch $source 'longEntrySignal[^\r\n]*broker\.|shortEntrySignal[^\r\n]
 
 # State shape: V2 decision fields live in Logic State; Broker State must not own them.
 Assert-Match $source '(?ms)^type MRLogicState\s+.*?varip int\s+pos\s*=\s*0' 'MRLogicState.pos missing'
+Assert-Match $source '(?ms)^type MRLogicState\s+.*?varip int\s+logicDecisionBar\s*=\s*na' 'MRLogicState Logic scheduler cursor missing'
 $logicFields = @(
     'pos', 'partialTaken', 'setupBar', 'setupDir', 'setupMode', 'entryBar', 'entryPrice',
     'mean', 'std', 'atr', 'partialTarget', 'finalTarget', 'baseStop', 'timeStop',
@@ -245,7 +336,9 @@ $brokerBlockMatch = [regex]::Match($source, '(?ms)^// Broker transition detectio
 $baselineBrokerBlockMatch = [regex]::Match($baselineSource, '(?ms)^// Broker transition detection and fill synchronization\..*?(?=^// Derived Logic Events)')
 Assert-True $brokerBlockMatch.Success 'current Broker execution block missing'
 Assert-True $baselineBrokerBlockMatch.Success 'v3.3.1 Broker execution block missing'
-Assert-True ((Normalize-SourceSnippet $brokerBlockMatch.Value) -eq (Normalize-SourceSnippet $baselineBrokerBlockMatch.Value)) 'Broker execution block changed from the v3.3.1 baseline'
+$currentBrokerBlockForParity = $brokerBlockMatch.Value -replace '(?m)^\s*bool allowBarCloseDecision\s*=.*\r?\n', ''
+$baselineBrokerBlockForParity = $baselineBrokerBlockMatch.Value -replace '(?m)^\s*bool allowBarCloseDecision\s*=.*\r?\n', ''
+Assert-True ((Normalize-SourceSnippet $currentBrokerBlockForParity) -eq (Normalize-SourceSnippet $baselineBrokerBlockForParity)) 'Broker execution facts changed from the v3.3.1 baseline'
 
 foreach ($snippet in @(
     @{ Body = $v2ActiveStopBody; Current = (Get-FunctionBody $source 'f_logicActiveStop'); Pattern = 't\.baseStop'; Message = 'V2 active-stop base source changed' },
@@ -341,7 +434,10 @@ Assert-NotMatch $source 'oca_name|oca_type' 'legacy OCA lifecycle must not remai
 
 # Real fills synchronize Broker State only; they must not decide T points or cooldown.
 Assert-Match $source 'bool isFillSynchronizationExecution\s*=\s*positionChanged' 'fill recalculation gate missing'
-Assert-Match $source 'allowBarCloseDecision\s*=\s*barstate\.isconfirmed\s*and\s*not isFillSynchronizationExecution' 'same-close decisions must be fill-gated'
+Assert-Match $source 'bool isNewLogicDecisionBar\s*=\s*barstate\.isconfirmed\s*and\s*\(na\(logic\.logicDecisionBar\)\s*or\s*bar_index\s*!=\s*logic\.logicDecisionBar\)' 'Logic scheduler must use a Logic-only per-bar cursor'
+Assert-Match $source 'if isNewLogicDecisionBar[\s\S]{0,120}logic\.logicDecisionBar\s*:=\s*bar_index' 'Logic scheduler cursor must advance before decisions'
+Assert-Match $source 'allowBarCloseDecision\s*=\s*isNewLogicDecisionBar' 'confirmed-bar decisions must use the Logic scheduler cursor'
+Assert-NotMatch $source 'allowBarCloseDecision\s*=\s*barstate\.isconfirmed\s*and\s*not isFillSynchronizationExecution' 'Broker positionChanged must not gate Logic decisions'
 Assert-Match $source 'broker\.brokerEntryPrice\s*:=\s*strategy\.position_avg_price' 'broker entry price must use actual average fill price'
 Assert-Match $source 'trimFilled[\s\S]{0,800}broker\.trimFillBar\s*:=\s*bar_index' 'trim fill diagnostic missing'
 Assert-NotMatch $source 'trimFilled[\s\S]{0,800}logic\.partialTaken\s*:=\s*true' 'trim fill must not create the Logic trim decision'
@@ -489,6 +585,140 @@ Assert-NotMatch $decisionBody '\$(High|Low)|\bHigh\b|\bLow\b' 'Get-Decision must
 
 # Dynamic Case A: Short T-trim followed by next-bar T-close. Both decisions
 # use only the confirmed close, and Final requires PartialTaken = true.
+$legacyPositionChangedGate = [regex]::IsMatch(
+    $source,
+    '(?m)^\s*bool allowBarCloseDecision\s*=\s*barstate\.isconfirmed\s+and\s+not\s+isFillSynchronizationExecution\s*$'
+)
+
+# Execution-timeline regression cases. The simulator models the only executions
+# that matter to the contract: a normal confirmed close, a same-bar fill
+# recalculation, and the next confirmed close. Broker position transitions are
+# deliberately allowed to coincide with a confirmed close; they are facts, not a
+# scheduler signal. The legacy source gate is selected here only to prove that
+# the old implementation goes red on the minimized failure timeline.
+$case1EntryFill = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 100 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 100 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 100 'same-bar-fill-recalculation-2' 1.0 'DUPLICATE-MANAGE'),
+    (New-Execution 101 'normal-confirmed' 1.0 'MANAGE-LONG')
+)
+Assert-True (($case1EntryFill.Events -join ',') -eq '100:ENTRY-LONG,101:MANAGE-LONG') 'Case 1 Entry fill must leave the next confirmed Logic bar runnable'
+Assert-True (($case1EntryFill.DecisionExecutions -join ',') -eq '100:normal-confirmed,101:normal-confirmed') 'Case 1 fill recalculations must not create duplicate Logic decisions'
+
+$case1BrokerTransitionOnConfirmedBar = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 110 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 110 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 111 'normal-confirmed-with-broker-transition' 0.5 'MANAGE-LONG')
+)
+Assert-True (($case1BrokerTransitionOnConfirmedBar.Events -join ',') -eq '110:ENTRY-LONG,111:MANAGE-LONG') 'Case 1 Broker positionChanged must not suppress the next confirmed Logic bar'
+Write-Host 'PASS: execution timeline Case 1 Entry fill and confirmed-bar Broker transition'
+
+$case2TrimFill = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 120 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 120 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 121 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 121 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 121 'same-bar-fill-recalculation-2' 0.5 'FINAL-DUPLICATE'),
+    (New-Execution 122 'normal-confirmed' 0.5 'FINAL-LONG'),
+    (New-Execution 122 'same-bar-fill-recalculation' 0.0)
+)
+Assert-True (($case2TrimFill.Events -join ',') -eq '120:ENTRY-LONG,121:TRIM-LONG,122:FINAL-LONG') 'Case 2 Trim fill must leave the next confirmed Final/BE/Trend/Timeout bar runnable'
+Assert-True (($case2TrimFill.DecisionExecutions -join ',') -eq '120:normal-confirmed,121:normal-confirmed,122:normal-confirmed') 'Case 2 fill recalculations must not add blank or duplicate Logic decisions'
+Write-Host 'PASS: execution timeline Case 2 Trim fill'
+
+$case3ContinuousLifecycle = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 130 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 130 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 132 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 132 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 133 'normal-confirmed' 0.5 'FINAL-LONG'),
+    (New-Execution 133 'same-bar-fill-recalculation' 0.0)
+)
+Assert-True (($case3ContinuousLifecycle.Events -join ',') -eq '130:ENTRY-LONG,132:TRIM-LONG,133:FINAL-LONG') 'Case 3 continuous Entry -> Trim -> Final bars drifted'
+Write-Host 'PASS: execution timeline Case 3 continuous lifecycle'
+
+$case4Cooldown = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 140 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 140 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 141 'normal-confirmed' 1.0 'FINAL-LONG'),
+    (New-Execution 141 'same-bar-fill-recalculation' 0.0),
+    (New-Execution 142 'normal-confirmed' 0.0 'SETUP'),
+    (New-Execution 143 'normal-confirmed' 0.0 'SETUP'),
+    (New-Execution 144 'normal-confirmed' 0.0 'SETUP')
+)
+Assert-True (($case4Cooldown.Events -join ',') -eq '140:ENTRY-LONG,141:FINAL-LONG,144:SETUP') 'Case 4 cooldown first eligible Setup bar must match V2 lastExitBar semantics'
+Write-Host 'PASS: execution timeline Case 4 cooldown'
+
+$case5ChainedLifecycles = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 150 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 150 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 152 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 152 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 153 'normal-confirmed' 0.5 'FINAL-LONG'),
+    (New-Execution 153 'same-bar-fill-recalculation' 0.0),
+    (New-Execution 156 'normal-confirmed' 0.0 'SETUP'),
+    (New-Execution 157 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 157 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 159 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 159 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 160 'normal-confirmed' 0.5 'FINAL-LONG'),
+    (New-Execution 160 'same-bar-fill-recalculation' 0.0)
+)
+Assert-True (($case5ChainedLifecycles.Events -join ',') -eq '150:ENTRY-LONG,152:TRIM-LONG,153:FINAL-LONG,156:SETUP,157:ENTRY-LONG,159:TRIM-LONG,160:FINAL-LONG') 'Case 5 Broker fills must not split the chained lifecycle or move the second trade'
+Write-Host 'PASS: execution timeline Case 5 chained lifecycles'
+
+$case6LongMirror = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 170 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 170 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 171 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 171 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 172 'normal-confirmed' 0.5 'FINAL-LONG'),
+    (New-Execution 172 'same-bar-fill-recalculation' 0.0)
+)
+$case6ShortMirror = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 180 'normal-confirmed' 0.0 'ENTRY-SHORT'),
+    (New-Execution 180 'same-bar-fill-recalculation' -1.0),
+    (New-Execution 181 'normal-confirmed' -1.0 'TRIM-SHORT'),
+    (New-Execution 181 'same-bar-fill-recalculation' -0.5),
+    (New-Execution 182 'normal-confirmed' -0.5 'FINAL-SHORT'),
+    (New-Execution 182 'same-bar-fill-recalculation' 0.0)
+)
+Assert-True (($case6LongMirror.Events -join ',') -eq '170:ENTRY-LONG,171:TRIM-LONG,172:FINAL-LONG') 'Case 6 Long mirror lifecycle drifted'
+Assert-True (($case6ShortMirror.Events -join ',') -eq '180:ENTRY-SHORT,181:TRIM-SHORT,182:FINAL-SHORT') 'Case 6 Short mirror lifecycle drifted'
+Write-Host 'PASS: execution timeline Case 6 Long/Short mirrors'
+
+$case7Stop = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 190 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 190 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 191 'normal-confirmed' 1.0 'STOP-LONG'),
+    (New-Execution 191 'same-bar-fill-recalculation' 0.0)
+)
+$case7BE = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 200 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 200 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 201 'normal-confirmed' 1.0 'TRIM-LONG'),
+    (New-Execution 201 'same-bar-fill-recalculation' 0.5),
+    (New-Execution 202 'normal-confirmed' 0.5 'BE-LONG'),
+    (New-Execution 202 'same-bar-fill-recalculation' 0.0)
+)
+$case7Trend = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 210 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 210 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 211 'normal-confirmed' 1.0 'TREND-LONG'),
+    (New-Execution 211 'same-bar-fill-recalculation' 0.0)
+)
+$case7Timeout = Invoke-ExecutionTimeline -UsePositionChangedGate $legacyPositionChangedGate -Executions @(
+    (New-Execution 220 'normal-confirmed' 0.0 'ENTRY-LONG'),
+    (New-Execution 220 'same-bar-fill-recalculation' 1.0),
+    (New-Execution 221 'normal-confirmed' 1.0 'TIME-LONG'),
+    (New-Execution 221 'same-bar-fill-recalculation' 0.0)
+)
+Assert-True (($case7Stop.Events -join ',') -eq '190:ENTRY-LONG,191:STOP-LONG') 'Case 7 Stop decision bar drifted'
+Assert-True (($case7BE.Events -join ',') -eq '200:ENTRY-LONG,201:TRIM-LONG,202:BE-LONG') 'Case 7 BE decision bar drifted'
+Assert-True (($case7Trend.Events -join ',') -eq '210:ENTRY-LONG,211:TREND-LONG') 'Case 7 Trend Fail decision bar drifted'
+Assert-True (($case7Timeout.Events -join ',') -eq '220:ENTRY-LONG,221:TIME-LONG') 'Case 7 Timeout decision bar drifted'
+Write-Host 'PASS: execution timeline Case 7 Stop/BE/Trend/Timeout'
+
 $caseA = Invoke-LifecycleCase -Dir -1 -EntryPrice 100 -BaseStop 110 -PartialTarget 95 -FinalTarget 90 -TrimClose 95 -FinalClose 90 -RoundTripCost 0.06
 Assert-True ($caseA.Events -join ',' -eq '2:TRIM,3:FINAL') 'Case A must produce Short T-Entry -> T-Trim -> next-bar T-Close'
 Assert-True ($caseA.PartialTaken -eq $false) 'Case A must be flat in Logic after final exit'

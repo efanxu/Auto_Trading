@@ -2,6 +2,13 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — Restore strict V2 Logic execution timeline
+
+### Fixed
+
+- **Confirmed-bar Logic scheduling** — `positionChanged` is now Broker-only execution diagnostics. A Logic-only per-bar cursor guarantees that every confirmed 15m bar runs the V2 lifecycle once, while same-bar `calc_on_order_fills` recalculations cannot repeat it.
+- **Lifecycle parity regression coverage** — the local harness now models normal confirmed executions, same-bar fill recalculations, next-bar management, chained cooldown lifecycles, Long/Short mirrors, and Stop/BE/Trend Fail/Timeout decision bars.
+
 ## [3.3.2] — Restore stable presentation footprint
 
 This release keeps the v3.3.1 V2 Logic-State / Broker Execution architecture and restores the production display layer to the stable 07cbe31 presentation footprint.
