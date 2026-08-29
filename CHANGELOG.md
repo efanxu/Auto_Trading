@@ -2,6 +2,12 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.2.1] — Shadow observability / export
+
+- Surfaced Shadow trade/reference metrics in the existing panel.
+- Added one-bar Shadow result export series.
+- No Logic or Strategy Tester order changes.
+
 ## [4.2.0] — Shadow Execution Accounting
 
 - Added an independent V4 Shadow Execution ledger that uses a touched, matching previous-bar PREPLAN limit as the historical entry fill approximation while keeping the official V3 confirmed-close Strategy Tester timeline unchanged.

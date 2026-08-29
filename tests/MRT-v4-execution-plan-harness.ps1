@@ -325,18 +325,19 @@ function Get-Section {
 $source = [IO.File]::ReadAllText($scriptPath)
 $v3Source = [IO.File]::ReadAllText($v3Path)
 $changelog = [IO.File]::ReadAllText($changelogPath)
+$harness = [IO.File]::ReadAllText($PSCommandPath)
 $testCount = 0
 
-Write-Host 'MR-T v4.2.0 V3-Aligned Execution Assist + Shadow Accounting Harness'
+Write-Host 'MR-T v4.2.1 V3-Aligned Execution Assist + Shadow Accounting Harness'
 Assert-True (Test-Path -LiteralPath $scriptPath) 'MRT_V4.pine must exist'
 
-Pass-Test 'Version and role are v4.2.0' {
-    Assert-Match $source 'strategy\("MR-T Strategy v4\.2\.0"' 'strategy version'
-    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.2\.0"' 'script version'
+Pass-Test 'Version and role are v4.2.1' {
+    Assert-Match $source 'strategy\("MR-T Strategy v4\.2\.1"' 'strategy version'
+    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.2\.1"' 'script version'
     Assert-Match $source 'V3-aligned Logic \+ previous-confirmed-bar execution assist' 'role comment'
     Assert-Match $source 'V4\.2\.0\s*=\s*V4\.1\.0 \+ independent Shadow Execution Accounting' 'shadow role comment'
     Assert-Match $source 'sourceBar=N\s+uses this bar''s final values;\s*validBar=N\+1' 'source-bar comment'
-    Assert-Match $changelog '(?m)^## \[4\.2\.0\]' 'CHANGELOG v4.2.0 entry'
+    Assert-Match $changelog '(?m)^## \[4\.2\.1\]' 'CHANGELOG v4.2.1 entry'
 }
 
 Pass-Test 'Only the requested Execution Assist input exists' {
@@ -553,17 +554,17 @@ Pass-Test 'Active Trade Lines show only formal Logic position' {
     Assert-NotMatch (Get-Section $source '// Active Trade Lines' '// Setup Labels') 'assist\.entryTrigger|assist\.tp1Provisional|assist\.tp2Provisional|assist\.stopProvisional' 'provisional lines plotted'
 }
 
-Pass-Test 'Chart-visible plot footprint is unchanged and Shadow adds exactly 8 Data Window fields' {
+Pass-Test 'Chart-visible plot footprint is unchanged and Shadow adds exactly 12 Data Window fields' {
     $plotPattern = '(?m)^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\('
     $v4PlotLines = @($source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
     $v3PlotLines = @($v3Source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
     $v4VisiblePlots = @($v4PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
     $v3VisiblePlots = @($v3PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
     Assert-True ($v4VisiblePlots.Count -eq $v3VisiblePlots.Count) 'chart-visible plot count changed'
-    Assert-True ($v4PlotLines.Count -eq $v3PlotLines.Count + 8) 'total plot count did not add exactly 8 Shadow fields'
-    Assert-True ([regex]::Matches($source, 'display\s*=\s*display\.data_window').Count -eq [regex]::Matches($v3Source, 'display\s*=\s*display\.data_window').Count + 8) 'Data Window count did not add exactly 8 fields'
+    Assert-True ($v4PlotLines.Count -eq $v3PlotLines.Count + 12) 'total plot count did not add exactly 12 Shadow fields'
+    Assert-True ([regex]::Matches($source, 'display\s*=\s*display\.data_window').Count -eq [regex]::Matches($v3Source, 'display\s*=\s*display\.data_window').Count + 12) 'Data Window count did not add exactly 12 fields'
     Assert-True ([regex]::Matches($source, '\bplotshape\(').Count -eq [regex]::Matches($v3Source, '\bplotshape\(').Count) 'plotshape count changed'
-    foreach ($field in @('V4 Shadow Entry Price', 'V4 Entry Improvement %', 'V4 Shadow Last Trade %', 'V3 Reference Last Trade %', 'V4 Shadow Net %', 'V3 Reference Net %', 'V4 vs V3 Delta %', 'V4 Shadow Profit Factor')) {
+    foreach ($field in @('V4 Shadow Entry Price', 'V4 Entry Improvement %', 'V4 Shadow Last Trade %', 'V3 Reference Last Trade %', 'V4 Shadow Net %', 'V3 Reference Net %', 'V4 vs V3 Delta %', 'V4 Shadow Profit Factor', 'V4 Shadow Trade Event', 'V4 Shadow Logic Entry', 'V4 Shadow Executed Entry', 'V4 Shadow Trade Delta %')) {
         Assert-Match $source ([regex]::Escape($field)) "missing Shadow Data Window field: $field"
     }
 }
@@ -619,7 +620,7 @@ Pass-Test 'Long and Short provisional stop math mirrors' {
     Assert-True ($long.Stop -lt $long.EntryTrigger -and $short.Stop -gt $short.EntryTrigger) 'stop direction'
 }
 
-Pass-Test 'V3 vs V4.2 Logic Timeline parity model' {
+Pass-Test 'V3 vs V4.2.1 Logic Timeline parity model' {
     $bars = @(
         [pscustomobject]@{ Index = 1; Action = 'ENTRY_LONG'; TriggerTouched = $true },
         [pscustomobject]@{ Index = 2; Action = 'TRIM'; TriggerTouched = $true },
@@ -868,6 +869,176 @@ Pass-Test '1008-like adverse Long PREPLAN is recorded as worse' {
     Assert-True ($selection.ImprovementPct -lt 0.0) 'adverse improvement sign'
 }
 
-Assert-True ($testCount -eq 65) "expected 65 tests, ran $testCount"
-Write-Host "PASS: $testCount/$testCount V4.2 execution-assist + Shadow accounting tests"
+Pass-Test 'Panel 21-row Shadow layout is explicit' {
+    Assert-Match $source 'var table panel = table\.new\(position\.top_right,\s*2,\s*21' 'Panel dimensions'
+    $rows = [regex]::Matches($source, 'table\.cell\(panel,\s*[01],\s*(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Unique
+    Assert-True ($rows.Count -eq 21 -and $rows[0] -eq 0 -and $rows[-1] -eq 20) 'Panel still has rows 0-20'
+    Assert-Match $source 'table\.cell\(panel,\s*0,\s*10,[\s\S]*?V3 / V4' 'entry row is in the existing panel'
+}
+
+Pass-Test 'Panel uses Shadow logic and executed entry while active' {
+    Assert-Match $source 'string entryText\s*=\s*shadow\.active\s*\?\s*f_price\(shadow\.logicEntryPrice\)\s*\+\s*" / "\s*\+\s*f_price\(shadow\.shadowEntryPrice\)' 'active entry pair'
+    Assert-NotMatch (Get-Section $source '// Panel' '// Alerts') 'entryText[\s\S]*?strategy\.position_avg_price' 'active Shadow entry uses Broker average'
+}
+
+Pass-Test 'Panel falls back to last entry prices when flat' {
+    Assert-Match $source 'string entryText\s*=\s*shadow\.active[\s\S]*?:\s*f_price\(shadow\.lastLogicEntryPrice\)\s*\+\s*" / "\s*\+\s*f_price\(shadow\.lastShadowEntryPrice\)' 'flat last entry pair'
+    Assert-Match $source 'plot\(displayedShadowEntry,\s*"V4 Shadow Entry Price"' 'Data Window uses displayed Shadow entry'
+    Assert-Match $source 'displayedShadowEntry\s*=\s*shadow\.active\s*\?\s*shadow\.shadowEntryPrice\s*:\s*shadow\.lastShadowEntryPrice' 'flat Data Window fallback'
+}
+
+Pass-Test 'Panel exposes Entry Improvement with result color' {
+    Assert-Match $source 'entryImprovementText\s*=\s*f_panelPct\(shadow\.lastEntryImprovementPct,\s*true\)' 'Entry Improvement text'
+    Assert-Match $source 'table\.cell\(panel,\s*1,\s*11,\s*entryImprovementText,\s*text_color\s*=\s*entryImprovementColor\)' 'Entry Improvement panel cell'
+    Assert-Match $source 'color entryImprovementColor\s*=\s*f_resultColor\(shadow\.lastEntryImprovementPct\)' 'Entry Improvement color'
+}
+
+Pass-Test 'Panel exposes most recent V3/V4 returns and trade number' {
+    Assert-Match $source 'recentTradeText\s*=\s*shadow\.lastTradeNumber\s*>\s*0[\s\S]*?shadow\.lastReferenceReturnPct[\s\S]*?shadow\.lastTradeReturnPct' 'recent V3/V4 returns'
+    Assert-Match $source '"#"\s*\+\s*str\.tostring\(shadow\.lastTradeNumber' 'recent trade number'
+    Assert-Match $source 'table\.cell\(panel,\s*1,\s*14,\s*recentTradeText\)' 'recent return panel cell'
+}
+
+Pass-Test 'Panel exposes most recent Trade Delta with result color' {
+    Assert-Match $source 'tradeDeltaText\s*=\s*shadow\.lastTradeNumber\s*>\s*0[\s\S]*?f_panelPct\(shadow\.lastDeltaPct,\s*true\)' 'recent Delta text'
+    Assert-Match $source 'table\.cell\(panel,\s*1,\s*15,\s*tradeDeltaText,\s*text_color\s*=\s*tradeDeltaColor\)' 'recent Delta panel cell'
+}
+
+Pass-Test 'Panel exposes cumulative V3/V4 Net' {
+    Assert-Match $source 'shadowNet\s*=\s*f_shadowNetPct\(shadow\)[\s\S]*?referenceNet\s*=\s*f_referenceNetPct\(shadow\)' 'cumulative net functions'
+    Assert-Match $source 'cumulativeNetText\s*=\s*"V3 "[\s\S]*?referenceNet[\s\S]*?" / V4 "[\s\S]*?shadowNet' 'cumulative net text'
+    Assert-Match $source 'table\.cell\(panel,\s*1,\s*16,\s*cumulativeNetText\)' 'cumulative net panel cell'
+}
+
+Pass-Test 'Panel exposes cumulative Delta' {
+    Assert-Match $source 'cumulativeDelta\s*=\s*f_shadowVsReferencePct\(shadow\)' 'cumulative Delta function'
+    Assert-Match $source 'table\.cell\(panel,\s*0,\s*17,[\s\S]*?Cumulative Delta %' 'cumulative Delta label'
+    Assert-Match $source 'table\.cell\(panel,\s*1,\s*17,\s*cumulativeDeltaText' 'cumulative Delta panel cell'
+}
+
+Pass-Test 'Panel exposes V4 Profit Factor' {
+    Assert-Match $source 'shadowPF\s*=\s*f_shadowProfitFactor\(shadow\)' 'Shadow PF function'
+    Assert-Match $source 'cumulativeDeltaText\s*=\s*[\s\S]*?" pp / PF "[\s\S]*?shadowPF' 'Shadow PF text'
+}
+
+Pass-Test 'Panel exposes V4 Win Rate' {
+    Assert-Match $source 'shadowQualityText\s*=\s*f_panelPct\(f_shadowWinRate\(shadow\),\s*false\)' 'Shadow Win Rate function'
+    Assert-Match $source 'table\.cell\(panel,\s*0,\s*18,[\s\S]*?V4 Win Rate' 'Shadow Win Rate label'
+}
+
+Pass-Test 'Panel exposes PREPLAN Usage' {
+    Assert-Match $source 'shadowQualityText[\s\S]*?f_shadowUsagePct\(shadow\)' 'PREPLAN usage function'
+    Assert-Match $source 'table\.cell\(panel,\s*0,\s*18,[\s\S]*?PREPLAN' 'PREPLAN usage label'
+}
+
+Pass-Test 'resetTrade preserves every Shadow last-result field' {
+    $resetBlock = Get-Section $source 'method resetTrade' 'method enter'
+    foreach ($field in @('lastEntryImprovementPct', 'lastTradeReturnPct', 'lastReferenceReturnPct', 'lastDeltaPct', 'lastLogicEntryPrice', 'lastShadowEntryPrice', 'lastTrimPrice', 'lastExitPrice', 'lastExitReason', 'lastTradeNumber', 'lastResultEventBar')) {
+        Assert-NotMatch $resetBlock "this\.$field\s*:=" "resetTrade cleared $field"
+    }
+    Assert-Match $source 'this\.lastResultEventBar\s*:=\s*decisionBar[\s\S]*?this\.resetTrade\(\)' 'snapshot precedes reset'
+}
+
+Pass-Test 'full Shadow close records result event bar' {
+    Assert-Match $source 'shadow\.closeTrade\(bar_index,\s*close,\s*logic\.logicEventReason\)[\s\S]*?shadowResultEventBar\s*:=\s*shadow\.lastResultEventBar' 'result event cursor handoff'
+    Assert-Match $source 'varip int shadowResultEventBar\s*=\s*na' 'persistent result event cursor'
+}
+
+Pass-Test 'Shadow event export series are gated to result bar' {
+    Assert-Match $source 'float shadowTradeEventExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.shadowTrades\s*:\s*na' 'trade event export gate'
+    Assert-Match $source 'float shadowLogicEntryExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastLogicEntryPrice\s*:\s*na' 'logic export gate'
+    Assert-Match $source 'float shadowExecutedEntryExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastShadowEntryPrice\s*:\s*na' 'executed export gate'
+    Assert-Match $source 'float shadowTradeDeltaExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastDeltaPct\s*:\s*na' 'Delta export gate'
+}
+
+Pass-Test 'Shadow event export is one-bar only' {
+    Assert-Match $source 'bool shadowResultEvent\s*=\s*shadowResultEventBar\s*==\s*bar_index' 'event is tied to bar index'
+    $series = @(0..4 | ForEach-Object { if ($_ -eq 2) { 7.0 } else { [double]::NaN } })
+    $nonNa = @($series | Where-Object { -not [double]::IsNaN($_) })
+    Assert-True ($nonNa.Count -eq 1 -and $nonNa[0] -eq 7.0) 'one result event produces one exported row'
+}
+
+Pass-Test 'Shadow Logic Entry export uses last snapshot' {
+    Assert-Match $source 'plot\(shadowLogicEntryExport,\s*"V4 Shadow Logic Entry",\s*display\s*=\s*display\.data_window\)' 'Logic Entry export plot'
+    Assert-Match $source 'shadowLogicEntryExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastLogicEntryPrice' 'Logic Entry comes from last snapshot'
+}
+
+Pass-Test 'Shadow Executed Entry export uses last snapshot' {
+    Assert-Match $source 'plot\(shadowExecutedEntryExport,\s*"V4 Shadow Executed Entry",\s*display\s*=\s*display\.data_window\)' 'Executed Entry export plot'
+    Assert-Match $source 'shadowExecutedEntryExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastShadowEntryPrice' 'Executed Entry comes from last snapshot'
+}
+
+Pass-Test 'Shadow Delta export uses last snapshot' {
+    Assert-Match $source 'plot\(shadowTradeDeltaExport,\s*"V4 Shadow Trade Delta %",\s*display\s*=\s*display\.data_window\)' 'Delta export plot'
+    Assert-Match $source 'shadowTradeDeltaExport\s*=\s*shadowResultEvent\s*\?\s*shadow\.lastDeltaPct' 'Delta comes from last snapshot'
+}
+
+Pass-Test 'Shadow result label is additive to formal V3 labels' {
+    Assert-Match $source 'bool showShadowResultLabel\s*=\s*showSetup' 'existing label switch reused'
+    Assert-Match $source 'shadowDeltaText\s*=\s*[\s\S]*?"V4 Δ "' 'compact Shadow label text'
+    foreach ($labelText in @('T买', 'T空', 'T减', 'T平', 'T止损', '趋势失效', 'T超时', 'T保本')) {
+        Assert-Match $source ([regex]::Escape($labelText)) "formal label changed: $labelText"
+    }
+    Assert-Match $source 'label\.new\(bar_index,\s*high,\s*shadowDeltaText[\s\S]*?size\s*=\s*size\.tiny' 'Long Shadow label'
+    Assert-Match $source 'label\.new\(bar_index,\s*low,\s*shadowDeltaText[\s\S]*?size\s*=\s*size\.tiny' 'Short Shadow label'
+}
+
+Pass-Test 'Formal chart plot footprint remains unchanged' {
+    $plotPattern = '(?m)^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\('
+    $v4PlotLines = @($source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
+    $v3PlotLines = @($v3Source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
+    $v4VisiblePlots = @($v4PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
+    $v3VisiblePlots = @($v3PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
+    Assert-True ($v4VisiblePlots.Count -eq $v3VisiblePlots.Count) 'formal visible plots changed'
+    Assert-True ([regex]::Matches($source, '\bplotshape\(').Count -eq [regex]::Matches($v3Source, '\bplotshape\(').Count) 'formal plotshape footprint changed'
+}
+
+Pass-Test 'No new Strategy Tester order is added' {
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-NotMatch $shadowSection 'strategy\.(entry|order|close|close_all)\(' 'Shadow order path added'
+    Assert-Match $source 'strategy\.entry\("MR-L"[\s\S]*?strategy\.entry\("MR-S"' 'official entry orders remain'
+    Assert-Match $source 'strategy\.close\(trimEntryId[\s\S]*?strategy\.close\(closeEntryId' 'official close orders remain'
+}
+
+Pass-Test 'Strategy Tester order path remains V3 order IDs' {
+    Assert-Match $source 'strategy\.entry\("MR-L",\s*strategy\.long' 'Long order ID'
+    Assert-Match $source 'strategy\.entry\("MR-S",\s*strategy\.short' 'Short order ID'
+    Assert-Match $source 'string trimEntryId = logic\.logicEventDir == 1 \? "MR-L" : "MR-S"' 'Trim order ID mapping'
+    Assert-Match $source 'string closeEntryId = logic\.logicEventDir == 1 \? "MR-L" : "MR-S"' 'Close order ID mapping'
+}
+
+Pass-Test 'Shadow accounting formulas remain the existing functions' {
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'f_shadowNetPct\(MRShadowExecutionState this\)[\s\S]*?\(this\.shadowEquityIndex - 1\.0\) \* 100\.0' 'Shadow Net formula'
+    Assert-Match $shadowSection 'f_referenceNetPct\(MRShadowExecutionState this\)[\s\S]*?\(this\.referenceEquityIndex - 1\.0\) \* 100\.0' 'Reference Net formula'
+    Assert-Match $shadowSection 'f_shadowVsReferencePct\(MRShadowExecutionState this\)[\s\S]*?f_shadowNetPct\(this\) - f_referenceNetPct\(this\)' 'Delta formula'
+    Assert-Match $shadowSection 'f_shadowProfitFactor\(MRShadowExecutionState this\)[\s\S]*?this\.shadowGrossProfit / this\.shadowGrossLoss' 'PF formula'
+    Assert-Match $shadowSection 'f_shadowWinRate\(MRShadowExecutionState this\)[\s\S]*?this\.shadowWins / this\.shadowTrades \* 100\.0' 'Win Rate formula'
+    Assert-NotMatch $shadowSection 'strategy\.netprofit|strategy\.grossprofit|strategy\.grossloss' 'Shadow formula reads Tester accounting'
+}
+
+Pass-Test 'MRT.pine hash remains byte-for-byte baseline' {
+    $expectedSha = 'E9B42666A9150E34504794CC8311936209ECA74D9D049A0AC16C540104A3D1AF'
+    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $v3Path).Hash -eq $expectedSha) 'MRT.pine SHA changed'
+    $null = & git -C $repoRoot diff --quiet -- MRT.pine
+    Assert-True ($LASTEXITCODE -eq 0) 'MRT.pine has working-tree changes'
+}
+
+Pass-Test 'V3 parity and legacy harness coverage remain wired' {
+    Assert-Match $source 'allowBarCloseDecision\s*=\s*isNewLogicDecisionBar' 'confirmed Logic scheduler'
+    $v3Harness = Join-Path $PSScriptRoot 'MRT-v3.3.2-v2-logic-parity-harness.ps1'
+    Assert-True (Test-Path -LiteralPath $v3Harness) 'V3 parity harness missing'
+    Assert-Match $harness "Pass-Test 'Valid touched PREPLAN selects its published limit'" 'legacy PREPLAN coverage'
+    Assert-Match $harness "Pass-Test 'Shadow and Reference equity compound independently from 1.0'" 'legacy accounting coverage'
+}
+
+Pass-Test 'Original V4 Shadow coverage remains in the harness' {
+    Assert-Match $harness "Pass-Test 'Shadow Entry requires matching PREPLAN direction, mode, and touch'" 'legacy entry gate test'
+    Assert-Match $harness "Pass-Test 'Shadow Profit Factor and Win Rate use complete trades only'" 'legacy PF/win test'
+    Assert-Match $harness "Pass-Test '1008-like Long Stop trade improves when PREPLAN entry is lower'" 'legacy 1008-like test'
+    Assert-True ($testCount -ge 90) 'legacy and new tests ran before final count'
+}
+
+Assert-True ($testCount -eq 91) "expected 91 tests, ran $testCount"
+Write-Host "PASS: $testCount/$testCount V4.2.1 execution-assist + Shadow observability tests"
 Write-Host 'Manual TradingView compile/backtest and live alert validation remain required.'

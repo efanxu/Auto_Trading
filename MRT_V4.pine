@@ -3,13 +3,14 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-strategy("MR-T Strategy v4.2.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
+strategy("MR-T Strategy v4.2.1", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v4.2.0
+// Mean Reversion T (MR-T) · Strategy v4.2.1
 // V3.3.2 = confirmed-close Logic reference (MRT.pine).
 // V4.1.0 = V3-aligned Logic + previous-confirmed-bar execution assist.
 // V4.2.0 = V4.1.0 + independent Shadow Execution Accounting.
+// V4.2.1 = V4.2.0 + Shadow result observability and Chart Data export.
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -27,7 +28,7 @@ strategy("MR-T Strategy v4.2.0", shorttitle = "MR-T v4", overlay = true, pyramid
 // Shadow 只记账 PREPLAN 入场价格改善,不改变 Logic 或 Strategy Tester 订单路径。
 // 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v4.2.0 —— V3-Aligned Logic + Previous-Bar PREPLAN + Shadow Execution Accounting。
+// 版本 / Version: v4.2.1 —— V3-Aligned Logic + Previous-Bar PREPLAN + Shadow Execution Accounting。
 // 变更见 CHANGELOG.md。
 // ============================================================================
 
@@ -46,7 +47,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "4.2.0"
+string SCRIPT_VERSION = "4.2.1"
 
 
 // ============================================================================
@@ -200,6 +201,8 @@ showBackground = input.bool(true, "显示做T环境", group = "⑪ 显示")
 showSetup = input.bool(true, "显示观察信号", group = "⑪ 显示")
 showPanel = input.bool(true, "显示状态面板", group = "⑪ 显示")
 showTradeLevels = input.bool(true, "显示本轮目标/风险", group = "⑪ 显示")
+// Reuse the existing label visibility switch; no additional input is needed.
+bool showShadowResultLabel = showSetup
 
 
 // ============================================================================
@@ -615,6 +618,8 @@ type MRShadowExecutionState
     varip float  lastTrimPrice = na
     varip float  lastExitPrice = na
     varip int    lastExitReason = 0
+    varip int    lastTradeNumber = 0
+    varip int    lastResultEventBar = na
 
     varip float  shadowEquityIndex = 1.0
     varip float  referenceEquityIndex = 1.0
@@ -633,6 +638,8 @@ var MRShadowExecutionState shadow = MRShadowExecutionState.new()
 varip int logicSetupEventBar = na
 varip int logicSetupEventDir = 0
 varip int logicSetupEventMode = 0
+varip int shadowResultEventBar = na
+varip int shadowResultLabelBar = na
 
 bool setupEvent = logicSetupEventBar == bar_index
 int setupEventDir = logicSetupEventDir
@@ -700,10 +707,10 @@ f_consistencyName(int state) =>
     state == CONSISTENCY_OK_FLAT ? "OK_FLAT" : state == CONSISTENCY_OK_LONG ? "OK_LONG" : state == CONSISTENCY_OK_SHORT ? "OK_SHORT" : state == CONSISTENCY_PENDING_ENTRY ? "PENDING_ENTRY" : state == CONSISTENCY_STALE_ACTIVE_FLAT ? "STALE_ACTIVE_FLAT" : state == CONSISTENCY_DIRECTION_MISMATCH ? "DIRECTION_MISMATCH" : state == CONSISTENCY_ORPHAN_BROKER ? "ORPHAN_BROKER" : state == CONSISTENCY_DIRECT_REVERSAL ? "DIRECT_REVERSAL" : state == CONSISTENCY_STALE_PENDING ? "STALE_PENDING" : state == CONSISTENCY_PENDING_TRIM ? "PENDING_TRIM" : state == CONSISTENCY_PENDING_EXIT ? "PENDING_EXIT" : "INVALID_CONTEXT"
 
 f_modeName(int mode) =>
-    mode == 2 ? "Shock" : "Range"
+    mode == 2 ? "Shock" : mode == 1 ? "Range" : "-"
 
 f_directionName(int dir) =>
-    dir == 1 ? "Long" : "Short"
+    dir == 1 ? "Long" : dir == -1 ? "Short" : "-"
 
 f_price(float value) =>
     na(value) ? "-" : str.tostring(value, format.mintick)
@@ -746,6 +753,16 @@ f_preplanMessage(string eventName, int dir, int mode, int sourceBar, int validBa
 // subject to the exchange's actual fill.
 f_pct(float value) =>
     na(value) ? "-" : str.tostring(value, "#.#####")
+
+f_panelPct(float value, bool signedValue) =>
+    if na(value)
+        "-"
+    else
+        string sign = signedValue and value > 0.0 ? "+" : ""
+        sign + str.tostring(value, "#.#####") + "%"
+
+f_resultColor(float value) =>
+    na(value) ? color.gray : value > 0.0 ? color.lime : value < 0.0 ? color.red : color.gray
 
 f_shadowEntryImprovement(int dir, float logicPrice, float shadowPrice) =>
     logicPrice != 0.0 ? (dir == 1 ? (logicPrice - shadowPrice) / logicPrice : (shadowPrice - logicPrice) / logicPrice) * 100.0 : na
@@ -857,7 +874,27 @@ method closeTrade(MRShadowExecutionState this, int decisionBar, float decisionPr
         float referenceEquityBeforeTrade = this.referenceEquityIndex
         float shadowTradePnLIndex = shadowEquityBeforeTrade * shadowTradeReturn
         float referenceTradePnLIndex = referenceEquityBeforeTrade * referenceTradeReturn
+        int completedTradeNumber = this.shadowTrades + 1
 
+        // Snapshot the completed trade before changing or resetting its state.
+        this.lastDir := this.dir
+        this.lastMode := this.mode
+        this.lastEntryBar := this.entryBar
+        this.lastExitBar := decisionBar
+        this.lastLogicEntryPrice := this.logicEntryPrice
+        this.lastShadowEntryPrice := this.shadowEntryPrice
+        this.lastTrimPrice := this.trimTaken ? this.trimPrice : na
+        this.lastExitPrice := decisionPrice
+        this.lastExitReason := reason
+        this.lastTradeReturnPct := shadowTradeReturn * 100.0
+        this.lastReferenceReturnPct := referenceTradeReturn * 100.0
+        this.lastDeltaPct := this.lastTradeReturnPct - this.lastReferenceReturnPct
+        this.lastTradeNumber := completedTradeNumber
+        this.exitBar := decisionBar
+        this.exitPrice := decisionPrice
+        this.exitReason := reason
+
+        // Update cumulative accounting only after the per-trade snapshot.
         this.shadowEquityIndex *= 1.0 + shadowTradeReturn
         this.referenceEquityIndex *= 1.0 + referenceTradeReturn
         if shadowTradePnLIndex > 0.0
@@ -873,21 +910,8 @@ method closeTrade(MRShadowExecutionState this, int decisionBar, float decisionPr
         if shadowTradeReturn > 0.0
             this.shadowWins += 1
 
-        this.lastDir := this.dir
-        this.lastMode := this.mode
-        this.lastEntryBar := this.entryBar
-        this.lastExitBar := decisionBar
-        this.lastLogicEntryPrice := this.logicEntryPrice
-        this.lastShadowEntryPrice := this.shadowEntryPrice
-        this.lastTrimPrice := this.trimTaken ? this.trimPrice : na
-        this.lastExitPrice := decisionPrice
-        this.lastExitReason := reason
-        this.lastTradeReturnPct := shadowTradeReturn * 100.0
-        this.lastReferenceReturnPct := referenceTradeReturn * 100.0
-        this.lastDeltaPct := this.lastTradeReturnPct - this.lastReferenceReturnPct
-        this.exitBar := decisionBar
-        this.exitPrice := decisionPrice
-        this.exitReason := reason
+        // Snapshot the completed result before resetTrade clears trade fields.
+        this.lastResultEventBar := decisionBar
         this.resetTrade()
 
 f_shadowEntryMessage(string eventName, MRShadowExecutionState this) =>
@@ -1461,6 +1485,7 @@ if allowBarCloseDecision
         shadow.recordTrim(bar_index, close, trimPct / 100.0)
     if logic.logicEventBar == bar_index and logic.logicEventKind == 3 and shadow.active
         shadow.closeTrade(bar_index, close, logic.logicEventReason)
+        shadowResultEventBar := shadow.lastResultEventBar
         alert(f_shadowResultMessage(shadow), alert.freq_all)
 
 // A confirmed Logic full exit owns the cleanup handoff. Cleanup is allowed
@@ -1709,6 +1734,21 @@ if exitEvent and exitReason == R_BE and exitEventDir == -1
 
 
 // ============================================================================
+// Shadow Result Label
+// ============================================================================
+// One compact result marker is emitted on the full Shadow close bar. The
+// intra-bar guard prevents calc_on_order_fills from creating a duplicate.
+bool shadowResultEvent = shadowResultEventBar == bar_index
+if showShadowResultLabel and shadowResultEvent and shadowResultLabelBar != bar_index
+    shadowResultLabelBar := bar_index
+    string shadowDeltaText = na(shadow.lastDeltaPct) ? "V4 Δ -" : "V4 Δ " + (shadow.lastDeltaPct > 0.0 ? "+" : "") + f_pct(shadow.lastDeltaPct) + "%"
+    if shadow.lastDir == 1
+        label.new(bar_index, high, shadowDeltaText, style = label.style_label_down, color = color.new(color.gray, 75), textcolor = color.white, size = size.tiny)
+    else if shadow.lastDir == -1
+        label.new(bar_index, low, shadowDeltaText, style = label.style_label_up, color = color.new(color.gray, 75), textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
 // Data Window
 // ============================================================================
 // Keep the production Data Window compact: market context, Logic parity fields,
@@ -1742,14 +1782,24 @@ plot(broker.rangeWins, "Range Wins", display = display.data_window)
 plot(broker.shockEntries, "Shock Entries", display = display.data_window)
 plot(broker.shockClosed, "Shock Closed", display = display.data_window)
 plot(broker.shockWins, "Shock Wins", display = display.data_window)
-plot(shadow.shadowEntryPrice, "V4 Shadow Entry Price", display = display.data_window)
-plot(shadow.lastEntryImprovementPct, "V4 Entry Improvement %", display = display.data_window)
+float displayedShadowEntry = shadow.active ? shadow.shadowEntryPrice : shadow.lastShadowEntryPrice
+float displayedEntryImprovement = shadow.lastEntryImprovementPct
+float shadowTradeEventExport = shadowResultEvent ? shadow.shadowTrades : na
+float shadowLogicEntryExport = shadowResultEvent ? shadow.lastLogicEntryPrice : na
+float shadowExecutedEntryExport = shadowResultEvent ? shadow.lastShadowEntryPrice : na
+float shadowTradeDeltaExport = shadowResultEvent ? shadow.lastDeltaPct : na
+plot(displayedShadowEntry, "V4 Shadow Entry Price", display = display.data_window)
+plot(displayedEntryImprovement, "V4 Entry Improvement %", display = display.data_window)
 plot(shadow.lastTradeReturnPct, "V4 Shadow Last Trade %", display = display.data_window)
 plot(shadow.lastReferenceReturnPct, "V3 Reference Last Trade %", display = display.data_window)
 plot(f_shadowNetPct(shadow), "V4 Shadow Net %", display = display.data_window)
 plot(f_referenceNetPct(shadow), "V3 Reference Net %", display = display.data_window)
 plot(f_shadowVsReferencePct(shadow), "V4 vs V3 Delta %", display = display.data_window)
 plot(f_shadowProfitFactor(shadow), "V4 Shadow Profit Factor", display = display.data_window)
+plot(shadowTradeEventExport, "V4 Shadow Trade Event", display = display.data_window)
+plot(shadowLogicEntryExport, "V4 Shadow Logic Entry", display = display.data_window)
+plot(shadowExecutedEntryExport, "V4 Shadow Executed Entry", display = display.data_window)
+plot(shadowTradeDeltaExport, "V4 Shadow Trade Delta %", display = display.data_window)
 
 
 // ============================================================================
@@ -1774,7 +1824,6 @@ if showPanel
     string stateText = consistencyError ? f_tr("状态错误", "STATE ERROR") : logic.pos == 1 ? f_tr("逻辑T多", "Logic Long") : logic.pos == -1 ? f_tr("逻辑T空", "Logic Short") : broker.entryIntentPending and broker.entryIntentDir == 1 ? f_tr("待多头成交", "Pending Long") : broker.entryIntentPending and broker.entryIntentDir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("逻辑空仓", "Logic Flat")
 
     string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
-    string brokerAvgText = currentPositionSize == 0.0 ? "-" : str.tostring(strategy.position_avg_price, format.mintick)
     string brokerStateText = broker.fullExitIntentPending ? f_tr("等待全平成交", "Full exit pending") : broker.trimIntentPending ? f_tr("等待T减成交", "Trim pending") : broker.entryIntentPending ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
     string consistencyText = f_consistencyName(consistencyState)
     color consistencyColor = consistencyError ? color.red : color.lime
@@ -1793,24 +1842,33 @@ if showPanel
     string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
     string shockText = str.tostring(shockMove, "#.00") + " ATR"
     string scoreText = str.tostring(regimeScore, "#")
-    string modeText = logic.pos != 0 ? f_modeName(logic.tradeMode) : broker.entryIntentPending ? f_modeName(broker.entryIntentMode) : "-"
+    string shadowTradeNumberText = shadow.active ? "#" + str.tostring(shadow.shadowTrades + 1, "#") : shadow.lastTradeNumber > 0 ? "#" + str.tostring(shadow.lastTradeNumber, "#") : "-"
+    string modeText = shadow.active ? shadowTradeNumberText + " " + f_directionName(shadow.dir) + " / " + f_modeName(shadow.mode) : broker.entryIntentPending ? f_directionName(broker.entryIntentDir) + " / " + f_modeName(broker.entryIntentMode) : shadow.lastTradeNumber > 0 ? shadowTradeNumberText + " " + f_directionName(shadow.lastDir) + " / " + f_modeName(shadow.lastMode) : "-"
     string stopText = stopMode
     string phaseText = logic.pos != 0 ? logic.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : broker.trimIntentPending ? "TRIM_PENDING" : broker.entryIntentPending ? "ENTRY_PENDING" : "FLAT"
-    string entryText = logic.pos == 0 ? "-" : f_price(logic.entryPrice) + " / " + f_price(shadow.shadowEntryPrice)
-    string trimText = logic.pos == 0 ? "-" : str.tostring(logic.partialTarget, format.mintick)
-    string finalText = logic.pos == 0 ? "-" : str.tostring(logic.finalTarget, format.mintick)
+    string entryText = shadow.active ? f_price(shadow.logicEntryPrice) + " / " + f_price(shadow.shadowEntryPrice) : f_price(shadow.lastLogicEntryPrice) + " / " + f_price(shadow.lastShadowEntryPrice)
+    string entryImprovementText = f_panelPct(shadow.lastEntryImprovementPct, true)
+    string trimText = shadow.active ? shadow.trimTaken ? f_price(shadow.trimPrice) : f_price(logic.partialTarget) : f_price(shadow.lastTrimPrice)
+    string finalText = shadow.active ? f_price(logic.finalTarget) : f_price(shadow.lastExitPrice)
     string riskText = logic.pos == 0 ? "-" : str.tostring(f_logicActiveStop(logic.pos), format.mintick)
-    float testerProfitFactor = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
-    string testerPLText = str.tostring(strategy.netprofit, format.mintick) + " / DD " + str.tostring(strategy.max_drawdown, format.mintick) + " / PF " + (na(testerProfitFactor) ? "-" : str.tostring(testerProfitFactor, "#.00"))
-    float testerWinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
-    string testerTradeText = str.tostring(strategy.closedtrades, "#") + " / " + (na(testerWinRate) ? "-" : str.tostring(testerWinRate, "#.0") + "%")
-    float brokerExecutionCost = currentPositionSize == 0.0 ? na : f_brokerExecutionCost(strategy.position_avg_price)
-    string brokerCostText = na(brokerExecutionCost) ? "-" : str.tostring(brokerExecutionCost, format.mintick)
-    string brokerDiagnosticsText = brokerStateText + " / R " + str.tostring(broker.recoveryCount, "#") + " / Cost " + brokerCostText
+    string exitReasonText = shadow.active ? "-" : shadow.lastTradeNumber > 0 ? f_exitName(shadow.lastExitReason) : "-"
+    string recentTradeText = shadow.lastTradeNumber > 0 ? "#" + str.tostring(shadow.lastTradeNumber, "#") + " V3 " + f_panelPct(shadow.lastReferenceReturnPct, true) + " / V4 " + f_panelPct(shadow.lastTradeReturnPct, true) : "-"
+    string tradeDeltaText = shadow.lastTradeNumber > 0 ? f_panelPct(shadow.lastDeltaPct, true) : "-"
+    float shadowNet = f_shadowNetPct(shadow)
+    float referenceNet = f_referenceNetPct(shadow)
+    float cumulativeDelta = f_shadowVsReferencePct(shadow)
+    float shadowPF = f_shadowProfitFactor(shadow)
+    string cumulativeNetText = "V3 " + f_panelPct(referenceNet, false) + " / V4 " + f_panelPct(shadowNet, false)
+    string cumulativeDeltaText = f_panelPct(cumulativeDelta, true) + " pp / PF " + (na(shadowPF) ? "-" : str.tostring(shadowPF, "#.00"))
+    string shadowQualityText = f_panelPct(f_shadowWinRate(shadow), false) + " / " + f_panelPct(f_shadowUsagePct(shadow), false)
+    string brokerSummaryText = brokerPositionText + " / " + brokerStateText + " / " + consistencyText
     float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
     float shockWinRate = broker.shockClosed > 0 ? broker.shockWins / broker.shockClosed * 100.0 : na
-    string rangeStatsText = "E " + str.tostring(broker.rangeEntries, "#") + " / C " + str.tostring(broker.rangeClosed, "#") + " / W " + str.tostring(broker.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
-    string shockStatsText = "E " + str.tostring(broker.shockEntries, "#") + " / C " + str.tostring(broker.shockClosed, "#") + " / W " + str.tostring(broker.shockWins, "#") + " (" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
+    string rangeStatsText = "R E" + str.tostring(broker.rangeEntries, "#") + "/C" + str.tostring(broker.rangeClosed, "#") + "/W" + str.tostring(broker.rangeWins, "#") + "(" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
+    string shockStatsText = "S E" + str.tostring(broker.shockEntries, "#") + "/C" + str.tostring(broker.shockClosed, "#") + "/W" + str.tostring(broker.shockWins, "#") + "(" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
+    color entryImprovementColor = f_resultColor(shadow.lastEntryImprovementPct)
+    color tradeDeltaColor = f_resultColor(shadow.lastDeltaPct)
+    color cumulativeDeltaColor = f_resultColor(cumulativeDelta)
 
     table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
     table.cell(panel, 1, 0, "15m")
@@ -1836,44 +1894,44 @@ if showPanel
     table.cell(panel, 0, 7, "Half-Life")
     table.cell(panel, 1, 7, hlText)
 
-    table.cell(panel, 0, 8, f_tr("模式", "Mode"))
+    table.cell(panel, 0, 8, f_tr("模式 / 方向", "Mode / Dir"))
     table.cell(panel, 1, 8, modeText)
 
     table.cell(panel, 0, 9, f_tr("阶段", "Phase"))
     table.cell(panel, 1, 9, phaseText)
 
-    table.cell(panel, 0, 10, f_tr("逻辑/V4执行入场价", "Logic / V4 Shadow entry"))
+    table.cell(panel, 0, 10, f_tr("V3 / V4 入场价", "V3 / V4 Entry"))
     table.cell(panel, 1, 10, entryText)
 
-    table.cell(panel, 0, 11, f_tr("T减 / T平", "Trim / Final"))
-    table.cell(panel, 1, 11, trimText + " / " + finalText)
+    table.cell(panel, 0, 11, f_tr("入场改善 %", "Entry Improvement %"))
+    table.cell(panel, 1, 11, entryImprovementText, text_color = entryImprovementColor)
 
-    table.cell(panel, 0, 12, "Risk")
-    table.cell(panel, 1, 12, riskText + " (" + stopText + ")")
+    table.cell(panel, 0, 12, f_tr("T减 / T平", "Trim / Exit"))
+    table.cell(panel, 1, 12, trimText + " / " + finalText)
 
-    table.cell(panel, 0, 13, f_tr("Tester 净利/回撤/PF", "Tester P&L/DD/PF"))
-    table.cell(panel, 1, 13, testerPLText)
+    table.cell(panel, 0, 13, f_tr("Risk / 出场原因", "Risk / Exit Reason"))
+    table.cell(panel, 1, 13, riskText + " (" + stopText + ") / " + exitReasonText)
 
-    table.cell(panel, 0, 14, f_tr("Tester 交易 / 胜率", "Tester trades / win"))
-    table.cell(panel, 1, 14, testerTradeText)
+    table.cell(panel, 0, 14, f_tr("V3 / V4 最近收益 %", "V3 / V4 Last Return %"))
+    table.cell(panel, 1, 14, recentTradeText)
 
-    table.cell(panel, 0, 15, f_tr("Range 进场 / 已平 / 盈利", "Range entries / closed / wins"))
-    table.cell(panel, 1, 15, rangeStatsText)
+    table.cell(panel, 0, 15, f_tr("最近 Trade Delta %", "Last Trade Delta %"))
+    table.cell(panel, 1, 15, tradeDeltaText, text_color = tradeDeltaColor)
 
-    table.cell(panel, 0, 16, f_tr("Shock 进场 / 已平 / 盈利", "Shock entries / closed / wins"))
-    table.cell(panel, 1, 16, shockStatsText)
+    table.cell(panel, 0, 16, f_tr("V3 / V4 累计 Net %", "V3 / V4 Cumulative Net %"))
+    table.cell(panel, 1, 16, cumulativeNetText)
 
-    table.cell(panel, 0, 17, f_tr("Broker 仓位", "Broker Position"))
-    table.cell(panel, 1, 17, brokerPositionText)
+    table.cell(panel, 0, 17, f_tr("累计 Delta % / V4 PF", "Cumulative Delta % / V4 PF"))
+    table.cell(panel, 1, 17, cumulativeDeltaText, text_color = cumulativeDeltaColor)
 
-    table.cell(panel, 0, 18, f_tr("Broker 均价", "Broker Avg Price"))
-    table.cell(panel, 1, 18, brokerAvgText)
+    table.cell(panel, 0, 18, f_tr("V4 胜率 / PREPLAN 使用", "V4 Win Rate / PREPLAN Usage"))
+    table.cell(panel, 1, 18, shadowQualityText)
 
-    table.cell(panel, 0, 19, f_tr("Broker状态 / 恢复次数", "Broker State / Recovery Count"))
-    table.cell(panel, 1, 19, brokerDiagnosticsText)
+    table.cell(panel, 0, 19, f_tr("Broker / 一致性", "Broker / Consistency"))
+    table.cell(panel, 1, 19, brokerSummaryText, text_color = consistencyColor)
 
-    table.cell(panel, 0, 20, f_tr("一致性", "Consistency"))
-    table.cell(panel, 1, 20, consistencyText, text_color = consistencyColor)
+    table.cell(panel, 0, 20, f_tr("Range / Shock 统计", "Range / Shock Stats"))
+    table.cell(panel, 1, 20, rangeStatsText + " / " + shockStatsText)
 
 else
     table.clear(panel, 0, 0, 1, 20)
