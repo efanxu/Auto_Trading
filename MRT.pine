@@ -6,7 +6,7 @@
 strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v3.1.0
+// Mean Reversion T (MR-T) · Strategy v3.1.1
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -20,7 +20,7 @@ strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
 // 收盘确认信号 → 下一可成交时点执行;换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v3.1.0 —— Confirmed-close Strategy Tester 回测版本。变更见 CHANGELOG.md。
+// 版本 / Version: v3.1.1 —— Confirmed-close Strategy Tester 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -38,7 +38,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "3.1.0"
+string SCRIPT_VERSION = "3.1.1"
 
 
 // ============================================================================
@@ -456,7 +456,10 @@ type MRFillState
     // Frozen trade context and real fill lifecycle.
     varip bool   active = false
     varip int    pos = 0
-    varip int    entryBar = na
+    // Decision bars preserve the original confirmed-close MR-T time axis.
+    // Fill bars record the Broker Emulator execution separately.
+    varip int    entryDecisionBar = na
+    varip int    entryFillBar = na
     varip float  entryPrice = na
     varip float  entrySize = na
     varip float  mean = na
@@ -469,13 +472,16 @@ type MRFillState
     varip int    tradeMode = 0
     varip float  cost = 0.0
     varip float  netProfitAtEntry = na
+    // lastExitBar is the confirmed-close exit decision bar used for cooldown.
     varip int    lastExitBar = na
+    varip int    exitDecisionBar = na
     varip int    exitReasonPending = 0
     varip bool   exitRequested = false
     varip bool   marketClosePlaced = false
     varip bool   trimRequested = false
     varip bool   partialTaken = false
-    varip int    partialBar = na
+    varip int    trimDecisionBar = na
+    varip int    trimFillBar = na
 
     // Broker/fill-state recovery is separate from the normal trade lifecycle.
     // A recovery never contributes to Range/Shock Closed or Wins statistics.
@@ -525,10 +531,12 @@ f_clearTradeContext() =>
     fillState.active := false
     fillState.pos := 0
     fillState.partialTaken := false
-    fillState.partialBar := na
+    fillState.trimDecisionBar := na
+    fillState.trimFillBar := na
     fillState.trimRequested := false
 
-    fillState.entryBar := na
+    fillState.entryDecisionBar := na
+    fillState.entryFillBar := na
     fillState.entryPrice := na
     fillState.entrySize := na
     fillState.mean := na
@@ -541,6 +549,7 @@ f_clearTradeContext() =>
     fillState.tradeMode := 0
     fillState.cost := 0.0
     fillState.netProfitAtEntry := na
+    fillState.exitDecisionBar := na
     fillState.exitReasonPending := 0
     fillState.exitRequested := false
     fillState.marketClosePlaced := false
@@ -590,6 +599,15 @@ int R_TIME  = 3
 int R_FINAL = 4
 int R_BE    = 5
 int R_STATE_RECOVERY = 6
+
+// f_manage() result codes. State mutation remains the source of truth; the
+// return value is a single int for diagnostics and future callers.
+int MANAGE_NONE     = 0
+int MANAGE_STOP_BE  = 1
+int MANAGE_TREND    = 2
+int MANAGE_TIMEOUT  = 3
+int MANAGE_TRIM     = 4
+int MANAGE_FINAL    = 5
 
 // Broker/fill-state consistency classifier.  The broker position remains the
 // final source of truth; these states describe whether the frozen lifecycle can
@@ -927,9 +945,9 @@ f_recentExitPrice(float fallback) =>
 // ============================================================================
 // Entry lifecycle
 // ============================================================================
-// 信号 bar 只提交市场订单并冻结信号上下文。订单在下一可成交时点成交后,
-// 才用 strategy.position_avg_price 初始化实际交易;目标/止损因此不再把 close
-// 当作成交价的唯一事实来源。
+// 信号 bar 只提交市场订单并冻结信号上下文。pendingBar 是 Entry decision bar;
+// 订单在下一可成交时点成交后,entryDecisionBar / entryFillBar 分别保存策略锚点
+// 与真实成交 bar,再用 strategy.position_avg_price 初始化实际交易。
 
 f_enter(int dir) =>
     t.pendingDir := dir
@@ -968,7 +986,8 @@ f_initializeTrade(int dir) =>
 
         fillState.active := true
         fillState.pos := dir
-        fillState.entryBar := bar_index
+        fillState.entryDecisionBar := fillState.pendingBar
+        fillState.entryFillBar := bar_index
         fillState.entryPrice := filledPrice
         fillState.entrySize := math.abs(strategy.position_size)
         fillState.mean := fillState.pendingMean
@@ -977,8 +996,10 @@ f_initializeTrade(int dir) =>
         fillState.tradeMode := fillState.pendingMode
         fillState.timeStop := fillState.pendingTimeStop
         fillState.partialTaken := false
-        fillState.partialBar := na
+        fillState.trimDecisionBar := na
+        fillState.trimFillBar := na
         fillState.trimRequested := false
+        fillState.exitDecisionBar := na
 
         float pz = fillState.tradeMode == 2 ? shockPartialZ : rangePartialZ
         float ez = fillState.tradeMode == 2 ? shockExitZ : rangeExitZ
@@ -1028,8 +1049,9 @@ f_initializeTrade(int dir) =>
 
 f_markPartial(int dir) =>
     if fillState.active and fillState.pos == dir and not fillState.partialTaken
+        // trimDecisionBar was captured by f_manage(); this is the real fill bar.
         fillState.partialTaken := true
-        fillState.partialBar := bar_index
+        fillState.trimFillBar := bar_index
         fillState.trimRequested := false
         fillState.eventKind := 2
         fillState.eventDir := dir
@@ -1054,7 +1076,9 @@ f_exit(int dir, int reason) =>
             if winningTrade
                 fillState.shockWins += 1
 
-        fillState.lastExitBar := bar_index
+        // The broker reaches flat later, but cooldown follows the confirmed exit decision.
+        int cooldownDecisionBar = na(fillState.exitDecisionBar) ? bar_index : fillState.exitDecisionBar
+        fillState.lastExitBar := cooldownDecisionBar
         f_clearTradeContext()
 
         fillState.eventKind := 3
@@ -1072,35 +1096,48 @@ f_exit(int dir, int reason) =>
 // Stop/BE → Trend Fail → Timeout → Trim → Final。
 
 f_manage(int dir, bool allowBarCloseDecision, bool tradeContextValid) =>
-    bool afterEntryBar = not na(fillState.entryBar) and bar_index > fillState.entryBar
-    bool afterTrimFillBar = not fillState.partialTaken or (not na(fillState.partialBar) and bar_index > fillState.partialBar)
-    bool canManage = tradeContextValid and fillState.pos == dir and currentPositionSize * dir > 0.0 and afterEntryBar and afterTrimFillBar
+    int decisionCode = MANAGE_NONE
+    bool afterEntryDecisionBar = not na(fillState.entryDecisionBar) and bar_index > fillState.entryDecisionBar
+    bool afterTrimDecisionBar = not fillState.partialTaken or (not na(fillState.trimDecisionBar) and bar_index > fillState.trimDecisionBar)
+    bool canManage = tradeContextValid and fillState.pos == dir and currentPositionSize * dir > 0.0 and afterEntryDecisionBar and afterTrimDecisionBar and not fillState.trimRequested and not fillState.exitRequested
 
     // Entry/Trim/Exit fill recalculations synchronize state only. Pending orders
     // also block a second lifecycle decision before the real fill is observed.
-    if allowBarCloseDecision and canManage and not fillState.exitRequested and not fillState.trimRequested
+    if allowBarCloseDecision and canManage
         float activeStop = f_activeStop(dir)
         bool stopFailed = dir == 1 ? close <= activeStop : close >= activeStop
         bool trendFailed = dir * htfSlopeATR <= -vetoHtfSlope or dir * localSlopeATR <= -vetoLocalSlope
-        bool timeFailed = not na(fillState.timeStop) and (bar_index - fillState.entryBar) >= fillState.timeStop
+        bool timeFailed = not na(fillState.timeStop) and (bar_index - fillState.entryDecisionBar) >= fillState.timeStop
         bool trimReached = not fillState.partialTaken and (dir == 1 ? close >= fillState.partialTarget : close <= fillState.partialTarget)
-        bool finalEligible = fillState.partialTaken and not na(fillState.partialBar) and bar_index > fillState.partialBar
+        bool finalEligible = fillState.partialTaken and not na(fillState.trimDecisionBar) and bar_index > fillState.trimDecisionBar
         bool finalReached = finalEligible and (dir == 1 ? close >= fillState.finalTarget : close <= fillState.finalTarget)
 
         if stopFailed
             fillState.exitRequested := true
             fillState.exitReasonPending := fillState.partialTaken and moveStopToBE ? R_BE : R_STOP
+            fillState.exitDecisionBar := bar_index
+            decisionCode := MANAGE_STOP_BE
         else if trendFailed
             fillState.exitRequested := true
             fillState.exitReasonPending := R_TREND
+            fillState.exitDecisionBar := bar_index
+            decisionCode := MANAGE_TREND
         else if timeFailed
             fillState.exitRequested := true
             fillState.exitReasonPending := R_TIME
+            fillState.exitDecisionBar := bar_index
+            decisionCode := MANAGE_TIMEOUT
         else if trimReached
             fillState.trimRequested := true
+            fillState.trimDecisionBar := bar_index
+            decisionCode := MANAGE_TRIM
         else if finalReached
             fillState.exitRequested := true
             fillState.exitReasonPending := R_FINAL
+            fillState.exitDecisionBar := bar_index
+            decisionCode := MANAGE_FINAL
+
+    decisionCode
 
 
 // ============================================================================
@@ -1353,6 +1390,12 @@ plot(fillState.latestClosedExitCode, "Latest Closed Entry ID Code", display = di
 plot(fillState.eventKind, "Fill Event Type", display = display.data_window)
 plot(fillState.active ? 1 : 0, "Broker-synced Trade Active", display = display.data_window)
 plot(fillState.partialTaken ? 1 : 0, "Broker-synced Partial Taken", display = display.data_window)
+plot(fillState.entryDecisionBar, "Entry Decision Bar", display = display.data_window)
+plot(fillState.entryFillBar, "Entry Fill Bar", display = display.data_window)
+plot(fillState.trimDecisionBar, "Trim Decision Bar", display = display.data_window)
+plot(fillState.trimFillBar, "Trim Fill Bar", display = display.data_window)
+plot(fillState.exitDecisionBar, "Exit Decision Bar", display = display.data_window)
+plot(fillState.lastExitBar, "Last Exit Decision Bar", display = display.data_window)
 plot(fillState.shockZCandidates, "Shock Z Candidates", display = display.data_window)
 plot(fillState.shockMoveCandidates, "Shock Move Candidates", display = display.data_window)
 plot(fillState.shockEnvironmentPass, "Shock Environment Pass", display = display.data_window)

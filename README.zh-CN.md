@@ -6,7 +6,7 @@ English · [简体中文](README.zh-CN.md)
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.1.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.1.1-informational)](CHANGELOG.md)
 
 ---
 
@@ -218,7 +218,7 @@ Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(�
 
 Broker Emulator 使用标准市场订单处理。confirmed-close 的 Entry、T减、T平、Stop/BE、Trend Fail 或 Timeout 决策会创建订单;由于 `process_orders_on_close = false` 且所有 `strategy.close` 都使用 `immediately = false`,订单在下一可成交时点执行。图表水平是收盘决策阈值,不是保证成交价。
 
-### v3.1.0 Confirmed-close Broker / FillState 一致性
+### v3.1.1 Confirmed-close Broker / FillState 一致性
 
 `strategy.position_size` 与 `strategy.position_avg_price` 是 Broker Emulator 的最终事实来源。`MRFillState` 只保存冻结的信号上下文、生命周期阶段、退出原因与辅助统计。Data Window 暴露以下数值一致性分类器:
 
@@ -235,7 +235,9 @@ Broker Emulator 使用标准市场订单处理。confirmed-close 的 Entry、T�
 
 Stale 上下文会被清除,不会增加 Range/Shock 的 Closed 或 Wins。孤儿仓位与直接反向会取消未成交订单,再用 `strategy.close_all()` 安全收口;绝不会用当前 mean/std 伪造为新交易。正常生命周期不使用 `strategy.order`、`strategy.exit`、stop/limit 价格单或 OCA 组。只有真实 Broker 仓位存在、active lifecycle 有效且方向一致时才绘制交易线。
 
-生命周期阶段明确区分为:Signal → Pending Entry → Active pre-trim → Pending Trim fill → Active post-trim → Pending Full Exit → Flat。只有 `strategy.position_size` 真实减少后才设置 `partialTaken`,只有真实归零后才 reset。正常历史运行的 `Consistency Recovery Count` 应为 `0`。
+生命周期阶段明确区分为:Signal → Pending Entry → Active pre-trim → Pending Trim fill → Active post-trim → Pending Full Exit → Flat。`entryDecisionBar`、`trimDecisionBar` 与 `exitDecisionBar` 是 confirmed-close 策略时间锚点;`entryFillBar` 与 `trimFillBar` 记录 Broker Emulator 的实际成交 bar。只有 `strategy.position_size` 真实减少后才设置 `partialTaken`,只有真实归零后才 reset。正常历史运行的 `Consistency Recovery Count` 应为 `0`。
+
+`f_manage()` 为诊断统一返回一个 `int` 动作编码(`MANAGE_NONE`、`MANAGE_STOP_BE`、`MANAGE_TREND`、`MANAGE_TIMEOUT`、`MANAGE_TRIM` 或 `MANAGE_FINAL`);订单提交仍以生命周期字段为唯一事实来源。
 
 Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Candidates`、`Shock Environment Pass`、`Shock Deceleration Pass`、`Shock Rejection Pass`、`Shock Setups`、`Shock Confirmed Entries`。每一层都包含前置条件,并只在 confirmed-close Entry eligibility 阶段计数,最大跌落层就是主要过滤来源。
 
@@ -249,18 +251,18 @@ Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Cand
 - 已确认信号 bar 先排队订单;成交后从真实 `strategy.position_avg_price` 与信号 bar 环境上下文冻结目标 / 止损。
 - 半衰期估计只用历史数据。
 
-Entry 成交 bar 只初始化真实成交均价、仓位与冻结上下文;管理要求 `bar_index > entryBar`。T减信号提交真实 `qty_percent = trimPct` 市场减仓;真实成交后,BE/T平管理还要求 `bar_index > partialBar`。因此不会发生 Entry → exit 或 T减 → BE/T平 的同 15m bar 生命周期跳跃。
+confirmed Entry signal bar 保存为 `entryDecisionBar`,实际 Broker Emulator 成交 bar 保存为 `entryFillBar`。Entry fill execution 只同步真实成交价、仓位与冻结上下文,但该成交 bar 真正 confirmed close 时,因 `bar_index > entryDecisionBar`,已经可以进行第一次管理。T减 signal 保存 `trimDecisionBar`,真实减仓 bar 保存为 `trimFillBar`;Trim fill execution 只同步真实仓位减少,而该 bar 的 confirmed close 因 `bar_index > trimDecisionBar` 已经可以判断 BE/T平。完整退出 decision 保存 `exitDecisionBar`,Broker 后续真实归零时用该 decision bar 作为 cooldown 锚点。
 
-### v3.1.0 TradingView 验收清单
+### v3.1.1 TradingView 验收清单
 
 在 15 分钟图于 TradingView 编译后:
 
 1. Pine v6 在 15m 图编译成功。
 2. `MR-L` / `MR-S` 在 confirmed 信号后的下一可成交时点成交。
-3. Entry 成交 bar 没有 T减、Stop 或 T平决策。
+3. Entry fill execution 只同步状态;Entry 成交 bar 的 confirmed close 可以触发 T减、Stop、Trend Fail 或 Timeout。
 4. T减只在 confirmed close 达到冻结的 T减水平时触发。
 5. 真实 Broker 仓位按 `trimPct` 减少(默认 50%)。
-6. 真实 T减成交 bar 之后才允许 BE 与 T平。
+6. Trim fill execution 只同步状态;Trim 成交 bar 的 confirmed close 可以判断 BE 与 T平。
 7. Stop 只在 confirmed close 穿越图表 Risk 时触发。
 8. Trend Fail 只在 confirmed close 判断。
 9. Timeout 只在 confirmed close 判断。
@@ -269,7 +271,7 @@ Entry 成交 bar 只初始化真实成交均价、仓位与冻结上下文;管�
 12. 正常历史路径的 `Consistency Recovery Count` 为 0。
 13. 最终 Flat 且无 pending order 时,Range + Shock Entries 等于 Range + Shock Closed。
 14. 正常订单列表没有 `MR-L/MR-S-STOP`、`-TRIM`、`-FINAL` bracket ID。
-15. 正常 Entry bar 不会同时出现 Entry + T减 + Stop;Bar Magnifier 开关不应实质改变生命周期决策。
+15. Entry/Trim fill execution 不产生生命周期决策,且一次 confirmed close 最多产生一个生命周期动作;Bar Magnifier 开关不应实质改变生命周期决策。
 
 源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 

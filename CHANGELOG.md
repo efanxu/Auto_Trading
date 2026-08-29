@@ -2,6 +2,27 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.1.1] — Compile fix and decision-bar timing alignment
+
+This patch keeps the confirmed-close MR-T decision model and real Strategy Tester broker fills while separating strategy decision bars from actual fill bars.
+
+### Fixed
+
+- **Pine return type** — `f_manage()` now accumulates one `int` management code (`NONE`, `STOP/BE`, `TREND`, `TIMEOUT`, `TRIM`, or `FINAL`) and explicitly returns it, removing the mixed `series int` / `series bool` block result that caused the Pine 1090:9 compile error.
+- **Decision-bar lifecycle timing** — `entryDecisionBar`, `trimDecisionBar`, and `exitDecisionBar` preserve the confirmed-close MR-T time axis; `entryFillBar` and `trimFillBar` record actual Broker Emulator executions.
+- **Entry and Trim management** — fill recalculations remain synchronization-only, while the confirmed close of the Entry or Trim fill bar can perform the next lifecycle decision. Final/BE eligibility is based on `trimDecisionBar`.
+- **TimeStop and cooldown** — TimeStop counts from `entryDecisionBar`; cooldown uses the full-exit `exitDecisionBar` when the broker later reaches flat.
+
+### Preserved
+
+- Range/Shock engines, Shock funnel, thresholds, defaults, confirmed-close risk decisions, real 50% default Trim, cross-date holding, consistency recovery, and Strategy Tester broker facts remain unchanged.
+
+### Verification
+
+- `tests/MRT-v3.1.1-confirmed-close-harness.ps1` covers Entry/Trim decision-versus-fill timing, TimeStop, cooldown, fill-only synchronization, unified `f_manage()` return typing, function branch scanning, Long/Short symmetry, consistency recovery, and unchanged order contracts.
+- Static review and `git diff --check` are required before release.
+- Pine v6 compilation and Strategy Tester runtime verification remain pending manual TradingView verification.
+
 ## [3.1.0] — Confirmed-close Strategy Tester execution
 
 This release restores the original MR-T confirmed 15-minute close decision model while retaining real TradingView Strategy Tester fills and broker positions. It is an execution-semantics change only; all inputs and strategy thresholds keep their prior names, groups, defaults, meanings, and Long/Short symmetry.
