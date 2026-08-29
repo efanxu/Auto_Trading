@@ -2,6 +2,28 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.3.2] — Restore stable presentation footprint
+
+This release keeps the v3.3.1 V2 Logic-State / Broker Execution architecture and restores the production display layer to the stable 07cbe31 presentation footprint.
+
+### Changed
+
+- **Three explicit layers** — `MRLogicState` remains the sole source for T-buy, T-short, T-trim, T-close, Stop/BE, Trend Fail, and Timeout decisions; `MRBrokerState` remains responsible for real Strategy Tester orders, fills, P&L, consistency, and recovery; Presentation only renders their facts.
+- **Stable Presentation baseline** — Local Mean, Range/Shock/Extreme bands and fills, Range/Shock backgrounds, Logic-frozen T-trim/T-close/Risk levels, Setup labels, Logic Event T labels, and the compact Panel follow commit `07cbe31a1c9adbdf5d96a6c84558184adfb0cdfb`.
+- **Compact production Data Window** — reduced from 44 to 27 plots. It retains market context, the minimum Logic parity fields, current Broker position/entry facts, recovery/consistency, and Range/Shock statistics; fill bars, intent flags, and Shock funnel counters remain development diagnostics.
+- **Conservative plot budget** — 37 `plot()` calls, one `bgcolor()`, and two const-color Shock `fill()` calls produce an estimated static budget of 38/50. The Panel remains at 21 rows and includes Broker state, recovery count, and cost diagnostics.
+- **Release harness** — renamed and extended `tests/MRT-v3.3.2-v2-logic-parity-harness.ps1` with direct v3.3.1 Logic/Broker regression checks and 07c Presentation regression checks.
+
+### Preserved
+
+- All 58 input declarations and defaults, `process_orders_on_close = true`, `calc_on_order_fills = true`, `calc_on_every_tick = false`, `pyramiding = 0`, zero margin requirements, real `strategy.entry` / `strategy.close`, default 50% Trim, Close-only V2 lifecycle, BE cost semantics, recovery isolation, and Range/Shock statistics.
+
+### Verification
+
+- Local harness passes V2 Logic parity, Broker architecture, Close-only lifecycle, BE cost, Trend/Timeout/Cooldown, Presentation regression, 27 Data Window plots, and the 38/50 static budget.
+- `git diff --check` is required before release.
+- TradingView Pine v6 compilation, absence of RE10140, visual comparison with 07c, Strategy Tester runtime parity, normal-path Recovery Count = 0, and Margin Call = 0 remain manual TradingView checks.
+
 ## [3.3.1] — Plot-budget and parity-harness correctness patch
 
 This patch keeps the v3.3.0 MRLogicState / MRBrokerState architecture and transaction logic unchanged.

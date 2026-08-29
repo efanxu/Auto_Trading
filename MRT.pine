@@ -6,7 +6,7 @@
 strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v3.3.1
+// Mean Reversion T (MR-T) · Strategy v3.3.2
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -22,7 +22,7 @@ strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0
 // confirmed-close 决策 → 当前 K 线收盘的 Strategy Tester 市价成交;
 // 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v3.3.1 —— V2 Logic-State Parity Strategy 回测版本。变更见 CHANGELOG.md。
+// 版本 / Version: v3.3.2 —— V2 Logic-State Parity Strategy 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -40,7 +40,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "3.3.1"
+string SCRIPT_VERSION = "3.3.2"
 
 
 // ============================================================================
@@ -1313,8 +1313,9 @@ if exitEvent and exitReason == R_BE and exitEventDir == -1
 // ============================================================================
 // Data Window
 // ============================================================================
-// Keep long-lived market, Logic, Broker, and funnel parity fields here. Current
-// UI-only execution state remains in the Panel so it does not consume plot budget.
+// Keep the production Data Window compact: market context, Logic parity fields,
+// Broker position/recovery facts, and Range/Shock statistics. Execution-only
+// transition diagnostics remain in the Panel so they do not consume plot budget.
 
 plot(z, "Z-score", display = display.data_window)
 plot(regimeScore, "Regime Score", display = display.data_window)
@@ -1327,46 +1328,29 @@ plot(localSlopeATR, "15m Slope", display = display.data_window)
 plot(htfSlopeATR, "1H Slope", display = display.data_window)
 plot(logic.pos, "Logic Position", display = display.data_window)
 plot(logic.partialTaken ? 1 : 0, "Logic Partial Taken", display = display.data_window)
-plot(logic.entryBar, "Logic Entry Bar", display = display.data_window)
 plot(logic.entryPrice, "Logic Entry Price", display = display.data_window)
 plot(logic.partialTarget, "Logic Partial Target", display = display.data_window)
 plot(logic.finalTarget, "Logic Final Target", display = display.data_window)
 plot(logic.pos != 0 ? f_logicActiveStop(logic.pos) : na, "Logic Active Stop", display = display.data_window)
-plot(logic.timeStop, "Logic Time Stop", display = display.data_window)
-plot(logic.lastExitBar, "Logic Last Exit Bar", display = display.data_window)
 plot(logic.logicEventKind, "Logic Event Code", display = display.data_window)
 plot(logic.logicEventReason, "Logic Event Reason", display = display.data_window)
 plot(currentPositionSize, "Broker Position", display = display.data_window)
 plot(broker.brokerEntryPrice, "Broker Entry Price", display = display.data_window)
-plot(broker.fillEventKind, "Broker Fill Event", display = display.data_window)
 plot(broker.recoveryCount, "Broker Recovery Count", display = display.data_window)
 plot(consistencyState, "Broker Consistency State", display = display.data_window)
-plot(broker.entryFillBar, "Broker Entry Fill Bar", display = display.data_window)
-plot(logic.trimDecisionBar, "Logic Trim Decision Bar", display = display.data_window)
-plot(broker.trimFillBar, "Broker Trim Fill Bar", display = display.data_window)
-plot(logic.exitDecisionBar, "Logic Exit Decision Bar", display = display.data_window)
-plot(broker.fullExitFillBar, "Broker Full Exit Fill Bar", display = display.data_window)
 plot(broker.rangeEntries, "Range Entries", display = display.data_window)
 plot(broker.rangeClosed, "Range Closed", display = display.data_window)
 plot(broker.rangeWins, "Range Wins", display = display.data_window)
 plot(broker.shockEntries, "Shock Entries", display = display.data_window)
 plot(broker.shockClosed, "Shock Closed", display = display.data_window)
 plot(broker.shockWins, "Shock Wins", display = display.data_window)
-plot(broker.latestClosedExitCode, "Latest Closed Entry ID Code", display = display.data_window)
-plot(broker.shockZCandidates, "Shock Z Candidates", display = display.data_window)
-plot(broker.shockMoveCandidates, "Shock Move Candidates", display = display.data_window)
-plot(broker.shockEnvironmentPass, "Shock Environment Pass", display = display.data_window)
-plot(broker.shockDecelerationPass, "Shock Deceleration Pass", display = display.data_window)
-plot(broker.shockRejectionPass, "Shock Rejection Pass", display = display.data_window)
-plot(broker.shockSetups, "Shock Setups", display = display.data_window)
-plot(broker.shockConfirmedEntries, "Shock Confirmed Entries", display = display.data_window)
 
 
 // ============================================================================
 // Panel
 // ============================================================================
 
-var table panel = table.new(position.top_right, 2, 22, border_width = 1)
+var table panel = table.new(position.top_right, 2, 21, border_width = 1)
 
 if showPanel and barstate.islast
 
@@ -1416,6 +1400,7 @@ if showPanel and barstate.islast
     string testerTradeText = str.tostring(strategy.closedtrades, "#") + " / " + (na(testerWinRate) ? "-" : str.tostring(testerWinRate, "#.0") + "%")
     float brokerExecutionCost = currentPositionSize == 0.0 ? na : f_brokerExecutionCost(strategy.position_avg_price)
     string brokerCostText = na(brokerExecutionCost) ? "-" : str.tostring(brokerExecutionCost, format.mintick)
+    string brokerDiagnosticsText = brokerStateText + " / R " + str.tostring(broker.recoveryCount, "#") + " / Cost " + brokerCostText
     float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
     float shockWinRate = broker.shockClosed > 0 ? broker.shockWins / broker.shockClosed * 100.0 : na
     string rangeStatsText = "E " + str.tostring(broker.rangeEntries, "#") + " / C " + str.tostring(broker.rangeClosed, "#") + " / W " + str.tostring(broker.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
@@ -1478,18 +1463,14 @@ if showPanel and barstate.islast
     table.cell(panel, 0, 18, f_tr("Broker 均价", "Broker Avg Price"))
     table.cell(panel, 1, 18, brokerAvgText)
 
-    table.cell(panel, 0, 19, f_tr("Broker状态", "Broker State"))
-    table.cell(panel, 1, 19, brokerStateText)
+    table.cell(panel, 0, 19, f_tr("Broker状态 / 恢复次数", "Broker State / Recovery Count"))
+    table.cell(panel, 1, 19, brokerDiagnosticsText)
 
     table.cell(panel, 0, 20, f_tr("一致性", "Consistency"))
     table.cell(panel, 1, 20, consistencyText, text_color = consistencyColor)
 
-    table.cell(panel, 0, 21, f_tr("Broker成本估算", "Broker cost estimate"))
-    table.cell(panel, 1, 21, brokerCostText)
-
-
 if not showPanel and barstate.islast
-    table.clear(panel, 0, 0, 1, 21)
+    table.clear(panel, 0, 0, 1, 20)
 
 
 // ============================================================================

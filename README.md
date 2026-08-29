@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md) · English
 
-A production-grade **V2 Logic-State Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.3.1 lets the V2 logic state decide every lifecycle point from a confirmed **15-minute close**, then lets Strategy Tester execute the resulting broker intent on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
+A production-grade **V2 Logic-State Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.3.2 lets the V2 logic state decide every lifecycle point from a confirmed **15-minute close**, then lets Strategy Tester execute the resulting broker intent on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.3.1-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.2-informational)](CHANGELOG.md)
 
 ---
 
@@ -37,6 +37,18 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; input labels are compile-time static, while alerts use structured dynamic messages |
 | Repaint-safe | Signals gated on confirmed bars; higher-timeframe data uses the last confirmed 1H bar; trade targets are frozen at entry |
 | Versioned | Semantic versioning (see `CHANGELOG.md`), version shown in the panel |
+
+---
+
+## Three-layer architecture
+
+The formal script keeps three explicit responsibilities:
+
+- **V2 Logic Layer** — `MRLogicState` is the only source for T-buy, T-short, T-trim, T-close, Stop/BE, Trend Fail, and Timeout decisions.
+- **Broker Execution Layer** — `MRBrokerState` submits real `strategy.entry` / `strategy.close` orders and records actual position, fill price, Strategy Tester P&L, consistency, and recovery facts.
+- **Presentation Layer** — the chart, Panel, and compact Data Window expose Logic decisions and Broker facts. Its production display footprint follows the stable 07cbe31 presentation baseline; internal transition diagnostics are covered by the harness.
+
+Presentation never feeds back into the Logic or Broker layers. T labels and frozen target/Risk lines come from Logic State; native order markers and Broker statistics come from Strategy Tester execution.
 
 ---
 
@@ -217,13 +229,15 @@ Strategy Tester is the formal performance source. Commission is declared as `0.0
 
 The V2 Logic State uses `logic.entryPrice = close` and `logic.cost = entryPrice * (2 * commissionBps) / 10000` for frozen targets, risk, and post-trim BE. `slippageTicks` is used only by the Broker cost estimate in the Panel; it never changes the V2 Logic BE threshold. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values. Range/Shock are lightweight Broker-side classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
 
-### v3.3.1 V2 Logic-State Parity execution
+### v3.3.2 V2 Logic-State Parity and stable Presentation
 
 The V2 `MRLogicState` is the only source for `T-buy`, `T-short`, `T-trim`, `T-close`, Stop, Trend Fail, Timeout, and Breakeven. On a confirmed close, it mutates immediately and emits a Broker intent. `MRBrokerState` then submits `strategy.entry` or `strategy.close` and records the actual Strategy Tester position, average fill price, P&L, and fill bars. Native Strategy Tester order markers represent Broker execution; custom T labels represent Logic Events.
 
 `process_orders_on_close = true`, `calc_on_order_fills = true`, `calc_on_every_tick = false`, `pyramiding = 0`, and zero margin requirements preserve the same-close parity configuration. A Broker fill recalculation only synchronizes execution facts and never creates, reorders, or rewrites a Logic decision. Chart levels remain confirmed-close decision thresholds, not intrabar stop/limit orders.
 
-v3.3.1 keeps the v3.3.0 Logic/Broker architecture and trims permanent diagnostics to stay below TradingView's plot limit. The Data Window now has 44 long-lived parity series and the script has 54 `plot()` calls, one `bgcolor()`, and two const-color Shock `fill()` calls (static budget estimate: 55). Strategy Tester P&L/average price and pending intents remain in the Tester or Panel; the Broker cost estimate is shown in the Panel. The release harness enforces `Data Window plot() <= 47` and `plot() <= 57`.
+v3.3.2 keeps the v3.3.1 Logic/Broker architecture and restores the stable 07cbe31 presentation footprint. The chart retains Local Mean, Range/Shock/Extreme bands and fills, Range/Shock backgrounds, frozen Logic T-trim/T-close/Risk levels, setup labels, Logic-event T labels, and the compact Panel. Active levels are shown while `logic.pos != 0`; Broker fills do not create T labels.
+
+The production Data Window now has 27 plots: market context, the minimum Logic parity fields, current Broker position/entry facts, Broker recovery/consistency, and Range/Shock statistics. The script has 37 `plot()` calls, one `bgcolor()`, and two const-color Shock `fill()` calls (static estimate: 38/50). Fill bars, intent flags, Shock funnel counters, and other internal transitions remain in the Panel or the release harness.
 
 ### Broker consistency and recovery
 
@@ -246,7 +260,7 @@ The Logic phases are: Setup → active pre-Trim → active post-Trim → flat. `
 
 `f_logicManage()` returns one `int` action code for diagnostics (`MANAGE_NONE`, `MANAGE_STOP_BE`, `MANAGE_TREND`, `MANAGE_TIMEOUT`, `MANAGE_TRIM`, or `MANAGE_FINAL`). Logic lifecycle fields remain the source of truth for Broker order submission.
 
-Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Shock Move Candidates`, `Shock Environment Pass`, `Shock Deceleration Pass`, `Shock Rejection Pass`, `Shock Setups`, and `Shock Confirmed Entries`. Each pass includes the preceding layers and is counted during confirmed-close Entry eligibility, so the largest drop identifies the main filter.
+The cumulative Shock funnel is development-level diagnostic coverage in the release harness rather than permanent production Data Window plots. This keeps the formal display compact while preserving V2 parity and filter-regression checks.
 
 ---
 
@@ -260,7 +274,7 @@ Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Sho
 
 The confirmed Entry decision stores `logic.entryBar`; the same-close Broker Emulator fill is stored as `broker.entryFillBar`. Entry-fill recalculation only synchronizes the real price and size; the next confirmed close is the first management opportunity because Logic management requires `bar_index > logic.entryBar`. A Logic Trim decision immediately sets `logic.partialTaken`; its same-close real reduction is stored as `broker.trimFillBar`. A full-exit decision immediately sets `logic.pos = 0` and `logic.lastExitBar`; `broker.fullExitFillBar` records the later or same-close flat transition. Logic cooldown uses `logic.lastExitBar`, never Broker flatness.
 
-### v3.3.1 TradingView validation checklist
+### v3.3.2 TradingView validation checklist
 
 After compiling in TradingView on a 15-minute chart:
 
@@ -281,8 +295,9 @@ After compiling in TradingView on a 15-minute chart:
 15. At a final flat state, Range + Shock Entries equals Range + Shock Closed (apart from a genuinely pending order).
 16. No normal order list contains `MR-L/MR-S-STOP`, `-TRIM`, or `-FINAL` bracket IDs.
 17. Entry/Trim fill executions never make Logic decisions, one confirmed close never emits more than one Logic lifecycle action, and Logic Event fields persist through same-bar fill recalculation. Bar Magnifier OFF/ON should not materially alter Logic lifecycle decisions.
+18. The production Data Window contains 27 plots (<= 35), and the static plot estimate is 38 (<= 50); the 07c presentation elements remain visible.
 
-Run the local parity checks with `powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.1-v2-logic-parity-harness.ps1`. They cover the V2 static audit, confirmed-close-only Stop/Trim/Final semantics, Long/Short BE cost, lifecycle cases, and the plot budget. The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
+Run the local parity and presentation checks with `powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.2-v2-logic-parity-harness.ps1`. They cover the V2 static audit, direct v3.3.1 Logic/Broker regression comparison, confirmed-close-only Stop/Trim/Final semantics, Long/Short BE cost, lifecycle cases, the 07c presentation footprint, and the plot budget. The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 
 ## Limitations & scope
 

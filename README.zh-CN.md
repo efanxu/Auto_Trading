@@ -2,11 +2,11 @@
 
 English · [简体中文](README.zh-CN.md)
 
-一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.1 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
+一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.2 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.3.1-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.2-informational)](CHANGELOG.md)
 
 ---
 
@@ -37,6 +37,18 @@ English · [简体中文](README.zh-CN.md)
 | 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;输入项标签是编译期静态文本,策略警报使用结构化动态消息 |
 | 防重绘 | 信号门控于已确认 K 线;高周期数据取上一根已确认的 1H bar;目标价进场时冻结 |
 | 版本化 | 语义化版本(见 `CHANGELOG.md`),版本号显示在面板 |
+
+---
+
+## 三层正式架构
+
+正式脚本保持三个明确职责层:
+
+- **V2 Logic Layer** —— `MRLogicState` 是 T买、T空、T减、T平、止损/保本、趋势失效与超时决策的唯一来源。
+- **Broker Execution Layer** —— `MRBrokerState` 提交真实 `strategy.entry` / `strategy.close`,记录真实仓位、成交价、Strategy Tester P&L、一致性与 Recovery 事实。
+- **Presentation Layer** —— 主图、Panel 与精简 Data Window 展示 Logic 决策和 Broker 事实;正式显示 footprint 以稳定的 07cbe31 Presentation 基线为准,内部 transition 由 harness 验证。
+
+Presentation 不反向参与 Logic 或 Broker。T 标签与冻结的 T减/T平/Risk 线来自 Logic State;TradingView 原生订单标记与统计来自 Strategy Tester 执行。
 
 ---
 
@@ -217,13 +229,15 @@ Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(�
 
 V2 Logic State 使用 `logic.entryPrice = close` 与 `logic.cost = entryPrice * (2 * commissionBps) / 10000` 冻结目标、风险和 T减后的 BE。`slippageTicks` 只用于 Panel 中的 Broker 成本估算,不进入 V2 Logic BE 阈值。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值。Range/Shock 是轻量 Broker 辅助分类,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
 
-### v3.3.1 V2 Logic-State Parity 执行模型
+### v3.3.2 V2 Logic-State Parity 与稳定 Presentation
 
 V2 `MRLogicState` 是 `T买`、`T空`、`T减`、`T平`、Stop、Trend Fail、Timeout 与 BE 的唯一来源。每个 confirmed close 立即更新 Logic 并产生 Broker intent;`MRBrokerState` 再提交 `strategy.entry` 或 `strategy.close`,记录真实仓位、成交均价、P&L 与 fill bar。主图 T 标签表示 Logic Event,TradingView 原生标记表示 Broker fill。
 
 `process_orders_on_close = true`、`calc_on_order_fills = true`、`calc_on_every_tick = false`、`pyramiding = 0` 与零保证金要求保持 same-close parity。Broker fill recalculation 只同步执行事实,不会创建、重排或重写 Logic decision。图表水平仍然只是 confirmed-close 决策阈值,不是盘中 stop/limit 挂单。
 
-v3.3.1 保持 v3.3.0 的 Logic/Broker 架构,并精简常驻诊断以避开 TradingView plot 上限。Data Window 现在保留 44 个长期 parity 序列,脚本包含 54 个 `plot()`、1 个 `bgcolor()` 与 2 个 const-color Shock `fill()`(静态预算估算为 55)。Strategy Tester 的 P&L/均价与 pending intent 继续在 Tester 或 Panel 中查看,Broker 成本估算也移到 Panel。发布 harness 强制检查 `Data Window plot() <= 47` 与 `plot() <= 57`。
+v3.3.2 保持 v3.3.1 的 Logic/Broker 架构,并恢复稳定的 07cbe31 Presentation footprint。主图保留 Local Mean、Range/Shock/Extreme bands 与 fill、Range/Shock 背景、冻结的 Logic T减/T平/Risk 线、Setup labels、Logic Event T labels 与精简 Panel。`logic.pos != 0` 时才显示本轮交易水平线;Broker fill 不生成 T 标签。
+
+正式 Data Window 现在只有 27 个 plot:市场上下文、最小 Logic parity 字段、当前 Broker 仓位/入场事实、Broker Recovery/Consistency 以及 Range/Shock 统计。脚本包含 37 个 `plot()`、1 个 `bgcolor()` 与 2 个 const-color Shock `fill()`(静态估算 38/50)。成交 bar、intent flag、Shock 漏斗计数及其它内部 transition 保留在 Panel 或 release harness 中。
 
 ### Broker 一致性与 Recovery
 
@@ -246,7 +260,7 @@ Logic 阶段为:Setup → active pre-Trim → active post-Trim → flat。`logic
 
 `f_logicManage()` 为诊断统一返回一个 `int` 动作编码(`MANAGE_NONE`、`MANAGE_STOP_BE`、`MANAGE_TREND`、`MANAGE_TIMEOUT`、`MANAGE_TRIM` 或 `MANAGE_FINAL`);Broker intent 仍以 Logic lifecycle 字段为唯一事实来源。
 
-Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Candidates`、`Shock Environment Pass`、`Shock Deceleration Pass`、`Shock Rejection Pass`、`Shock Setups`、`Shock Confirmed Entries`。每一层都包含前置条件,并只在 confirmed-close Entry eligibility 阶段计数,最大跌落层就是主要过滤来源。
+累计 Shock 漏斗改为 release harness 的开发级诊断,不再作为正式 Data Window 常驻 plot。这样保持生产显示精简,同时保留 V2 parity 与过滤器回归检查。
 
 ---
 
@@ -260,7 +274,7 @@ Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Cand
 
 confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator 成交 bar 保存为 `broker.entryFillBar`。Entry fill execution 只同步真实成交价和仓位;下一根 confirmed close 因 Logic 管理要求 `bar_index > logic.entryBar` 才是第一次管理。Logic T减 decision 当场设置 `logic.partialTaken`,同收盘真实减仓 bar 保存为 `broker.trimFillBar`。完整退出 decision 当场设置 `logic.pos = 0` 与 `logic.lastExitBar`;`broker.fullExitFillBar` 记录真实归零 bar。Cooldown 只使用 Logic lastExitBar。
 
-### v3.3.1 TradingView 验收清单
+### v3.3.2 TradingView 验收清单
 
 在 15 分钟图于 TradingView 编译后:
 
@@ -281,8 +295,9 @@ confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator �
 15. 最终 Flat 且无 pending order 时,Range + Shock Entries 等于 Range + Shock Closed。
 16. 正常订单列表没有 `MR-L/MR-S-STOP`、`-TRIM`、`-FINAL` bracket ID。
 17. Entry/Trim fill execution 不产生 Logic decision;一次 confirmed close 最多产生一个 Logic lifecycle action;Logic Event 字段跨 same-bar fill recalculation 保持稳定。Bar Magnifier 开关不应实质改变 Logic lifecycle decision。
+18. 正式 Data Window 为 27 个 plot (<= 35),静态 plot 估算为 38 (<= 50);07c Presentation 元素保持可见。
 
-运行本地 parity 检查:`powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.1-v2-logic-parity-harness.ps1`。它覆盖 V2 静态审计、confirmed-close-only Stop/Trim/Final、含 V2 成本的 Long/Short BE、生命周期 Case 与 plot budget。源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
+运行本地 parity 与 Presentation 检查:`powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.2-v2-logic-parity-harness.ps1`。它覆盖 V2 静态审计、直接对比 v3.3.1 Logic/Broker、confirmed-close-only Stop/Trim/Final、含 V2 成本的 Long/Short BE、生命周期 Case、07c Presentation footprint 与 plot budget。源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 
 ## 局限与边界
 

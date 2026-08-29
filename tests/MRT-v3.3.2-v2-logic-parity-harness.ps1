@@ -3,7 +3,8 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $repoRoot 'MRT.pine'
-$baselineCommit = 'cb3e18714c1eecf17f9561e5bb33f76fb747ba5c'
+$logicBrokerCommit = '68684f733b3993b8a73737b9012a6f19fbbfb66a'
+$presentationCommit = '07cbe31a1c9adbdf5d96a6c84558184adfb0cdfb'
 $v2Commit = 'fdb2a7d0ff0cf082af2ee15476e8bdb03b708151'
 
 function Assert-True {
@@ -61,6 +62,12 @@ function Normalize-V2Code {
     param([string]$Text)
 
     return (($Text -replace '\bt\.', 'logic.' -replace '\bf_activeStop\b', 'f_logicActiveStop' -replace '\bf_enter\b', 'f_logicEnter' -replace '\bf_exit\b', 'f_logicExit' -replace '\bcostBps\b', 'commissionBps' -replace '\s+', ' ').Trim())
+}
+
+function Normalize-SourceSnippet {
+    param([string]$Text)
+
+    return (($Text -replace '\r?\n', "`n" -replace '\s+', ' ').Trim())
 }
 
 function Assert-V2Snippet {
@@ -161,23 +168,25 @@ function Invoke-LifecycleCase {
 }
 
 $source = [System.IO.File]::ReadAllText($scriptPath)
-$baselineSource = ((& git -C $repoRoot show "$($baselineCommit):MRT.pine") -join [Environment]::NewLine)
+$baselineSource = ((& git -C $repoRoot show "$($logicBrokerCommit):MRT.pine") -join [Environment]::NewLine)
+$presentationSource = ((& git -C $repoRoot show "$($presentationCommit):MRT.pine") -join [Environment]::NewLine)
 $v2Source = ((& git -C $repoRoot show "$($v2Commit):MRT.pine") -join [Environment]::NewLine)
 
-Write-Host 'MRT v3.3.1 V2 Logic-State Parity Harness'
+Write-Host 'MRT v3.3.2 V2 Logic-State Parity + Presentation Regression Harness'
 Write-Host "Repo: $repoRoot"
-Write-Host "Current baseline: $baselineCommit"
+Write-Host "Logic/Broker baseline: $logicBrokerCommit"
+Write-Host "Presentation baseline: $presentationCommit"
 Write-Host "V2 baseline: $v2Commit"
 
 # Version, settings, and input compatibility.
-Assert-Match $source 'SCRIPT_VERSION\s*=\s*"3\.3\.1"' 'SCRIPT_VERSION must be 3.3.1'
+Assert-Match $source 'SCRIPT_VERSION\s*=\s*"3\.3\.2"' 'SCRIPT_VERSION must be 3.3.2'
 Assert-Match $source 'strategy\([^\r\n]*commission_type\s*=\s*strategy\.commission\.percent[^\r\n]*commission_value\s*=\s*0\.03' 'strategy commission settings changed'
 Assert-Match $source 'strategy\([^\r\n]*slippage\s*=\s*0' 'strategy slippage setting changed'
 
 $inputLines = @($source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*input\.' })
 Assert-True ($inputLines.Count -eq 58) "expected 58 inputs, found $($inputLines.Count)"
 $baselineInputLines = @($baselineSource -split '\r?\n' | Where-Object { $_ -match '^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*input\.' })
-Assert-True (($inputLines -join [Environment]::NewLine) -eq ($baselineInputLines -join [Environment]::NewLine)) 'input declarations/defaults changed from the v3.2.0 baseline'
+Assert-True (($inputLines -join [Environment]::NewLine) -eq ($baselineInputLines -join [Environment]::NewLine)) 'input declarations/defaults changed from the v3.3.1 baseline'
 Assert-Match $source 'commissionBps\s*=\s*input\.float\(3\.0' 'commissionBps default changed'
 Assert-Match $source 'slippageTicks\s*=\s*input\.int\(0' 'slippageTicks default changed'
 Assert-Match $source 'trimPct\s*=\s*input\.float\(50\.0' 'trimPct default changed'
@@ -224,6 +233,19 @@ $v2ActiveStopBody = Get-FunctionBody $v2Source 'f_activeStop'
 $v2EnterBody = Get-FunctionBody $v2Source 'f_enter'
 $v2ExitBody = Get-FunctionBody $v2Source 'f_exit'
 $v2ManageBody = Get-FunctionBody $v2Source 'f_manage'
+
+# Presentation changes must not rewrite the current v3.3.1 Logic/Broker core.
+foreach ($logicFunction in @('f_logicEnter', 'f_logicManage', 'f_logicExit', 'f_logicActiveStop')) {
+    $currentBody = Get-FunctionBody $source $logicFunction
+    $baselineBody = Get-FunctionBody $baselineSource $logicFunction
+    Assert-True ((Normalize-SourceSnippet $currentBody) -eq (Normalize-SourceSnippet $baselineBody)) "$logicFunction changed from the v3.3.1 Logic baseline"
+}
+
+$brokerBlockMatch = [regex]::Match($source, '(?ms)^// Broker transition detection and fill synchronization\..*?(?=^// Derived Logic Events)')
+$baselineBrokerBlockMatch = [regex]::Match($baselineSource, '(?ms)^// Broker transition detection and fill synchronization\..*?(?=^// Derived Logic Events)')
+Assert-True $brokerBlockMatch.Success 'current Broker execution block missing'
+Assert-True $baselineBrokerBlockMatch.Success 'v3.3.1 Broker execution block missing'
+Assert-True ((Normalize-SourceSnippet $brokerBlockMatch.Value) -eq (Normalize-SourceSnippet $baselineBrokerBlockMatch.Value)) 'Broker execution block changed from the v3.3.1 baseline'
 
 foreach ($snippet in @(
     @{ Body = $v2ActiveStopBody; Current = (Get-FunctionBody $source 'f_logicActiveStop'); Pattern = 't\.baseStop'; Message = 'V2 active-stop base source changed' },
@@ -348,49 +370,82 @@ Assert-Match $source 'if entryEvent[\s\S]{0,500}label\.new' 'entry T labels must
 Assert-Match $source 'if partialEvent[\s\S]{0,500}label\.new' 'trim T labels must be Logic-event based'
 Assert-Match $source 'if exitEvent[\s\S]{0,500}label\.new' 'exit T labels must be Logic-event based'
 
-# Required long-lived Data Window diagnostics.
+# Presentation regression: retain the 07c display sections and map all active
+# trade values/events to the current Logic/Broker objects.
+$presentationSections = @(
+    'Plot Mean', 'Bands', 'Background', 'Active Trade Lines', 'Setup Labels',
+    'Entry', 'Partial', 'Exits \(Final / Stop / Trend / Time / BE\)', 'Data Window', 'Panel'
+)
+foreach ($section in $presentationSections) {
+    Assert-Match $presentationSource "(?m)^// $section" "07c Presentation section missing: $section"
+    Assert-Match $source "(?m)^// $section" "current Presentation section missing: $section"
+}
+
+$presentationMatch = [regex]::Match($source, '(?ms)^// Plot Mean.*?(?=^// Alerts)')
+Assert-True $presentationMatch.Success 'current Presentation block missing'
+$presentationBody = $presentationMatch.Value
+foreach ($displayToken in @(
+    'Local Mean', 'Range +Z', 'Range -Z', 'Shock +Z', 'Shock -Z', 'Extreme +Z', 'Extreme -Z',
+    '/ Trim', '/ Target', '/ Risk', 'Mean Reversion Environment',
+    'R obs', 'S obs', 'T Long', 'T Short', 'T Trim', 'T Close', 'T Stop', 'Trend fail', 'T Timeout', 'T BE'
+)) {
+    Assert-Match $presentationBody ([regex]::Escape($displayToken)) "07c display footprint missing: $displayToken"
+}
+Assert-NotMatch $presentationBody '\bfillState\b|\btradeContextValid\b|\bf_activeStop\b|\bt\.' 'Presentation still uses legacy state variables'
+Assert-Match $presentationBody 'if logic\.pos\s*!=\s*0[\s\S]{0,300}logic\.partialTarget[\s\S]{0,300}logic\.finalTarget[\s\S]{0,300}f_logicActiveStop\(logic\.pos\)' 'active trade lines are not Logic-state mapped'
+Assert-Match $presentationBody 'entryEvent[\s\S]{0,500}label\.new' 'entry labels are not presentational Logic events'
+Assert-Match $presentationBody 'partialEvent[\s\S]{0,500}label\.new' 'trim labels are not presentational Logic events'
+Assert-Match $presentationBody 'exitEvent[\s\S]{0,500}label\.new' 'exit labels are not presentational Logic events'
+Assert-Match $presentationBody 'fill\(pShockUpper,\s*pStopUpper,\s*color\s*=\s*color\.new\(color\.red,\s*94\)\)' 'upper Shock fill changed from the stable const-color form'
+Assert-Match $presentationBody 'fill\(pShockLower,\s*pStopLower,\s*color\s*=\s*color\.new\(color\.green,\s*94\)\)' 'lower Shock fill changed from the stable const-color form'
+Assert-Match $presentationBody 'table\.new\(position\.top_right,\s*2,\s*21' 'Panel row count drifted from the 07c footprint'
+Assert-Match $presentationBody 'Broker State / Recovery Count' 'Panel no longer exposes Broker recovery count'
+
+# Required production Data Window fields. Development fill transitions, intent
+# flags, and Shock funnel counters stay in the Panel/harness instead.
 foreach ($dataWindowLabel in @(
     'Z-score', 'Regime Score', 'Half-Life', 'Shock ATR', 'Previous Shock ATR',
     '15m ER', '1H ER', '15m Slope', '1H Slope',
-    'Logic Position', 'Logic Partial Taken', 'Logic Entry Bar', 'Logic Entry Price',
-    'Logic Partial Target', 'Logic Final Target', 'Logic Active Stop', 'Logic Time Stop',
-    'Logic Last Exit Bar', 'Logic Event Code', 'Logic Event Reason',
-    'Logic Trim Decision Bar', 'Logic Exit Decision Bar',
-    'Broker Position', 'Broker Entry Price', 'Broker Fill Event', 'Broker Recovery Count',
-    'Broker Consistency State', 'Broker Entry Fill Bar', 'Broker Trim Fill Bar',
-    'Broker Full Exit Fill Bar',
-    'Range Entries', 'Range Closed', 'Range Wins', 'Shock Entries', 'Shock Closed', 'Shock Wins',
-    'Latest Closed Entry ID Code', 'Shock Z Candidates', 'Shock Move Candidates',
-    'Shock Environment Pass', 'Shock Deceleration Pass', 'Shock Rejection Pass',
-    'Shock Setups', 'Shock Confirmed Entries'
+    'Logic Position', 'Logic Partial Taken', 'Logic Entry Price',
+    'Logic Partial Target', 'Logic Final Target', 'Logic Active Stop',
+    'Logic Event Code', 'Logic Event Reason',
+    'Broker Position', 'Broker Entry Price', 'Broker Recovery Count',
+    'Broker Consistency State',
+    'Range Entries', 'Range Closed', 'Range Wins', 'Shock Entries', 'Shock Closed', 'Shock Wins'
 )) {
     Assert-Match $source ([regex]::Escape($dataWindowLabel)) "missing Data Window field: $dataWindowLabel"
 }
 
-# These fields remain available in the Panel or Strategy Tester, but must not
-# consume permanent Data Window plot counts.
+# These fields remain available in the Panel, Strategy Tester, or harness, but
+# must not consume permanent Data Window plot counts.
 foreach ($removedDataWindowLabel in @(
-    'Strategy Tester Net P&L', 'Strategy Position Avg Price', 'Broker Fill Event Bar',
-    'Previous Execution Position Size', 'Direction Reversal Detected',
-    'Broker Entry Intent Pending', 'Broker Trim Intent Pending', 'Broker Full Exit Intent Pending',
-    'Broker Execution Cost Estimate', 'Logic Base Stop', 'Logic Entry Decision Bar'
+    'Strategy Tester Net P&L', 'Strategy Position Avg Price', 'Previous Execution Position Size',
+    'Direction Reversal Detected', 'Broker Fill Event', 'Logic Entry Bar', 'Logic Time Stop',
+    'Logic Last Exit Bar', 'Broker Entry Fill Bar', 'Logic Trim Decision Bar',
+    'Broker Trim Fill Bar', 'Logic Exit Decision Bar', 'Broker Full Exit Fill Bar',
+    'Latest Closed Entry ID Code', 'Shock Z Candidates', 'Shock Move Candidates',
+    'Shock Environment Pass', 'Shock Deceleration Pass', 'Shock Rejection Pass',
+    'Shock Setups', 'Shock Confirmed Entries', 'Broker Entry Intent Pending',
+    'Broker Trim Intent Pending', 'Broker Full Exit Intent Pending', 'Broker Execution Cost Estimate',
+    'Logic Base Stop', 'Logic Entry Decision Bar'
 )) {
-    Assert-NotMatch $source ([regex]::Escape($removedDataWindowLabel)) "冗余 Data Window field remains: $removedDataWindowLabel"
+    Assert-NotMatch $source ([regex]::Escape($removedDataWindowLabel)) "redundant Data Window field remains: $removedDataWindowLabel"
 }
 
-# Plot budget: TradingView counts Data Window plots too. The current script has
-# const-color fills, so they do not add a dynamic fill plot count.
+# Plot budget: TradingView counts Data Window plots too. Count actual call lines,
+# including assignment-form plot() calls, and exclude const-color fills because
+# they do not add a dynamic fill plot count.
 $plotFunctionPatterns = [ordered]@{
-    'plot()' = '(?m)\bplot\s*\('
-    'plotshape()' = '(?m)\bplotshape\s*\('
-    'plotchar()' = '(?m)\bplotchar\s*\('
-    'plotarrow()' = '(?m)\bplotarrow\s*\('
-    'plotbar()' = '(?m)\bplotbar\s*\('
-    'plotcandle()' = '(?m)\bplotcandle\s*\('
-    'alertcondition()' = '(?m)\balertcondition\s*\('
-    'bgcolor()' = '(?m)\bbgcolor\s*\('
-    'barcolor()' = '(?m)\bbarcolor\s*\('
-    'fill()' = '(?m)\bfill\s*\('
+    'plot()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\s*\('
+    'plotshape()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plotshape\s*\('
+    'plotchar()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plotchar\s*\('
+    'plotarrow()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plotarrow\s*\('
+    'plotbar()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plotbar\s*\('
+    'plotcandle()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plotcandle\s*\('
+    'alertcondition()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?alertcondition\s*\('
+    'bgcolor()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?bgcolor\s*\('
+    'barcolor()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?barcolor\s*\('
+    'fill()' = '(?m)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?fill\s*\('
 }
 $plotCounts = [ordered]@{}
 foreach ($entry in $plotFunctionPatterns.GetEnumerator()) {
@@ -406,14 +461,16 @@ $dynamicFillLines = @($source -split '\r?\n' | Where-Object {
 $dynamicFillCount = $dynamicFillLines.Count
 $expectedPlotCount = $plotCounts['plot()'] + $plotCounts['plotshape()'] + $plotCounts['plotchar()'] + $plotCounts['plotarrow()'] + $plotCounts['plotbar()'] + $plotCounts['plotcandle()'] + $plotCounts['alertcondition()'] + $plotCounts['bgcolor()'] + $plotCounts['barcolor()'] + $dynamicFillCount
 
-Assert-True ($dataWindowPlotCount -le 47) "Data Window plot() budget exceeded: $dataWindowPlotCount"
-Assert-True ($plotCounts['plot()'] -le 57) "plot() call budget exceeded: $($plotCounts['plot()'])"
+Assert-True ($dataWindowPlotCount -eq 27) "Data Window plot() footprint changed: $dataWindowPlotCount (expected 27)"
+Assert-True ($dataWindowPlotCount -le 35) "Data Window plot() budget exceeded: $dataWindowPlotCount"
 Assert-True ($plotCounts['fill()'] -eq 2) "expected two Shock fill() calls, found $($plotCounts['fill()'])"
 Assert-True ($plotCounts['bgcolor()'] -eq 1) "expected one bgcolor() call, found $($plotCounts['bgcolor()'])"
 Assert-True ($dynamicFillCount -eq 0) "dynamic fill colors consume unexpected plot counts: $dynamicFillCount"
 Assert-Match $source 'fill\(pShockUpper,\s*pStopUpper,\s*color\s*=\s*color\.new\(color\.red,\s*94\)\)' 'upper Shock fill must use const color'
 Assert-Match $source 'fill\(pShockLower,\s*pStopLower,\s*color\s*=\s*color\.new\(color\.green,\s*94\)\)' 'lower Shock fill must use const color'
-Assert-True ($expectedPlotCount -le 60) "expected TradingView plot-count budget exceeded: $expectedPlotCount"
+Assert-True ($plotCounts['plot()'] -eq 37) "plot() footprint changed: $($plotCounts['plot()']) (expected 37)"
+Assert-True ($expectedPlotCount -eq 38) "expected static plot budget changed: $expectedPlotCount (expected 38)"
+Assert-True ($expectedPlotCount -le 50) "expected TradingView plot-count budget exceeded: $expectedPlotCount"
 
 # Confirmed-close-only regression checks for both the Pine management function
 # and this harness's own dynamic decision model.
@@ -433,7 +490,7 @@ Assert-NotMatch $decisionBody '\$(High|Low)|\bHigh\b|\bLow\b' 'Get-Decision must
 # Dynamic Case A: Short T-trim followed by next-bar T-close. Both decisions
 # use only the confirmed close, and Final requires PartialTaken = true.
 $caseA = Invoke-LifecycleCase -Dir -1 -EntryPrice 100 -BaseStop 110 -PartialTarget 95 -FinalTarget 90 -TrimClose 95 -FinalClose 90 -RoundTripCost 0.06
-Assert-True ($caseA.Events -join ',' -eq '2:TRIM,3:FINAL') 'Case A must produce Short T空 -> T减 -> next-bar T平'
+Assert-True ($caseA.Events -join ',' -eq '2:TRIM,3:FINAL') 'Case A must produce Short T-Entry -> T-Trim -> next-bar T-Close'
 Assert-True ($caseA.PartialTaken -eq $false) 'Case A must be flat in Logic after final exit'
 Assert-True ($caseA.TrimDecisionBar -eq 2 -and $caseA.ExitDecisionBar -eq 3) 'Case A decision bars are wrong'
 
@@ -474,20 +531,31 @@ Assert-True ($shortBEContinue -eq 'NONE') 'Short BE must not trigger below Entry
 $shortBEDecision = Get-Decision -1 $shortEntryPrice 105 95 90 $true 99.95 $shortRoundTripCost
 Assert-True ($shortBEDecision -eq 'STOP') 'Short BE must trigger above Entry - cost'
 
+# Dynamic Trend/Timeout checks preserve the V2 management priority after the
+# Stop/BE branch and before Trim/Final.
+$trendDecision = Get-Decision 1 100 95 105 110 $false 100 0.0 $true $false
+Assert-True ($trendDecision -eq 'TREND') 'Trend Fail must be emitted before Trim/Final'
+$timeoutDecision = Get-Decision 1 100 95 105 110 $false 100 0.0 $false $true
+Assert-True ($timeoutDecision -eq 'TIME') 'Timeout must be emitted before Trim/Final'
+
 $cooldownBars = 2
 $lastExitBar = 10
 Assert-True ((10 - $lastExitBar) -lt [math]::Max($cooldownBars, 1)) 'same-bar exit must remain in cooldown'
 Assert-True ((12 - $lastExitBar) -ge [math]::Max($cooldownBars, 1)) 'cooldown must release after the configured number of bars'
 
 Write-Host 'PASS: static V2 Logic-State parity checks'
+Write-Host 'PASS: v3.3.1 Logic/Broker core unchanged'
+Write-Host 'PASS: 07c Presentation footprint and Logic/Broker mapping checks'
 Write-Host 'PASS: static close-only Stop/Trim/Final and plot-budget checks'
-Write-Host 'PASS: dynamic Case A Short T空 -> T减 -> next-bar T平'
-Write-Host 'PASS: dynamic Case B Long T买 -> T止损 Stop precedence'
+Write-Host 'PASS: dynamic Case A Short T-Entry -> T-Trim -> next-bar T-Close'
+Write-Host 'PASS: dynamic Case B Long T-Entry -> T-Stop precedence'
 Write-Host 'PASS: dynamic Long/Short BE with V2 round-trip cost'
+Write-Host 'PASS: dynamic Trend Fail and Timeout priority checks'
 Write-Host 'PASS: dynamic Logic cooldown checks'
 Write-Host "Number of plot() calls: $($plotCounts['plot()'])"
 Write-Host "Number of Data Window plot() calls: $dataWindowPlotCount"
 Write-Host "Number of fill() calls: $($plotCounts['fill()'])"
 Write-Host "Number of bgcolor() calls: $($plotCounts['bgcolor()'])"
-Write-Host "Expected plot-count budget: $expectedPlotCount / 60"
-Write-Host 'All MRT v3.3.1 V2 Logic-State Parity checks passed.'
+Write-Host "Estimated static plot budget: $expectedPlotCount / 50"
+Write-Host 'TradingView formal plot-count and Pine v6 compilation remain manual checks.'
+Write-Host 'All MRT v3.3.2 V2 Logic-State Parity and Presentation Regression checks passed.'
