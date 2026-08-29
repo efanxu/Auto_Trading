@@ -13,6 +13,7 @@ All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioni
 
 ### Fixed
 
+- **MR-T v4 residual cleanup** — replaced exit brackets with explicit OCA-reduce orders, added strict-flat cleanup, restored filled-position Trade Level visibility, and fixed Plan expiry at `>=`.
 - **Confirmed-bar Logic scheduling** — `positionChanged` is now Broker-only execution diagnostics. A Logic-only per-bar cursor guarantees that every confirmed 15m bar runs the V2 lifecycle once, while same-bar `calc_on_order_fills` recalculations cannot repeat it.
 - **Lifecycle parity regression coverage** — the local harness now models normal confirmed executions, same-bar fill recalculations, next-bar management, chained cooldown lifecycles, Long/Short mirrors, and Stop/BE/Trend Fail/Timeout decision bars.
 

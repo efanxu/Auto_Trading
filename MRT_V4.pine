@@ -458,11 +458,19 @@ type ExecutionPlanState
     varip bool entryFilled = false
     varip int entryFillBar = na
     varip float actualEntryPrice = na
+    varip float entryQty = na
     varip bool exitsSubmitted = false
+    varip string initialExitOcaName = ""
+    varip string remainderExitOcaName = ""
     varip bool partialFilled = false
     varip int partialFillBar = na
     varip int closeIntentReason = 0
     varip int closeIntentBar = na
+    varip bool fullExitPending = false
+    varip bool cleanupPending = false
+    varip bool cleanupClosePlaced = false
+    varip bool cleanupAlertSent = false
+    varip int expectedFlatReason = 0
 
 type MRBrokerFillState
     varip bool trackerReady = false
@@ -514,11 +522,19 @@ method reset(ExecutionPlanState this) =>
     this.entryFilled := false
     this.entryFillBar := na
     this.actualEntryPrice := na
+    this.entryQty := na
     this.exitsSubmitted := false
+    this.initialExitOcaName := ""
+    this.remainderExitOcaName := ""
     this.partialFilled := false
     this.partialFillBar := na
     this.closeIntentReason := 0
     this.closeIntentBar := na
+    this.fullExitPending := false
+    this.cleanupPending := false
+    this.cleanupClosePlaced := false
+    this.cleanupAlertSent := false
+    this.expectedFlatReason := 0
 
 var MRSignalState signal = MRSignalState.new()
 var ExecutionPlanState plan = ExecutionPlanState.new()
@@ -593,6 +609,9 @@ f_entryOrderId(int dir) =>
 f_brokerExecutionCost(float price) =>
     price * (2.0 * commissionBps) / 10000.0 + 2.0 * slippageTicks * syminfo.mintick
 
+f_exitReasonName(int reason) =>
+    reason == R_FINAL ? "TP2" : reason == R_BE ? "BE" : reason == R_TREND ? "TREND_FAIL" : reason == R_TIME ? "TIMEOUT" : "STOP"
+
 // Every V4 alert and order alert_message comes from this single formatter.
 f_executionMessage(string eventName, int dir, int mode, float actualFill, string reason) =>
     int validBars = not na(plan.createdBar) and not na(plan.expiryBar) ? plan.expiryBar - plan.createdBar : 0
@@ -633,23 +652,26 @@ bool sameDirectionPosition = positionSampleReady and previousExecutionPositionSi
 bool positionReduced = sameDirectionPosition and math.abs(currentPositionSize) < math.abs(previousExecutionPositionSize)
 bool positionChanged = positionSampleReady and currentPositionSize != previousExecutionPositionSize
 bool isFillSynchronizationExecution = positionChanged
+bool brokerDirectionMismatch = currentPositionSize != 0.0 and plan.active and plan.entryFilled and plan.dir != currentPositionDir
 
 bool hasNewClosedTrade = positionSampleReady and closedTradesNow > broker.observedClosedTrades
 string latestClosedExitId = hasNewClosedTrade ? strategy.closedtrades.exit_id(closedTradesNow - 1) : ""
-float latestClosedExitPrice = hasNewClosedTrade ? strategy.closedtrades.exit_price(closedTradesNow - 1) : close
+float latestClosedExitPrice = hasNewClosedTrade ? strategy.closedtrades.exit_price(closedTradesNow - 1) : na
 
 bool entryFilledNow = positionEntered and plan.active and not plan.entryFilled and currentPositionDir == plan.dir
-bool partialReductionNow = positionReduced and plan.active and plan.entryFilled and not plan.partialFilled
-bool tp1PriceReachedAtFill = partialReductionNow and (plan.dir == 1 ? latestClosedExitPrice >= plan.partialTarget : latestClosedExitPrice <= plan.partialTarget)
-bool tp1FilledNow = partialReductionNow and latestClosedExitId == "MR4-TP1" and tp1PriceReachedAtFill
-bool unexpectedPartialStopNow = partialReductionNow and not tp1FilledNow
+bool priceReductionNow = positionReduced and plan.active and plan.entryFilled and not brokerDirectionMismatch
+bool tp1FilledNow = priceReductionNow and not plan.partialFilled and latestClosedExitId == "MR4-TP1"
+bool unexpectedPartialPriceExitNow = priceReductionNow and not tp1FilledNow and not plan.cleanupPending
 bool fullExitFilledNow = positionClosed and plan.active and plan.entryFilled
 
 if entryFilledNow
     plan.entryFilled := true
     plan.entryFillBar := bar_index
     plan.actualEntryPrice := strategy.position_avg_price
+    plan.entryQty := math.abs(strategy.position_size)
     plan.activeStop := plan.baseStop
+    plan.initialExitOcaName := "MR4-EXIT-" + str.tostring(bar_index) + "-" + str.tostring(plan.dir)
+    plan.remainderExitOcaName := ""
     broker.brokerEntryPrice := plan.actualEntryPrice
     broker.entryFillBar := bar_index
     broker.fillEventBar := bar_index
@@ -670,11 +692,11 @@ if entryFilledNow
 
     alert(f_executionMessage("ENTRY_FILLED", plan.dir, plan.mode, plan.actualEntryPrice, ""), alert.freq_all)
 
-    // Two strategy.exit brackets reserve trimPct and its remainder. Pine's
-    // default strategy.oca.reduce behavior prevents aggregate over-exit.
-    string filledEntryId = f_entryOrderId(plan.dir)
-    strategy.exit("MR4-TP1", from_entry = filledEntryId, limit = plan.partialTarget, stop = plan.baseStop, qty_percent = trimPct, comment_profit = "TP1", comment_loss = "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP1_OR_STOP"))
-    strategy.exit("MR4-TP2", from_entry = filledEntryId, limit = plan.finalTarget, stop = plan.baseStop, qty_percent = 100.0 - trimPct, comment_profit = "TP2", comment_loss = "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP2_OR_STOP"))
+    // One explicit OCA-reduce group owns TP1, TP2, and the shared initial Stop.
+    int initialPriceExitDirection = plan.dir == 1 ? strategy.short : strategy.long
+    strategy.order("MR4-TP1", initialPriceExitDirection, qty = plan.entryQty * trimPct / 100.0, limit = plan.partialTarget, oca_name = plan.initialExitOcaName, oca_type = strategy.oca.reduce, comment = "TP1", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP1"))
+    strategy.order("MR4-TP2", initialPriceExitDirection, qty = plan.entryQty, limit = plan.finalTarget, oca_name = plan.initialExitOcaName, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP2"))
+    strategy.order("MR4-STOP", initialPriceExitDirection, qty = plan.entryQty, stop = plan.baseStop, oca_name = plan.initialExitOcaName, oca_type = strategy.oca.reduce, comment = "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "STOP"))
     plan.exitsSubmitted := true
 
 if tp1FilledNow
@@ -700,28 +722,58 @@ if tp1FilledNow
     float breakEvenStop = plan.dir == 1 ? f_roundUpToTick(plan.actualEntryPrice + executionCost) : f_roundDownToTick(plan.actualEntryPrice - executionCost)
     plan.activeStop := moveStopToBE ? (plan.dir == 1 ? math.max(plan.baseStop, breakEvenStop) : math.min(plan.baseStop, breakEvenStop)) : plan.baseStop
 
-    // Replace the reserved TP2 bracket so 100% means the current remainder.
+    // Rebuild both remainder orders from the Broker's actual position size.
     strategy.cancel("MR4-TP1")
     strategy.cancel("MR4-TP2")
-    string remainingEntryId = f_entryOrderId(plan.dir)
-    strategy.exit("MR4-TP2", from_entry = remainingEntryId, limit = plan.finalTarget, stop = plan.activeStop, qty_percent = 100.0, comment_profit = "TP2", comment_loss = moveStopToBE ? "Breakeven" : "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, moveStopToBE ? "TP2_OR_BE" : "TP2_OR_STOP"))
+    strategy.cancel("MR4-STOP")
+    strategy.cancel("MR4-BE")
+    float remainingQty = math.abs(strategy.position_size)
+    int remainingPriceExitDirection = plan.dir == 1 ? strategy.short : strategy.long
+    plan.remainderExitOcaName := "MR4-REMAINDER-" + str.tostring(plan.entryFillBar) + "-" + str.tostring(plan.dir)
+    strategy.order("MR4-TP2", remainingPriceExitDirection, qty = remainingQty, limit = plan.finalTarget, oca_name = plan.remainderExitOcaName, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP2"))
+    strategy.order("MR4-BE", remainingPriceExitDirection, qty = remainingQty, stop = plan.activeStop, oca_name = plan.remainderExitOcaName, oca_type = strategy.oca.reduce, comment = moveStopToBE ? "Breakeven" : "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, moveStopToBE ? "BE" : "STOP"))
 
     if moveStopToBE
         alert(f_executionMessage("BE_STOP_UPDATE", plan.dir, plan.mode, na, ""), alert.freq_all)
 
-if unexpectedPartialStopNow
-    plan.closeIntentReason := R_STOP
+if unexpectedPartialPriceExitNow
+    plan.fullExitPending := true
+    plan.cleanupPending := true
+    plan.cleanupClosePlaced := false
+    plan.cleanupAlertSent := false
+    plan.expectedFlatReason := plan.closeIntentReason != 0 ? plan.closeIntentReason : latestClosedExitId == "MR4-TP2" ? R_FINAL : latestClosedExitId == "MR4-BE" ? (moveStopToBE ? R_BE : R_STOP) : R_STOP
     plan.closeIntentBar := bar_index
     strategy.cancel("MR4-TP1")
     strategy.cancel("MR4-TP2")
-    strategy.exit("MR4-TP2", from_entry = f_entryOrderId(plan.dir), stop = plan.baseStop, qty_percent = 100.0, comment_loss = "Initial Stop remainder", alert_message = f_executionMessage("STOP_REMAINDER_ORDER", plan.dir, plan.mode, latestClosedExitPrice, "PARTIAL_STOP"))
-    alert(f_executionMessage("STOP_PARTIAL_FILL", plan.dir, plan.mode, latestClosedExitPrice, "PARTIAL_STOP"), alert.freq_all)
+    strategy.cancel("MR4-STOP")
+    strategy.cancel("MR4-BE")
+    string cleanupReason = "AFTER_" + f_exitReasonName(plan.expectedFlatReason)
+    strategy.close_all(comment = "MR-T V4 Residual Cleanup", alert_message = f_executionMessage("RESIDUAL_CLEANUP", plan.dir, plan.mode, latestClosedExitPrice, cleanupReason))
+    plan.cleanupClosePlaced := true
+    alert(f_executionMessage("RESIDUAL_CLEANUP", plan.dir, plan.mode, latestClosedExitPrice, cleanupReason), alert.freq_all)
+    plan.cleanupAlertSent := true
+
+// A cleanup close is retried after every fill synchronization until Broker is exactly flat.
+if plan.cleanupPending and plan.active and plan.entryFilled and not brokerDirectionMismatch
+    if isFillSynchronizationExecution and currentPositionSize != 0.0 and not unexpectedPartialPriceExitNow
+        plan.cleanupClosePlaced := false
+    strategy.cancel("MR4-TP1")
+    strategy.cancel("MR4-TP2")
+    strategy.cancel("MR4-STOP")
+    strategy.cancel("MR4-BE")
+    if currentPositionSize != 0.0 and not plan.cleanupClosePlaced
+        string retryCleanupReason = "AFTER_" + f_exitReasonName(plan.expectedFlatReason)
+        strategy.close_all(comment = "MR-T V4 Residual Cleanup", alert_message = f_executionMessage("RESIDUAL_CLEANUP", plan.dir, plan.mode, latestClosedExitPrice, retryCleanupReason))
+        plan.cleanupClosePlaced := true
+        if not plan.cleanupAlertSent
+            alert(f_executionMessage("RESIDUAL_CLEANUP", plan.dir, plan.mode, latestClosedExitPrice, retryCleanupReason), alert.freq_all)
+            plan.cleanupAlertSent := true
 
 if fullExitFilledNow
     int finishedDir = plan.dir
     int finishedMode = plan.mode
     bool finalPriceReached = finishedDir == 1 ? latestClosedExitPrice >= plan.finalTarget : latestClosedExitPrice <= plan.finalTarget
-    int finishedReason = plan.closeIntentReason != 0 ? plan.closeIntentReason : plan.partialFilled and not finalPriceReached ? (moveStopToBE ? R_BE : R_STOP) : finalPriceReached ? R_FINAL : R_STOP
+    int finishedReason = plan.expectedFlatReason != 0 ? plan.expectedFlatReason : plan.closeIntentReason != 0 ? plan.closeIntentReason : latestClosedExitId == "MR4-TP2" ? R_FINAL : latestClosedExitId == "MR4-BE" ? (moveStopToBE ? R_BE : R_STOP) : plan.partialFilled and not finalPriceReached ? (moveStopToBE ? R_BE : R_STOP) : finalPriceReached ? R_FINAL : R_STOP
     string fillEventName = finishedReason == R_FINAL ? "TP2_FILLED" : finishedReason == R_BE ? "BE_FILLED" : finishedReason == R_TREND ? "TREND_FAIL_FILLED" : finishedReason == R_TIME ? "TIMEOUT_FILLED" : "STOP_FILLED"
     float tradeNetProfit = na(broker.netProfitAtEntry) ? 0.0 : strategy.netprofit - broker.netProfitAtEntry
     bool winningBrokerTrade = tradeNetProfit > 0.0
@@ -739,6 +791,11 @@ if fullExitFilledNow
     broker.netProfitAtEntry := na
     broker.brokerEntryPrice := na
 
+    strategy.cancel("MR4-TP1")
+    strategy.cancel("MR4-TP2")
+    strategy.cancel("MR4-STOP")
+    strategy.cancel("MR4-BE")
+
     signal.lastExitBar := bar_index
     executionEventBar := bar_index
     executionEventKind := 3
@@ -752,23 +809,39 @@ if fullExitFilledNow
 
 // Orphan/mismatched Broker positions are execution errors, never signal input.
 bool orphanBrokerPosition = currentPositionSize != 0.0 and (not plan.active or not plan.entryFilled)
-bool brokerDirectionMismatch = currentPositionSize != 0.0 and plan.active and plan.dir != currentPositionDir
-int consistencyState = currentPositionSize == 0.0 and not plan.active ? CONSISTENCY_OK_FLAT : plan.active and not plan.entryFilled ? CONSISTENCY_PENDING_ENTRY : currentPositionSize > 0.0 ? CONSISTENCY_OK_LONG : currentPositionSize < 0.0 ? CONSISTENCY_OK_SHORT : CONSISTENCY_STALE_ACTIVE_FLAT
+int consistencyState = currentPositionSize == 0.0 and not plan.active ? CONSISTENCY_OK_FLAT : plan.active and not plan.entryFilled ? CONSISTENCY_PENDING_ENTRY : plan.active and plan.fullExitPending ? CONSISTENCY_PENDING_EXIT : currentPositionSize > 0.0 ? CONSISTENCY_OK_LONG : currentPositionSize < 0.0 ? CONSISTENCY_OK_SHORT : CONSISTENCY_STALE_ACTIVE_FLAT
 
 if orphanBrokerPosition or brokerDirectionMismatch
     consistencyState := brokerDirectionMismatch ? CONSISTENCY_DIRECTION_MISMATCH : CONSISTENCY_ORPHAN_BROKER
+    if plan.active and plan.entryFilled and not plan.fullExitPending
+        plan.fullExitPending := true
+        plan.cleanupPending := true
+        plan.cleanupClosePlaced := false
+        plan.cleanupAlertSent := false
+        plan.expectedFlatReason := R_STOP
+        plan.closeIntentReason := R_STOP
+        plan.closeIntentBar := bar_index
+
     if not broker.recoveryPending
         broker.recoveryPending := true
         broker.recoveryClosePlaced := false
         broker.recoveryCount += 1
         strategy.cancel_all()
 
-    if currentPositionSize != 0.0 and not broker.recoveryClosePlaced
+    if currentPositionSize != 0.0 and (not broker.recoveryClosePlaced or (isFillSynchronizationExecution and positionReduced))
         strategy.close_all(comment = "MR-T V4 Broker Recovery", alert_message = f_executionMessage("BROKER_RECOVERY", currentPositionDir, plan.mode, na, "STATE_MISMATCH"))
         broker.recoveryClosePlaced := true
+        if plan.active and plan.entryFilled
+            plan.cleanupClosePlaced := true
+            if not plan.cleanupAlertSent
+                alert(f_executionMessage("RESIDUAL_CLEANUP", plan.dir, plan.mode, latestClosedExitPrice, "AFTER_BROKER_RECOVERY"), alert.freq_all)
+                plan.cleanupAlertSent := true
 else if broker.recoveryPending and currentPositionSize == 0.0
     broker.recoveryPending := false
     broker.recoveryClosePlaced := false
+    if plan.active and not plan.entryFilled
+        strategy.cancel(f_entryOrderId(plan.dir))
+        plan.reset()
 
 // A historical fill recalculation can expose the bar's final OHLC. Blocking
 // positionChanged passes prevents that OHLC from driving signal or cancel logic.
@@ -806,7 +879,7 @@ bool shortRangeSetup = allowShort and rangeEnvironment and z >= rangeEntryZ and 
 // Pending plans cancel only on the confirmed decision clock and only while flat.
 if allowBarCloseDecision and plan.active and not plan.entryFilled and currentPositionSize == 0.0 and bar_index > plan.createdBar
     string cancelReason = ""
-    bool planExpired = bar_index > plan.expiryBar
+    bool planExpired = bar_index >= plan.expiryBar
     bool missedTP1 = plan.dir == 1 ? high >= plan.partialTarget : low <= plan.partialTarget
     bool oppositeSetup = plan.dir == 1 ? (shortShockSetup or shortRangeSetup) : (longShockSetup or longRangeSetup)
 
@@ -940,17 +1013,21 @@ if allowBarCloseDecision and (longEntrySignal or shortEntrySignal)
         plan.reset()
 
 // Confirmed-close state exits retain the V3 trend and time mathematics.
-if allowBarCloseDecision and plan.active and plan.entryFilled and currentPositionSize != 0.0 and plan.closeIntentReason == 0
+if allowBarCloseDecision and plan.active and plan.entryFilled and currentPositionSize != 0.0 and not plan.fullExitPending and plan.closeIntentReason == 0
     bool trendFailed = plan.dir * htfSlopeATR <= -vetoHtfSlope or plan.dir * localSlopeATR <= -vetoLocalSlope
     bool timeFailed = not na(plan.frozenTimeStop) and not na(plan.entryFillBar) and bar_index > plan.entryFillBar and (bar_index - plan.entryFillBar) >= plan.frozenTimeStop
 
     if trendFailed or timeFailed
         int stateExitReason = trendFailed ? R_TREND : R_TIME
         string stateExitEvent = trendFailed ? "TREND_FAIL" : "TIMEOUT"
+        plan.fullExitPending := true
+        plan.expectedFlatReason := stateExitReason
         plan.closeIntentReason := stateExitReason
         plan.closeIntentBar := bar_index
         strategy.cancel("MR4-TP1")
         strategy.cancel("MR4-TP2")
+        strategy.cancel("MR4-STOP")
+        strategy.cancel("MR4-BE")
         strategy.close(f_entryOrderId(plan.dir), comment = stateExitEvent, alert_message = f_executionMessage(stateExitEvent, plan.dir, plan.mode, na, "CONFIRMED_CLOSE"))
         alert(f_executionMessage(stateExitEvent, plan.dir, plan.mode, na, "CONFIRMED_CLOSE"), alert.freq_all)
 
@@ -1019,7 +1096,8 @@ float activePartialLine = na
 float activeFinalLine = na
 float activeRiskLine = na
 
-if plan.active
+bool showActiveTradeLines = plan.active and plan.entryFilled and currentPositionSize != 0.0
+if showActiveTradeLines
     activePartialLine := plan.partialTarget
     activeFinalLine := plan.finalTarget
     activeRiskLine := plan.activeStop
@@ -1164,7 +1242,7 @@ if showPanel
 
     string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
     string brokerAvgText = currentPositionSize == 0.0 ? "-" : str.tostring(strategy.position_avg_price, format.mintick)
-    string brokerStateText = plan.closeIntentReason != 0 ? f_tr("等待全平成交", "Full exit pending") : plan.active and not plan.entryFilled ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
+    string brokerStateText = plan.fullExitPending ? f_tr("等待全平成交", "Full exit pending") : plan.active and not plan.entryFilled ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
     string consistencyText = f_consistencyName(consistencyState)
     color consistencyColor = consistencyError ? color.red : color.lime
 

@@ -74,7 +74,7 @@ function Test-Geometry {
 function Get-CancelReason {
     param($Plan, [int]$Bar, [bool]$Veto = $false, [bool]$Missed = $false, [bool]$Opposite = $false)
     if ($Plan.EntryFilled) { return '' }
-    if ($Bar -gt $Plan.ExpiryBar) { return 'EXPIRED' }
+    if ($Bar -ge $Plan.ExpiryBar) { return 'EXPIRED' }
     if ($Veto) { return 'HARD_TREND_VETO' }
     if ($Missed) { return 'MISSED_TP1' }
     if ($Opposite) { return 'OPPOSITE_SETUP' }
@@ -97,6 +97,55 @@ function Fill-TP1 {
     $cost = $Plan.ActualEntry * 6.0 / 10000.0 + 0.5
     $Plan | Add-Member -NotePropertyName ActiveStop -NotePropertyValue ([math]::Ceiling(($Plan.ActualEntry + $cost) / 0.25) * 0.25) -Force
     return $true
+}
+
+function New-ExitModel {
+    param([double]$EntryQty, [double]$TrimPct)
+
+    [pscustomobject]@{
+        EntryQty = $EntryQty
+        TP1Qty = $EntryQty * $TrimPct / 100.0
+        TP2Qty = $EntryQty
+        StopQty = $EntryQty
+        RemainingQty = $EntryQty
+        CleanupPending = $false
+        CleanupCloseCount = 0
+        PlanReset = $false
+        Closed = 0
+        LastExitBar = $null
+        RangeClosed = 0
+        ShockClosed = 0
+    }
+}
+
+function Observe-FullExit {
+    param($Model, [double]$PositionSize)
+
+    if ($PositionSize -eq 0.0 -and -not $Model.PlanReset) {
+        $Model.PlanReset = $true
+        $Model.Closed += 1
+        $Model.LastExitBar = 20
+        $Model.RangeClosed += 1
+    }
+    else {
+        $Model.CleanupPending = $true
+        $Model.CleanupCloseCount += 1
+    }
+}
+
+function Get-PartialExitOutcome {
+    param([string]$ExitId, [bool]$AlreadyPartialFilled)
+
+    if ($ExitId -eq 'MR4-TP1' -and -not $AlreadyPartialFilled) {
+        return 'TP1'
+    }
+    return 'CLEANUP'
+}
+
+function Get-ShowActiveTradeLines {
+    param([bool]$PlanActive, [bool]$EntryFilled, [double]$PositionSize)
+
+    return $PlanActive -and $EntryFilled -and $PositionSize -ne 0.0
 }
 
 $source = [IO.File]::ReadAllText($scriptPath)
@@ -155,8 +204,8 @@ Pass-Test 'Confirmation close is not market entry' {
 }
 Pass-Test 'Plan expiry' {
     $p = New-PlanModel 1 Range
-    Assert-True ((Get-CancelReason $p 18) -eq '') 'expired too early'
-    Assert-True ((Get-CancelReason $p 19) -eq 'EXPIRED') 'did not expire'
+    Assert-True ((Get-CancelReason $p 17) -eq '') 'expired too early'
+    Assert-True ((Get-CancelReason $p 18) -eq 'EXPIRED') 'did not expire at boundary'
 }
 Pass-Test 'Hard Trend Veto cancel' {
     Assert-True ((Get-CancelReason (New-PlanModel 1 Range) 11 $true) -eq 'HARD_TREND_VETO') 'reason'
@@ -179,15 +228,24 @@ Pass-Test 'Entry fill starts trade clock' {
 Pass-Test 'Actual Broker average recorded' {
     Assert-Match $source 'plan\.actualEntryPrice\s*:=\s*strategy\.position_avg_price' 'broker average missing'
 }
+Pass-Test 'Residual never resets an active Plan' {
+    $m = New-ExitModel 1.0 90.0
+    Observe-FullExit $m 0.00001
+    Assert-True ($m.CleanupPending -and $m.CleanupCloseCount -eq 1 -and -not $m.PlanReset) 'residual model incorrectly reset'
+    Assert-Match $source 'cleanupPending' 'cleanup state missing'
+    Assert-Match $source 'strategy\.close_all\(' 'residual close command missing'
+    Assert-Match $source 'currentPositionSize\s*==\s*0\.0[\s\S]*?plan\.reset\(\)' 'reset is not gated by strict flat'
+}
 Pass-Test 'Entry fill submits TP and Stop' {
-    Assert-Match $source 'if entryFilledNow[\s\S]*?strategy\.exit\("MR4-TP1"[\s\S]*?strategy\.exit\("MR4-TP2"' 'fill brackets missing'
+    Assert-Match $source 'if entryFilledNow[\s\S]*?strategy\.order\("MR4-TP1"[\s\S]*?strategy\.order\("MR4-TP2"[\s\S]*?strategy\.order\("MR4-STOP"' 'explicit price exits missing'
 }
 Pass-Test 'TP1 remaining quantity correct' {
     $p = New-PlanModel 1 Range
     Fill-Entry $p 14 83.25
     $null = Fill-TP1 $p 15
     Assert-Near $p.PositionPct 50.0 'remainder'
-    Assert-Match $source 'qty_percent\s*=\s*trimPct[\s\S]*?qty_percent\s*=\s*100\.0\s*-\s*trimPct' 'reservation missing'
+    Assert-Match $source 'plan\.entryQty\s*:=\s*math\.abs\(strategy\.position_size\)' 'actual entry quantity missing'
+    Assert-Match $source 'qty\s*=\s*plan\.entryQty\s*\*\s*trimPct\s*/\s*100\.0' 'TP1 quantity is not based on entry quantity'
 }
 Pass-Test 'TP1 moves Stop to BE' {
     $p = New-PlanModel 1 Range
@@ -201,11 +259,11 @@ Pass-Test 'TP2 fully exits' {
     Assert-Match $source 'fullExitFilledNow[\s\S]*?plan\.reset\(\)' 'full reset missing'
 }
 Pass-Test 'Initial Stop is a real order' {
-    Assert-Match $source 'strategy\.exit\("MR4-TP1"[^\r\n]*stop\s*=\s*plan\.baseStop' 'TP1 stop missing'
-    Assert-Match $source 'strategy\.exit\("MR4-TP2"[^\r\n]*stop\s*=\s*plan\.baseStop' 'TP2 stop missing'
+    Assert-Match $source 'strategy\.order\("MR4-STOP"[^\r\n]*qty\s*=\s*plan\.entryQty[^\r\n]*stop\s*=\s*plan\.baseStop' 'initial stop missing'
+    Assert-NotMatch $source 'strategy\.exit\(' 'strategy.exit bracket remains'
 }
 Pass-Test 'BE Stop is a real updated order' {
-    Assert-Match $source 'strategy\.cancel\("MR4-TP2"\)[\s\S]*?strategy\.exit\("MR4-TP2"[^\r\n]*stop\s*=\s*plan\.activeStop' 'BE bracket missing'
+    Assert-Match $source 'strategy\.cancel\("MR4-STOP"\)[\s\S]*?strategy\.order\("MR4-TP2"[\s\S]*?strategy\.order\("MR4-BE"[^\r\n]*qty\s*=\s*remainingQty[^\r\n]*stop\s*=\s*plan\.activeStop' 'BE OCA group missing'
     Assert-Match $source '"BE_FILLED"' 'BE fill event missing'
 }
 Pass-Test 'Trend Fail confirmed-close exit' {
@@ -224,11 +282,11 @@ Pass-Test 'Same-bar TP1 idempotence' {
     Fill-Entry $p 14 83.25
     Assert-True (Fill-TP1 $p 15) 'first fill missing'
     Assert-True (-not (Fill-TP1 $p 15)) 'duplicate fill'
-    Assert-Match $source 'partialReductionNow[\s\S]*?not plan\.partialFilled' 'source dedupe missing'
+    Assert-Match $source 'tp1FilledNow\s*=\s*priceReductionNow[\s\S]*?not plan\.partialFilled' 'source dedupe missing'
 }
 Pass-Test 'Same-bar final Stop idempotence' {
     Assert-Match $source 'fullExitFilledNow\s*=\s*positionClosed\s*and\s*plan\.active\s*and\s*plan\.entryFilled' 'fact gate missing'
-    Assert-Match $source 'alert\(f_executionMessage\(fillEventName[\s\S]*?plan\.reset\(\)' 'atomic reset missing'
+    Assert-Match $source 'currentPositionSize\s*==\s*0\.0[\s\S]*?plan\.reset\(\)' 'strict flat reset missing'
 }
 Pass-Test 'Plan cancel is not trade or cooldown' {
     $block = [regex]::Match($source, '(?ms)// Pending plans cancel.*?(?=// Create or replace Signal Setup)').Value
@@ -284,6 +342,158 @@ Pass-Test 'Panel remains 21 rows' {
     Assert-True ($rows.Count -eq 21 -and $rows[0] -eq 0 -and $rows[-1] -eq 20) 'row structure'
 }
 
-Assert-True ($testCount -eq 32) "expected 32 tests, ran $testCount"
-Write-Host 'PASS: 32/32 execution-plan tests'
+Pass-Test 'Entry fill records actual Broker quantity' {
+    Assert-Match $source 'varip float entryQty\s*=\s*na' 'entry quantity field missing'
+    Assert-Match $source 'plan\.entryQty\s*:=\s*math\.abs\(strategy\.position_size\)' 'entry quantity is not Broker-derived'
+}
+Pass-Test 'Price exits use explicit strategy.order' {
+    Assert-NotMatch $source 'strategy\.exit\(' 'implicit strategy.exit bracket remains'
+    Assert-Match $source 'strategy\.order\("MR4-TP1"' 'TP1 strategy.order missing'
+    Assert-Match $source 'strategy\.order\("MR4-TP2"' 'TP2 strategy.order missing'
+    Assert-Match $source 'strategy\.order\("MR4-STOP"' 'Stop strategy.order missing'
+}
+Pass-Test 'Initial TP1 TP2 Stop share one OCA reduce group' {
+    $entryBlock = [regex]::Match($source, '(?ms)if entryFilledNow.*?(?=if tp1FilledNow)').Value
+    Assert-True ([regex]::Matches($entryBlock, 'strategy\.order\("MR4-(?:TP1|TP2|STOP)"').Count -eq 3) 'initial exit order count'
+    Assert-True ([regex]::Matches($entryBlock, 'oca_name\s*=\s*plan\.initialExitOcaName').Count -eq 3) 'initial OCA names differ'
+    Assert-True ([regex]::Matches($entryBlock, 'oca_type\s*=\s*strategy\.oca\.reduce').Count -eq 3) 'initial OCA type missing'
+}
+Pass-Test 'Initial quantities cover actual entry' {
+    $m = New-ExitModel 1.0 90.0
+    Assert-Near $m.TP1Qty 0.9 'TP1 quantity'
+    Assert-Near $m.TP2Qty 1.0 'TP2 quantity'
+    Assert-Near $m.StopQty 1.0 'Stop quantity'
+    Assert-Match $source 'strategy\.order\("MR4-STOP"[^\r\n]*qty\s*=\s*plan\.entryQty' 'Stop does not cover entry quantity'
+}
+Pass-Test 'TP1 quantity uses trimPct of entryQty' {
+    $m = New-ExitModel 0.0001 90.0
+    Assert-Near $m.TP1Qty 0.00009 'TP1 quantity'
+    Assert-Match $source 'qty\s*=\s*plan\.entryQty\s*\*\s*trimPct\s*/\s*100\.0' 'TP1 quantity formula missing'
+}
+Pass-Test 'TP1 fill reads actual remaining Broker quantity' {
+    Assert-Match $source 'float remainingQty\s*=\s*math\.abs\(strategy\.position_size\)' 'remaining quantity is not Broker-derived'
+}
+Pass-Test 'TP1 rebuilds TP2 with actual remainder' {
+    $tp1Block = [regex]::Match($source, '(?ms)if tp1FilledNow.*?(?=if unexpectedPartialPriceExitNow)').Value
+    Assert-Match $tp1Block 'strategy\.order\("MR4-TP2"[^\r\n]*qty\s*=\s*remainingQty[^\r\n]*limit\s*=\s*plan\.finalTarget' 'TP2 remainder order missing'
+    Assert-Match $tp1Block 'oca_name\s*=\s*plan\.remainderExitOcaName[^\r\n]*oca_type\s*=\s*strategy\.oca\.reduce' 'TP2 remainder OCA missing'
+}
+Pass-Test 'TP1 rebuilds BE Stop with actual remainder' {
+    $tp1Block = [regex]::Match($source, '(?ms)if tp1FilledNow.*?(?=if unexpectedPartialPriceExitNow)').Value
+    Assert-Match $tp1Block 'strategy\.order\("MR4-BE"[^\r\n]*qty\s*=\s*remainingQty[^\r\n]*stop\s*=\s*plan\.activeStop' 'BE remainder order missing'
+    Assert-Match $tp1Block 'strategy\.order\("MR4-BE"[^\r\n]*oca_name\s*=\s*plan\.remainderExitOcaName[^\r\n]*oca_type\s*=\s*strategy\.oca\.reduce' 'BE remainder OCA missing'
+}
+Pass-Test 'Initial Stop partial fill enters cleanup' {
+    Assert-True ((Get-PartialExitOutcome 'MR4-STOP' $false) -eq 'CLEANUP') 'Stop partial was treated as TP1'
+    Assert-Match $source 'unexpectedPartialPriceExitNow\s*=\s*priceReductionNow[\s\S]*?plan\.cleanupPending\s*:=\s*true' 'Stop partial cleanup path missing'
+}
+Pass-Test 'BE Stop partial fill enters cleanup' {
+    Assert-True ((Get-PartialExitOutcome 'MR4-BE' $true) -eq 'CLEANUP') 'BE partial was treated as TP1'
+    Assert-Match $source 'latestClosedExitId\s*==\s*"MR4-BE"[\s\S]*?R_BE' 'BE partial reason missing'
+}
+Pass-Test 'TP2 partial fill enters cleanup' {
+    Assert-True ((Get-PartialExitOutcome 'MR4-TP2' $true) -eq 'CLEANUP') 'TP2 partial was treated as TP1'
+    Assert-Match $source 'latestClosedExitId\s*==\s*"MR4-TP2"[\s\S]*?R_FINAL' 'TP2 partial reason missing'
+}
+Pass-Test 'Trend Fail residual enters cleanup' {
+    $stateExitBlock = [regex]::Match($source, '(?ms)if trendFailed or timeFailed.*?(?=// Commit Broker observations)').Value
+    Assert-Match $stateExitBlock 'plan\.fullExitPending\s*:=\s*true[\s\S]*?plan\.expectedFlatReason\s*:=\s*stateExitReason' 'Trend/timeout pending state missing'
+    Assert-Match $stateExitBlock 'strategy\.close\(f_entryOrderId\(plan\.dir\)' 'state exit close missing'
+}
+Pass-Test 'Timeout residual enters cleanup' {
+    Assert-Match $source 'stateExitEvent\s*=\s*trendFailed\s*\?\s*"TREND_FAIL"\s*:\s*"TIMEOUT"[\s\S]*?plan\.fullExitPending\s*:=\s*true' 'Timeout full-exit intent missing'
+    Assert-Match $source 'plan\.expectedFlatReason\s*:=\s*stateExitReason[\s\S]*?strategy\.close\(' 'Timeout cleanup handoff missing'
+}
+Pass-Test 'Broker Recovery residual is retried' {
+    Assert-Match $source 'broker\.recoveryClosePlaced\s*or\s*\(isFillSynchronizationExecution\s*and\s*positionReduced\)' 'Recovery does not retry after partial fill'
+    Assert-Match $source 'strategy\.close_all\([^\r\n]*BROKER_RECOVERY' 'Broker Recovery close missing'
+    Assert-Match $source '"RESIDUAL_CLEANUP"[^\r\n]*"AFTER_BROKER_RECOVERY"' 'Recovery residual alert missing'
+}
+Pass-Test 'Residual 0.00001 never resets Plan' {
+    $m = New-ExitModel 1.0 90.0
+    Observe-FullExit $m 0.00001
+    Assert-True ($m.CleanupPending -and -not $m.PlanReset) 'residual reset was allowed'
+    $cleanupBlock = [regex]::Match($source, '(?ms)// A cleanup close.*?(?=if fullExitFilledNow)').Value
+    Assert-NotMatch $cleanupBlock 'plan\.reset\(' 'cleanup block resets Plan early'
+}
+Pass-Test 'Residual 0.00001 submits cleanup close' {
+    $m = New-ExitModel 1.0 90.0
+    Observe-FullExit $m 0.00001
+    Assert-True ($m.CleanupCloseCount -eq 1) 'cleanup close was not submitted'
+    Assert-Match $source 'plan\.cleanupPending[\s\S]*?strategy\.close_all\(' 'cleanup close command missing'
+    Assert-Match $source 'f_executionMessage\("RESIDUAL_CLEANUP"' 'cleanup alert event missing'
+}
+Pass-Test 'Residual cleanup payload carries execution context' {
+    $cleanupLines = @($source -split '\r?\n' | Where-Object { $_ -match 'f_executionMessage\("RESIDUAL_CLEANUP"' })
+    Assert-True ($cleanupLines.Count -ge 2) 'cleanup event is not emitted for both command and alert paths'
+    Assert-Match $source '\|actual_fill="\s*\+\s*f_price\(actualFill\)' 'actual_fill payload field missing'
+    Assert-Match $source '\|reason="\s*\+\s*reason' 'reason payload field missing'
+    Assert-Match $cleanupLines[0] 'plan\.dir.*plan\.mode.*latestClosedExitPrice' 'cleanup context missing'
+}
+Pass-Test 'Only strict Broker flat completes lifecycle' {
+    $m = New-ExitModel 1.0 90.0
+    Observe-FullExit $m 0.00001
+    Assert-True (-not $m.PlanReset) 'nonzero position reset'
+    Observe-FullExit $m 0.0
+    Assert-True $m.PlanReset 'zero position did not reset'
+    Assert-Match $source 'positionClosed\s*=\s*positionSampleReady[^\r\n]*currentPositionSize\s*==\s*0\.0' 'strict flat transition missing'
+}
+Pass-Test 'Full flat sets cooldown after cleanup' {
+    $fullExitBlock = [regex]::Match($source, '(?ms)if fullExitFilledNow.*?(?=// Orphan/mismatched)').Value
+    Assert-Match $fullExitBlock 'signal\.lastExitBar\s*:=\s*bar_index[\s\S]*?plan\.reset\(\)' 'cooldown/reset ordering missing'
+    Assert-Match $source 'barsSinceExit\s*=.*?signal\.lastExitBar[\s\S]*?requiredCooldown' 'cooldown gate missing'
+}
+Pass-Test 'Range and Shock closed stats require full flat' {
+    $fullExitBlock = [regex]::Match($source, '(?ms)if fullExitFilledNow.*?(?=// Orphan/mismatched)').Value
+    Assert-Match $fullExitBlock 'broker\.rangeClosed\s*\+=' 'Range closed statistic missing'
+    Assert-Match $fullExitBlock 'broker\.shockClosed\s*\+=' 'Shock closed statistic missing'
+    Assert-Match $source 'fullExitFilledNow\s*=\s*positionClosed\s*and\s*plan\.active\s*and\s*plan\.entryFilled' 'stats are not gated by full flat'
+}
+Pass-Test 'Full-exit statistics are idempotent' {
+    $m = New-ExitModel 1.0 90.0
+    Observe-FullExit $m 0.0
+    Observe-FullExit $m 0.0
+    Assert-True ($m.Closed -eq 1 -and $m.RangeClosed -eq 1) 'duplicate full-exit statistics'
+    Assert-Match $source 'positionClosed\s*=\s*positionSampleReady' 'full-exit transition fact missing'
+}
+Pass-Test 'Normal TP1 partial does not trigger full cleanup' {
+    $m = New-ExitModel 1.0 90.0
+    Assert-True ((Get-PartialExitOutcome 'MR4-TP1' $false) -eq 'TP1') 'TP1 was not recognized'
+    Assert-True (-not $m.CleanupPending) 'normal TP1 cleanup state set'
+    $tp1Block = [regex]::Match($source, '(?ms)if tp1FilledNow.*?(?=if unexpectedPartialPriceExitNow)').Value
+    Assert-NotMatch $tp1Block 'cleanupPending\s*:=\s*true' 'TP1 path enters cleanup'
+}
+Pass-Test 'TP1 remainder quantities are exact in model' {
+    $m = New-ExitModel 1.0 90.0
+    $m.RemainingQty = $m.EntryQty - $m.TP1Qty
+    Assert-Near $m.RemainingQty 0.1 'remainder'
+    Assert-Near $m.RemainingQty ($m.TP2Qty - $m.TP1Qty) 'TP2 remainder'
+    Assert-Near $m.RemainingQty ($m.StopQty - $m.TP1Qty) 'BE remainder'
+}
+Pass-Test 'Active Trade Lines require filled nonflat position' {
+    Assert-Match $source 'bool showActiveTradeLines\s*=\s*plan\.active\s*and\s*plan\.entryFilled\s*and\s*currentPositionSize\s*!=\s*0\.0' 'active line visibility condition missing'
+    $lineBlock = [regex]::Match($source, '(?ms)// Active Trade Lines.*?(?=// Setup Labels)').Value
+    Assert-Match $lineBlock 'if showActiveTradeLines' 'active line assignment gate missing'
+}
+Pass-Test 'PLAN_PENDING hides all three Active Trade Lines' {
+    Assert-True (-not (Get-ShowActiveTradeLines $true $false 0.0)) 'PLAN_PENDING model shows active lines'
+    Assert-True (Get-ShowActiveTradeLines $true $true 1.0) 'filled position model hides active lines'
+    Assert-Match $source 'plan\.active\s*and\s*plan\.entryFilled\s*and\s*currentPositionSize\s*!=\s*0\.0' 'pending line exclusion missing'
+}
+Pass-Test 'Expiry uses inclusive future-bar count' {
+    Assert-Match $source 'bool planExpired\s*=\s*bar_index\s*>=\s*plan\.expiryBar' 'expiry boundary is not inclusive'
+    $p = New-PlanModel 1 Range
+    $validBars = @(1..8 | ForEach-Object { $p.CreatedBar + $_ })
+    Assert-True ($validBars.Count -eq 8 -and $validBars[-1] -eq $p.ExpiryBar) 'validBars=8 does not map to N+1..N+8'
+    Assert-True ((Get-CancelReason $p $p.ExpiryBar) -eq 'EXPIRED') 'N+8 was not expired at confirmed close'
+}
+Pass-Test 'V3 parity harness remains green' {
+    $v3Harness = Join-Path $PSScriptRoot 'MRT-v3.3.2-v2-logic-parity-harness.ps1'
+    Assert-True (Test-Path -LiteralPath $v3Harness) 'V3 parity harness missing'
+    $null = & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $v3Harness 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 0) 'V3 parity harness failed'
+}
+
+Assert-True ($testCount -eq 60) "expected 60 tests, ran $testCount"
+Write-Host 'PASS: 60/60 execution-plan tests'
 Write-Host 'Manual TradingView compile/backtest remains required for Pine syntax and Broker Emulator fill ordering.'
