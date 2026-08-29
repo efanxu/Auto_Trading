@@ -2,6 +2,13 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.0.0] — Frozen execution plans and intrabar price orders
+
+- Added `MRT_V4.pine`, preserving `MRT.pine` as the byte-for-byte v3.3.2 V2 Logic-State Parity reference. Confirmed 15m signals now create tick-rounded, frozen retracement plans with Range/Shock expiry, cancellation alerts, and non-marketable limit entries.
+- Entry fills synchronize from Broker Emulator facts, then submit reserved TP1/TP2 `strategy.exit` brackets with frozen targets and Stop. Actual TP1 fills update the remaining bracket to an execution-cost-aware break-even Stop; Trend Fail and Timeout remain confirmed-close state exits.
+- Enabled Bar Magnifier while keeping `calc_on_every_tick = false` and `calc_on_order_fills = true`. Fill recalculations are excluded from signal/cancel decisions, and the 21-row Panel no longer depends on `barstate.islast`.
+- Added `tests/MRT-v4-execution-plan-harness.ps1` with 32 deterministic model/static checks. TradingView Pine compilation and Broker Emulator fill-order backtesting remain manual release checks.
+
 ## [Unreleased] — Restore strict V2 Logic execution timeline
 
 ### Fixed

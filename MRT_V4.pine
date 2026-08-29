@@ -1,0 +1,1277 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | fill={{strategy.order.price}}
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
+// GitHub: https://github.com/Ye-Yu-Mo
+strategy("MR-T Strategy v4.0.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, use_bar_magnifier = true, margin_long = 0, margin_short = 0, max_labels_count = 500)
+
+// ============================================================================
+// Mean Reversion T (MR-T) · Strategy v4.0.0
+// V3.3.2 = confirmed-close V2 parity reference (MRT.pine).
+// V4.0.0 = confirmed signal + frozen execution plan + intrabar price-order execution.
+//
+// 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
+//
+// 双引擎 / Dual Engine
+//   1. Range Reversion   市场适合震荡回归 → 温和 Z 偏离即可观察
+//   2. Shock Reversal    市场不一定横盘 → 异常冲击 + 减速/拒绝 + 回归确认
+// 共同保护 / Guard        Hard Trend Veto (1H + 15m 斜率与 Efficiency Ratio)
+// 生命周期 / Lifecycle    观察 → 确认 → 冻结计划 → Limit 成交 → TP1/BE/TP2/Stop
+// 状态退出 / State exits  趋势失效 / T超时 (confirmed close)
+// 架构 / Architecture     MRSignalState → ExecutionPlanState → MRBrokerFillState
+//
+// 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
+// confirmed-close 负责信号与状态退出;盘中 Limit/TP/Stop 由 Broker Emulator 成交;
+// 换品种/周期前请重新评估全部参数。
+//
+// 版本 / Version: v4.0.0 —— Frozen Execution Plan Strategy。变更见 CHANGELOG.md。
+// ============================================================================
+
+
+// ============================================================================
+// ⑫ 语言与版本 / ⑫ Language & Version
+// ============================================================================
+// 运行时 UI(面板 / 图表标签 / 报错)随 lang 切换中英文。
+// 注意:Pine 的 input 标题/分组、plotshape 的 text 都是编译期 const string,
+// 无法用运行时变量切换语言:输入项标签保持中文。策略 alert() 与 order
+// alert_message 使用运行时字符串,包含实际事件、方向、模式和成交占位符。
+
+lang = input.string("zh", "语言 / Language", options = ["zh", "en"], group = "⑫ 语言与版本 / Language & Version")
+
+f_tr(simple string zh, simple string en) =>
+    lang == "zh" ? zh : en
+
+string SCRIPT_NAME = "MR-T"
+string SCRIPT_VERSION = "4.0.0"
+
+
+// ============================================================================
+// ① 交易方向
+// ============================================================================
+
+allowLong = input.bool(true, "允许T买", group = "① 交易方向")
+allowShort = input.bool(true, "允许T空", group = "① 交易方向")
+
+
+// ============================================================================
+// ② 均值与 Z-score
+// ============================================================================
+
+meanLen = input.int(32, "15m 局部均值 EMA", minval = 10, group = "② 均值与Z-score")
+zLen = input.int(32, "Z-score 周期", minval = 10, group = "② 均值与Z-score")
+
+rangeEntryZ = input.float(1.65, "Range模式观察 Z", minval = 1.0, step = 0.05, group = "② 均值与Z-score")
+shockEntryZ = input.float(2.00, "Shock模式观察 Z", minval = 1.2, step = 0.05, group = "② 均值与Z-score")
+
+rangePartialZ = input.float(0.80, "Range T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+rangeExitZ = input.float(0.25, "Range T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+shockPartialZ = input.float(1.00, "Shock T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+shockExitZ = input.float(0.50, "Shock T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+stopZ = input.float(3.25, "极端统计失效 Z", minval = 2.2, step = 0.25, group = "② 均值与Z-score")
+
+
+// ============================================================================
+// ③ 1H 市场状态
+// ============================================================================
+
+htfTf = input.timeframe("60", "市场状态周期", group = "③ 1H 市场状态")
+htfMeanLen = input.int(20, "1H 均值 EMA", minval = 5, group = "③ 1H 市场状态")
+htfSlopeLookback = input.int(4, "1H 斜率周期", minval = 1, group = "③ 1H 市场状态")
+
+idealHtfSlope = input.float(0.10, "1H 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "③ 1H 市场状态")
+
+htfERLen = input.int(10, "1H Efficiency Ratio 周期", minval = 3, group = "③ 1H 市场状态")
+idealHtfER = input.float(0.50, "1H 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "③ 1H 市场状态")
+
+
+// ============================================================================
+// ④ 15m 市场状态
+// ============================================================================
+
+localSlopeLookback = input.int(8, "15m 斜率周期", minval = 2, group = "④ 15m 市场状态")
+idealLocalSlope = input.float(0.12, "15m 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "④ 15m 市场状态")
+
+localERLen = input.int(16, "15m Efficiency Ratio 周期", minval = 3, group = "④ 15m 市场状态")
+idealLocalER = input.float(0.60, "15m 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "④ 15m 市场状态")
+
+
+// ============================================================================
+// ⑤ Regime Score
+// ============================================================================
+
+rangeMinScore = input.float(50.0, "Range模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+shockMinScore = input.float(45.0, "Shock模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+
+regimeSmoothLen = input.int(3, "环境分平滑周期", minval = 1, maxval = 8, group = "⑤ Regime Score")
+
+
+// ============================================================================
+// ⑥ Hard Trend Veto
+// ============================================================================
+
+vetoHtfSlope = input.float(0.18, "1H 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalSlope = input.float(0.23, "15m 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+
+vetoHtfER = input.float(0.75, "1H 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalER = input.float(0.80, "15m 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+
+
+// ============================================================================
+// ⑦ Shock Engine
+// ============================================================================
+
+shockLookback = input.int(2, "Shock 检测 K 数", minval = 1, maxval = 4, group = "⑦ Shock Engine")
+minShockATR = input.float(0.80, "最小 Shock 强度 ATR", minval = 0.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireShockDeceleration = input.bool(true, "Shock要求冲击减速", group = "⑦ Shock Engine")
+decelerationRatio = input.float(0.85, "Shock减速比例", minval = 0.30, maxval = 1.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireRejection = input.bool(true, "Shock要求拒绝/反向K线", group = "⑦ Shock Engine")
+
+minWickRatio = input.float(0.30, "最低拒绝影线比例", minval = 0.0, maxval = 0.8, step = 0.05, group = "⑦ Shock Engine")
+
+
+// ============================================================================
+// ⑧ Half-Life / Time Stop
+// ============================================================================
+
+halfLifeLookback = input.int(80, "Half-Life 样本长度", minval = 30, group = "⑧ Half-Life")
+
+timeStopMultiplier = input.float(3.0, "Time Stop = Half-Life ×", minval = 1.0, step = 0.25, group = "⑧ Half-Life")
+
+minTimeStopBars = input.int(8, "最短 Time Stop", minval = 2, group = "⑧ Half-Life")
+maxTimeStopBars = input.int(40, "最长 Time Stop", minval = 8, group = "⑧ Half-Life")
+fallbackTimeStopBars = input.int(24, "Half-Life无效时 Time Stop", minval = 4, group = "⑧ Half-Life")
+
+
+// ============================================================================
+// ⑨ Setup / Confirmation
+// ============================================================================
+
+rangeSetupBars = input.int(16, "Range Setup 有效 K 数", minval = 2, maxval = 48, group = "⑨ 入场确认")
+shockSetupBars = input.int(8, "Shock Setup 有效 K 数", minval = 2, maxval = 24, group = "⑨ 入场确认")
+
+requireCandleConfirm = input.bool(true, "要求K线方向确认", group = "⑨ 入场确认")
+requireBandReclaim = input.bool(true, "要求价格重新进入Z区间", group = "⑨ 入场确认")
+
+cooldownBars = input.int(3, "退出后冷却 K 数", minval = 0, maxval = 24, group = "⑨ 入场确认")
+trimPct = input.float(50.0, "T减退出仓位 (%)", minval = 1.0, maxval = 99.0, step = 1.0, group = "⑨ 入场确认")
+
+
+// ============================================================================
+// ⑩ 风险控制
+// ============================================================================
+
+atrLen = input.int(14, "ATR 周期", minval = 1, group = "⑩ 风险控制")
+
+hardStopATR = input.float(2.50, "ATR 紧急止损", minval = 0.50, step = 0.25, group = "⑩ 风险控制")
+
+stopMode = input.string("Balanced", "止损模式", options = ["Tight", "Balanced", "Loose"], group = "⑩ 风险控制")
+
+balancedWeight = input.float(0.50, "Balanced统计止损权重", minval = 0.0, maxval = 1.0, step = 0.05, group = "⑩ 风险控制")
+
+moveStopToBE = input.bool(true, "T减后启用保本保护", group = "⑩ 风险控制")
+
+// strategy() 只能接受编译期的 commission/slippage 默认值;这两个输入用于
+// BE 价格估算,应与 Strategy Tester -> Properties 中的设置保持一致。
+commissionBps = input.float(3.0, "Strategy Tester 手续费(bp/边)", minval = 0.0, step = 0.5, group = "⑩ 风险控制")
+slippageTicks = input.int(0, "Strategy Tester 滑点(ticks/边)", minval = 0, group = "⑩ 风险控制")
+
+
+// ============================================================================
+// V4 Execution Plan
+// ============================================================================
+
+rangePlanValidBars = input.int(8, "Range Plan 有效 K 数", minval = 1, group = "V4 Execution Plan")
+shockPlanValidBars = input.int(4, "Shock Plan 有效 K 数", minval = 1, group = "V4 Execution Plan")
+
+
+// ============================================================================
+// ⑪ 显示
+// ============================================================================
+
+showBands = input.bool(true, "显示均值回归区间", group = "⑪ 显示")
+showBackground = input.bool(true, "显示做T环境", group = "⑪ 显示")
+showSetup = input.bool(true, "显示观察信号", group = "⑪ 显示")
+showPanel = input.bool(true, "显示状态面板", group = "⑪ 显示")
+showTradeLevels = input.bool(true, "显示本轮目标/风险", group = "⑪ 显示")
+
+
+// ============================================================================
+// 参数检查
+// ============================================================================
+
+if shockEntryZ <= rangeEntryZ
+    runtime.error("Shock模式 Z 必须高于 Range模式 Z。/ Shock mode Z must be higher than Range mode Z.")
+
+if rangeExitZ >= rangePartialZ
+    runtime.error("Range T平目标必须小于 Range T减目标。/ Range exit Z must be below Range partial Z.")
+
+if shockExitZ >= shockPartialZ
+    runtime.error("Shock T平目标必须小于 Shock T减目标。/ Shock exit Z must be below Shock partial Z.")
+
+if rangePartialZ >= rangeEntryZ
+    runtime.error("Range T减目标必须小于 Range观察 Z。/ Range partial Z must be below Range entry Z.")
+
+if shockPartialZ >= shockEntryZ
+    runtime.error("Shock T减目标必须小于 Shock观察 Z。/ Shock partial Z must be below Shock entry Z.")
+
+if stopZ <= shockEntryZ
+    runtime.error("Stop Z 必须高于 Shock Entry Z。/ Stop Z must be above Shock entry Z.")
+
+
+// ============================================================================
+// 周期保护
+// ============================================================================
+
+chartSeconds = timeframe.in_seconds(timeframe.period)
+requiredSeconds = timeframe.in_seconds("15")
+htfSeconds = timeframe.in_seconds(htfTf)
+
+if chartSeconds != requiredSeconds
+    runtime.error("Mean Reversion T 设计用于15分钟图。/ Designed for the 15-minute chart.")
+
+if htfSeconds <= chartSeconds
+    runtime.error("高周期必须高于15分钟,默认使用60分钟。/ Higher timeframe must be above 15m. Default is 60m.")
+
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Kaufman Efficiency Ratio, 路径用平均单根位移近似。
+f_er(int length) =>
+    float absMove = math.abs(ta.change(close))
+    float avgMove = ta.sma(absMove, length)
+    float path = avgMove * length
+    float net = math.abs(close - close[length])
+    path > 0.0 ? net / path : 0.0
+
+// 上一根(高周期)已确认的 ER —— 防重绘。需在 request.security 内求值。
+f_erPrev(int length) =>
+    f_er(length)[1]
+
+// 归一化斜率:EMA 位移 / ATR / lookback。
+f_slopeATR(int emaLength, int atrLength, int lookback) =>
+    float m = ta.ema(close, emaLength)
+    float a = math.max(ta.atr(atrLength), syminfo.mintick)
+    (m - m[lookback]) / a / lookback
+
+// 上一根(高周期)已确认的斜率 —— 防重绘。需在 request.security 内求值。
+f_slopeATRPrev(int emaLength, int atrLength, int lookback) =>
+    f_slopeATR(emaLength, atrLength, lookback)[1]
+
+// 单维度环境分:25 分满分,随 |value|/ideal 衰减,截断到 [0, 25]。
+f_score(float value, float idealLimit) =>
+    float ratio = idealLimit > 0.0 ? math.abs(value) / idealLimit : 10.0
+    float rawScore = 25.0 * (1.0 - ratio)
+    float floorScore = math.max(rawScore, 0.0)
+    math.min(floorScore, 25.0)
+
+
+// ============================================================================
+// Mean / ATR
+// ============================================================================
+
+mean15 = ta.ema(close, meanLen)
+atr15 = ta.atr(atrLen)
+safeATR = math.max(atr15, syminfo.mintick)
+
+
+// ============================================================================
+// Residual / Z-score
+// ============================================================================
+
+residual = close - mean15
+residualStd = ta.stdev(residual, zLen)
+safeStd = math.max(nz(residualStd), syminfo.mintick)
+z = residual / safeStd
+
+
+// ============================================================================
+// 动态区间
+// ============================================================================
+
+upperRangeBand = mean15 + rangeEntryZ * safeStd
+lowerRangeBand = mean15 - rangeEntryZ * safeStd
+
+upperShockBand = mean15 + shockEntryZ * safeStd
+lowerShockBand = mean15 - shockEntryZ * safeStd
+
+upperStopBand = mean15 + stopZ * safeStd
+lowerStopBand = mean15 - stopZ * safeStd
+
+
+// ============================================================================
+// Local Regime (15m)
+// ============================================================================
+
+localSlopeATR = (mean15 - mean15[localSlopeLookback]) / safeATR / localSlopeLookback
+localER = f_er(localERLen)
+
+
+// ============================================================================
+// Confirmed 1H Regime (防重绘:取上一根已确认的 1H bar 值)
+// ============================================================================
+
+htfSlopeATR = request.security(syminfo.tickerid, htfTf, f_slopeATRPrev(htfMeanLen, atrLen, htfSlopeLookback), lookahead = barmerge.lookahead_on)
+htfER = request.security(syminfo.tickerid, htfTf, f_erPrev(htfERLen), lookahead = barmerge.lookahead_on)
+
+
+// ============================================================================
+// Regime Score
+// ============================================================================
+
+htfSlopeScore = f_score(htfSlopeATR, idealHtfSlope)
+htfERScore = f_score(htfER, idealHtfER)
+localSlopeScore = f_score(localSlopeATR, idealLocalSlope)
+localERScore = f_score(localER, idealLocalER)
+
+rawRegimeScore = htfSlopeScore + htfERScore + localSlopeScore + localERScore
+regimeScore = ta.sma(rawRegimeScore, regimeSmoothLen)
+
+
+// ============================================================================
+// Hard Trend Veto
+// ============================================================================
+
+htfSlopeVeto = math.abs(htfSlopeATR) >= vetoHtfSlope
+localSlopeVeto = math.abs(localSlopeATR) >= vetoLocalSlope
+htfERVeto = htfER >= vetoHtfER
+localERVeto = localER >= vetoLocalER
+
+hardTrendVeto = htfSlopeVeto or localSlopeVeto or htfERVeto or localERVeto
+
+rangeEnvironment = not hardTrendVeto and regimeScore >= rangeMinScore
+shockEnvironment = not hardTrendVeto and regimeScore >= shockMinScore
+
+
+// ============================================================================
+// Shock Detection
+// ============================================================================
+// Shock 强度:最近 N 根走了多少 ATR。
+
+shockMove = (close - close[shockLookback]) / safeATR
+shockUp = shockMove >= minShockATR
+shockDown = shockMove <= -minShockATR
+
+// 当前冲击 vs 前一段冲击:开始减弱 → 更像过冲结束。
+previousShockMove = (close[shockLookback] - close[shockLookback * 2]) / safeATR
+shockDecelerating = math.abs(shockMove) <= math.abs(previousShockMove) * decelerationRatio
+decelerationOK = not requireShockDeceleration or shockDecelerating
+
+
+// ============================================================================
+// Candle / Wick Rejection
+// ============================================================================
+
+barRange = math.max(high - low, syminfo.mintick)
+
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+lowerWickRatio = lowerWick / barRange
+upperWickRatio = upperWick / barRange
+
+bullishCandle = close > open
+bearishCandle = close < open
+
+longRejection = bullishCandle or lowerWickRatio >= minWickRatio
+shortRejection = bearishCandle or upperWickRatio >= minWickRatio
+
+longRejectionOK = not requireRejection or longRejection
+shortRejectionOK = not requireRejection or shortRejection
+
+
+// ============================================================================
+// Half-Life
+// ============================================================================
+// 对 d(residual) ~ beta * residual[-1] 回归,Half-Life = -ln(2) / beta。
+// beta 为正(动量)或无效时,退化到 fallbackTimeStopBars。
+
+residualLag = residual[1]
+residualDelta = residual - residual[1]
+
+hlCorr = ta.correlation(residualDelta, residualLag, halfLifeLookback)
+hlDeltaStd = ta.stdev(residualDelta, halfLifeLookback)
+hlLagStd = ta.stdev(residualLag, halfLifeLookback)
+
+bool betaOK = not na(hlCorr) and not na(hlDeltaStd) and not na(hlLagStd) and hlLagStd > 0.0
+
+float hlBeta = na
+
+if betaOK
+    hlBeta := hlCorr * hlDeltaStd / hlLagStd
+
+float halfLife = na
+
+if not na(hlBeta) and hlBeta < -0.000001
+    halfLife := -math.log(2.0) / hlBeta
+
+
+// ============================================================================
+// 全局 Cross
+// ============================================================================
+
+zCrossOverNegRange = ta.crossover(z, -rangeEntryZ)
+zCrossUnderPosRange = ta.crossunder(z, rangeEntryZ)
+
+zCrossOverNegShock = ta.crossover(z, -shockEntryZ)
+zCrossUnderPosShock = ta.crossunder(z, shockEntryZ)
+
+
+// ============================================================================
+// State: confirmed signal clock, frozen execution plan, and Broker facts
+// ============================================================================
+
+type MRSignalState
+    varip int setupBar = na
+    varip int setupDir = 0
+    varip int setupMode = 0
+    varip int decisionBar = na
+    varip int lastExitBar = na
+    varip int eventBar = na
+    varip int eventKind = 0
+    varip int eventDir = 0
+    varip int eventReason = 0
+    varip int eventMode = 0
+    varip float eventPrice = na
+
+type ExecutionPlanState
+    varip bool active = false
+    varip int dir = 0
+    varip int mode = 0
+    varip int createdBar = na
+    varip int expiryBar = na
+    varip float frozenMean = na
+    varip float frozenStd = na
+    varip float frozenATR = na
+    varip float frozenHalfLife = na
+    varip int frozenTimeStop = na
+    varip float entryLimit = na
+    varip float partialTarget = na
+    varip float finalTarget = na
+    varip float baseStop = na
+    varip float activeStop = na
+    varip bool entryFilled = false
+    varip int entryFillBar = na
+    varip float actualEntryPrice = na
+    varip bool exitsSubmitted = false
+    varip bool partialFilled = false
+    varip int partialFillBar = na
+    varip int closeIntentReason = 0
+    varip int closeIntentBar = na
+
+type MRBrokerFillState
+    varip bool trackerReady = false
+    varip float previousPositionSize = na
+    varip int observedClosedTrades = 0
+    varip float brokerEntryPrice = na
+    varip int entryFillBar = na
+    varip int partialFillBar = na
+    varip int fullExitFillBar = na
+    varip int fillEventBar = na
+    varip int fillEventKind = 0
+    varip int fillEventDir = 0
+    varip int fillEventReason = 0
+    varip float fillEventPrice = na
+    varip float netProfitAtEntry = na
+    varip bool recoveryPending = false
+    varip bool recoveryClosePlaced = false
+    varip int recoveryCount = 0
+    varip int rangeEntries = 0
+    varip int rangeClosed = 0
+    varip int rangeWins = 0
+    varip int shockEntries = 0
+    varip int shockClosed = 0
+    varip int shockWins = 0
+    varip int shockZCandidates = 0
+    varip int shockMoveCandidates = 0
+    varip int shockEnvironmentPass = 0
+    varip int shockDecelerationPass = 0
+    varip int shockRejectionPass = 0
+    varip int shockSetups = 0
+    varip int shockConfirmedEntries = 0
+
+method reset(ExecutionPlanState this) =>
+    this.active := false
+    this.dir := 0
+    this.mode := 0
+    this.createdBar := na
+    this.expiryBar := na
+    this.frozenMean := na
+    this.frozenStd := na
+    this.frozenATR := na
+    this.frozenHalfLife := na
+    this.frozenTimeStop := na
+    this.entryLimit := na
+    this.partialTarget := na
+    this.finalTarget := na
+    this.baseStop := na
+    this.activeStop := na
+    this.entryFilled := false
+    this.entryFillBar := na
+    this.actualEntryPrice := na
+    this.exitsSubmitted := false
+    this.partialFilled := false
+    this.partialFillBar := na
+    this.closeIntentReason := 0
+    this.closeIntentBar := na
+
+var MRSignalState signal = MRSignalState.new()
+var ExecutionPlanState plan = ExecutionPlanState.new()
+var MRBrokerFillState broker = MRBrokerFillState.new()
+
+// Setup and execution events are rollback-safe snapshots for the existing labels.
+varip int signalSetupEventBar = na
+varip int signalSetupEventDir = 0
+varip int signalSetupEventMode = 0
+varip int executionEventBar = na
+varip int executionEventKind = 0
+varip int executionEventDir = 0
+varip int executionEventReason = 0
+varip int executionEventMode = 0
+varip float executionEventPrice = na
+
+if na(signalSetupEventBar) or bar_index != signalSetupEventBar
+    signalSetupEventBar := na
+    signalSetupEventDir := 0
+    signalSetupEventMode := 0
+
+if na(executionEventBar) or bar_index != executionEventBar
+    executionEventBar := na
+    executionEventKind := 0
+    executionEventDir := 0
+    executionEventReason := 0
+    executionEventMode := 0
+    executionEventPrice := na
+
+// Exit reason enum. Price exits are Broker fills; state exits are close decisions.
+int R_STOP = 1
+int R_TREND = 2
+int R_TIME = 3
+int R_FINAL = 4
+int R_BE = 5
+
+// Compact compatibility diagnostics for the unchanged 21-row panel.
+int CONSISTENCY_OK_FLAT = 0
+int CONSISTENCY_OK_LONG = 1
+int CONSISTENCY_OK_SHORT = 2
+int CONSISTENCY_PENDING_ENTRY = 3
+int CONSISTENCY_STALE_ACTIVE_FLAT = 4
+int CONSISTENCY_DIRECTION_MISMATCH = 5
+int CONSISTENCY_ORPHAN_BROKER = 6
+int CONSISTENCY_INVALID_CONTEXT = 9
+int CONSISTENCY_PENDING_EXIT = 11
+
+f_consistencyName(int state) =>
+    state == CONSISTENCY_OK_FLAT ? "OK_FLAT" : state == CONSISTENCY_OK_LONG ? "OK_LONG" : state == CONSISTENCY_OK_SHORT ? "OK_SHORT" : state == CONSISTENCY_PENDING_ENTRY ? "PLAN_PENDING" : state == CONSISTENCY_PENDING_EXIT ? "PENDING_EXIT" : state == CONSISTENCY_DIRECTION_MISMATCH ? "DIRECTION_MISMATCH" : state == CONSISTENCY_ORPHAN_BROKER ? "ORPHAN_BROKER" : state == CONSISTENCY_STALE_ACTIVE_FLAT ? "STALE_PLAN" : "INVALID_CONTEXT"
+
+f_modeName(int mode) =>
+    mode == 2 ? "Shock" : "Range"
+
+f_directionName(int dir) =>
+    dir == 1 ? "Long" : "Short"
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_roundToTick(float value) =>
+    math.round(value / syminfo.mintick) * syminfo.mintick
+
+f_roundUpToTick(float value) =>
+    math.ceil(value / syminfo.mintick) * syminfo.mintick
+
+f_roundDownToTick(float value) =>
+    math.floor(value / syminfo.mintick) * syminfo.mintick
+
+f_entryOrderId(int dir) =>
+    dir == 1 ? "MR4-L" : "MR4-S"
+
+f_brokerExecutionCost(float price) =>
+    price * (2.0 * commissionBps) / 10000.0 + 2.0 * slippageTicks * syminfo.mintick
+
+// Every V4 alert and order alert_message comes from this single formatter.
+f_executionMessage(string eventName, int dir, int mode, float actualFill, string reason) =>
+    int validBars = not na(plan.createdBar) and not na(plan.expiryBar) ? plan.expiryBar - plan.createdBar : 0
+    float tp1Qty = trimPct
+    float tp2Qty = 100.0 - trimPct
+    "MR-T-V4|event=" + eventName +
+      "|direction=" + f_directionName(dir) +
+      "|mode=" + f_modeName(mode) +
+      "|entry_limit=" + f_price(plan.entryLimit) +
+      "|tp1=" + f_price(plan.partialTarget) +
+      "|tp1_qty=" + str.tostring(tp1Qty, "#.##") +
+      "|tp2=" + f_price(plan.finalTarget) +
+      "|tp2_qty=" + str.tostring(tp2Qty, "#.##") +
+      "|stop=" + f_price(plan.activeStop) +
+      "|valid_bars=" + str.tostring(validBars) +
+      "|created_bar=" + str.tostring(plan.createdBar) +
+      "|actual_fill=" + f_price(actualFill) +
+      "|reason=" + reason
+
+// --------------------------------------------------------------------------
+// Broker fill synchronization. This executes before the signal scheduler.
+// A position-size transition identifies a fill pass and blocks signal logic.
+float currentPositionSize = strategy.position_size
+int currentPositionDir = currentPositionSize > 0.0 ? 1 : currentPositionSize < 0.0 ? -1 : 0
+bool trackerWasReady = broker.trackerReady
+float previousExecutionPositionSize = broker.previousPositionSize
+int closedTradesNow = strategy.closedtrades
+
+if not trackerWasReady
+    broker.previousPositionSize := currentPositionSize
+    broker.observedClosedTrades := closedTradesNow
+    broker.trackerReady := true
+
+bool positionSampleReady = trackerWasReady and not na(previousExecutionPositionSize)
+bool positionEntered = positionSampleReady and previousExecutionPositionSize == 0.0 and currentPositionSize != 0.0
+bool positionClosed = positionSampleReady and previousExecutionPositionSize != 0.0 and currentPositionSize == 0.0
+bool sameDirectionPosition = positionSampleReady and previousExecutionPositionSize != 0.0 and currentPositionSize != 0.0 and previousExecutionPositionSize * currentPositionSize > 0.0
+bool positionReduced = sameDirectionPosition and math.abs(currentPositionSize) < math.abs(previousExecutionPositionSize)
+bool positionChanged = positionSampleReady and currentPositionSize != previousExecutionPositionSize
+bool isFillSynchronizationExecution = positionChanged
+
+bool hasNewClosedTrade = positionSampleReady and closedTradesNow > broker.observedClosedTrades
+string latestClosedExitId = hasNewClosedTrade ? strategy.closedtrades.exit_id(closedTradesNow - 1) : ""
+float latestClosedExitPrice = hasNewClosedTrade ? strategy.closedtrades.exit_price(closedTradesNow - 1) : close
+
+bool entryFilledNow = positionEntered and plan.active and not plan.entryFilled and currentPositionDir == plan.dir
+bool partialReductionNow = positionReduced and plan.active and plan.entryFilled and not plan.partialFilled
+bool tp1PriceReachedAtFill = partialReductionNow and (plan.dir == 1 ? latestClosedExitPrice >= plan.partialTarget : latestClosedExitPrice <= plan.partialTarget)
+bool tp1FilledNow = partialReductionNow and latestClosedExitId == "MR4-TP1" and tp1PriceReachedAtFill
+bool unexpectedPartialStopNow = partialReductionNow and not tp1FilledNow
+bool fullExitFilledNow = positionClosed and plan.active and plan.entryFilled
+
+if entryFilledNow
+    plan.entryFilled := true
+    plan.entryFillBar := bar_index
+    plan.actualEntryPrice := strategy.position_avg_price
+    plan.activeStop := plan.baseStop
+    broker.brokerEntryPrice := plan.actualEntryPrice
+    broker.entryFillBar := bar_index
+    broker.fillEventBar := bar_index
+    broker.fillEventKind := 1
+    broker.fillEventDir := plan.dir
+    broker.fillEventReason := 0
+    broker.fillEventPrice := plan.actualEntryPrice
+    broker.netProfitAtEntry := strategy.netprofit
+    broker.rangeEntries += plan.mode == 1 ? 1 : 0
+    broker.shockEntries += plan.mode == 2 ? 1 : 0
+
+    executionEventBar := bar_index
+    executionEventKind := 1
+    executionEventDir := plan.dir
+    executionEventReason := 0
+    executionEventMode := plan.mode
+    executionEventPrice := plan.actualEntryPrice
+
+    alert(f_executionMessage("ENTRY_FILLED", plan.dir, plan.mode, plan.actualEntryPrice, ""), alert.freq_all)
+
+    // Two strategy.exit brackets reserve trimPct and its remainder. Pine's
+    // default strategy.oca.reduce behavior prevents aggregate over-exit.
+    string filledEntryId = f_entryOrderId(plan.dir)
+    strategy.exit("MR4-TP1", from_entry = filledEntryId, limit = plan.partialTarget, stop = plan.baseStop, qty_percent = trimPct, comment_profit = "TP1", comment_loss = "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP1_OR_STOP"))
+    strategy.exit("MR4-TP2", from_entry = filledEntryId, limit = plan.finalTarget, stop = plan.baseStop, qty_percent = 100.0 - trimPct, comment_profit = "TP2", comment_loss = "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, "TP2_OR_STOP"))
+    plan.exitsSubmitted := true
+
+if tp1FilledNow
+    plan.partialFilled := true
+    plan.partialFillBar := bar_index
+    broker.partialFillBar := bar_index
+    broker.fillEventBar := bar_index
+    broker.fillEventKind := 2
+    broker.fillEventDir := plan.dir
+    broker.fillEventReason := 0
+    broker.fillEventPrice := latestClosedExitPrice
+
+    executionEventBar := bar_index
+    executionEventKind := 2
+    executionEventDir := plan.dir
+    executionEventReason := 0
+    executionEventMode := plan.mode
+    executionEventPrice := latestClosedExitPrice
+
+    alert(f_executionMessage("TP1_FILLED", plan.dir, plan.mode, latestClosedExitPrice, ""), alert.freq_all)
+
+    float executionCost = f_brokerExecutionCost(plan.actualEntryPrice)
+    float breakEvenStop = plan.dir == 1 ? f_roundUpToTick(plan.actualEntryPrice + executionCost) : f_roundDownToTick(plan.actualEntryPrice - executionCost)
+    plan.activeStop := moveStopToBE ? (plan.dir == 1 ? math.max(plan.baseStop, breakEvenStop) : math.min(plan.baseStop, breakEvenStop)) : plan.baseStop
+
+    // Replace the reserved TP2 bracket so 100% means the current remainder.
+    strategy.cancel("MR4-TP1")
+    strategy.cancel("MR4-TP2")
+    string remainingEntryId = f_entryOrderId(plan.dir)
+    strategy.exit("MR4-TP2", from_entry = remainingEntryId, limit = plan.finalTarget, stop = plan.activeStop, qty_percent = 100.0, comment_profit = "TP2", comment_loss = moveStopToBE ? "Breakeven" : "Initial Stop", alert_message = f_executionMessage("PRICE_EXIT_ORDER", plan.dir, plan.mode, na, moveStopToBE ? "TP2_OR_BE" : "TP2_OR_STOP"))
+
+    if moveStopToBE
+        alert(f_executionMessage("BE_STOP_UPDATE", plan.dir, plan.mode, na, ""), alert.freq_all)
+
+if unexpectedPartialStopNow
+    plan.closeIntentReason := R_STOP
+    plan.closeIntentBar := bar_index
+    strategy.cancel("MR4-TP1")
+    strategy.cancel("MR4-TP2")
+    strategy.exit("MR4-TP2", from_entry = f_entryOrderId(plan.dir), stop = plan.baseStop, qty_percent = 100.0, comment_loss = "Initial Stop remainder", alert_message = f_executionMessage("STOP_REMAINDER_ORDER", plan.dir, plan.mode, latestClosedExitPrice, "PARTIAL_STOP"))
+    alert(f_executionMessage("STOP_PARTIAL_FILL", plan.dir, plan.mode, latestClosedExitPrice, "PARTIAL_STOP"), alert.freq_all)
+
+if fullExitFilledNow
+    int finishedDir = plan.dir
+    int finishedMode = plan.mode
+    bool finalPriceReached = finishedDir == 1 ? latestClosedExitPrice >= plan.finalTarget : latestClosedExitPrice <= plan.finalTarget
+    int finishedReason = plan.closeIntentReason != 0 ? plan.closeIntentReason : plan.partialFilled and not finalPriceReached ? (moveStopToBE ? R_BE : R_STOP) : finalPriceReached ? R_FINAL : R_STOP
+    string fillEventName = finishedReason == R_FINAL ? "TP2_FILLED" : finishedReason == R_BE ? "BE_FILLED" : finishedReason == R_TREND ? "TREND_FAIL_FILLED" : finishedReason == R_TIME ? "TIMEOUT_FILLED" : "STOP_FILLED"
+    float tradeNetProfit = na(broker.netProfitAtEntry) ? 0.0 : strategy.netprofit - broker.netProfitAtEntry
+    bool winningBrokerTrade = tradeNetProfit > 0.0
+
+    broker.fullExitFillBar := bar_index
+    broker.fillEventBar := bar_index
+    broker.fillEventKind := 3
+    broker.fillEventDir := finishedDir
+    broker.fillEventReason := finishedReason
+    broker.fillEventPrice := latestClosedExitPrice
+    broker.rangeClosed += finishedMode == 1 ? 1 : 0
+    broker.shockClosed += finishedMode == 2 ? 1 : 0
+    broker.rangeWins += finishedMode == 1 and winningBrokerTrade ? 1 : 0
+    broker.shockWins += finishedMode == 2 and winningBrokerTrade ? 1 : 0
+    broker.netProfitAtEntry := na
+    broker.brokerEntryPrice := na
+
+    signal.lastExitBar := bar_index
+    executionEventBar := bar_index
+    executionEventKind := 3
+    executionEventDir := finishedDir
+    executionEventReason := finishedReason
+    executionEventMode := finishedMode
+    executionEventPrice := latestClosedExitPrice
+
+    alert(f_executionMessage(fillEventName, finishedDir, finishedMode, latestClosedExitPrice, ""), alert.freq_all)
+    plan.reset()
+
+// Orphan/mismatched Broker positions are execution errors, never signal input.
+bool orphanBrokerPosition = currentPositionSize != 0.0 and (not plan.active or not plan.entryFilled)
+bool brokerDirectionMismatch = currentPositionSize != 0.0 and plan.active and plan.dir != currentPositionDir
+int consistencyState = currentPositionSize == 0.0 and not plan.active ? CONSISTENCY_OK_FLAT : plan.active and not plan.entryFilled ? CONSISTENCY_PENDING_ENTRY : currentPositionSize > 0.0 ? CONSISTENCY_OK_LONG : currentPositionSize < 0.0 ? CONSISTENCY_OK_SHORT : CONSISTENCY_STALE_ACTIVE_FLAT
+
+if orphanBrokerPosition or brokerDirectionMismatch
+    consistencyState := brokerDirectionMismatch ? CONSISTENCY_DIRECTION_MISMATCH : CONSISTENCY_ORPHAN_BROKER
+    if not broker.recoveryPending
+        broker.recoveryPending := true
+        broker.recoveryClosePlaced := false
+        broker.recoveryCount += 1
+        strategy.cancel_all()
+
+    if currentPositionSize != 0.0 and not broker.recoveryClosePlaced
+        strategy.close_all(comment = "MR-T V4 Broker Recovery", alert_message = f_executionMessage("BROKER_RECOVERY", currentPositionDir, plan.mode, na, "STATE_MISMATCH"))
+        broker.recoveryClosePlaced := true
+else if broker.recoveryPending and currentPositionSize == 0.0
+    broker.recoveryPending := false
+    broker.recoveryClosePlaced := false
+
+// A historical fill recalculation can expose the bar's final OHLC. Blocking
+// positionChanged passes prevents that OHLC from driving signal or cancel logic.
+bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution and (na(signal.decisionBar) or signal.decisionBar != bar_index)
+
+if allowBarCloseDecision
+    signal.decisionBar := bar_index
+
+int barsSinceExit = na(signal.lastExitBar) ? 100000 : bar_index - signal.lastExitBar
+int requiredCooldown = math.max(cooldownBars, 1)
+bool canEnter = na(signal.lastExitBar) or barsSinceExit >= requiredCooldown
+
+// ============================================================================
+// Existing Setup formulas (Shock priority, unchanged mathematics)
+// ============================================================================
+
+bool longShockZCandidate = allowLong and z <= -shockEntryZ
+bool shortShockZCandidate = allowShort and z >= shockEntryZ
+bool longShockMoveCandidate = longShockZCandidate and shockDown
+bool shortShockMoveCandidate = shortShockZCandidate and shockUp
+bool longShockEnvironmentCandidate = longShockMoveCandidate and shockEnvironment
+bool shortShockEnvironmentCandidate = shortShockMoveCandidate and shockEnvironment
+bool longShockDecelerationCandidate = longShockEnvironmentCandidate and decelerationOK
+bool shortShockDecelerationCandidate = shortShockEnvironmentCandidate and decelerationOK
+bool longShockRejectionCandidate = longShockDecelerationCandidate and longRejectionOK
+bool shortShockRejectionCandidate = shortShockDecelerationCandidate and shortRejectionOK
+
+bool noSameLong = na(signal.setupBar) or signal.setupDir != 1
+bool noSameShort = na(signal.setupBar) or signal.setupDir != -1
+bool longShockSetup = allowLong and shockEnvironment and shockDown and z <= -shockEntryZ and decelerationOK and longRejectionOK and noSameLong
+bool shortShockSetup = allowShort and shockEnvironment and shockUp and z >= shockEntryZ and decelerationOK and shortRejectionOK and noSameShort
+bool longRangeSetup = allowLong and rangeEnvironment and z <= -rangeEntryZ and noSameLong
+bool shortRangeSetup = allowShort and rangeEnvironment and z >= rangeEntryZ and noSameShort
+
+// Pending plans cancel only on the confirmed decision clock and only while flat.
+if allowBarCloseDecision and plan.active and not plan.entryFilled and currentPositionSize == 0.0 and bar_index > plan.createdBar
+    string cancelReason = ""
+    bool planExpired = bar_index > plan.expiryBar
+    bool missedTP1 = plan.dir == 1 ? high >= plan.partialTarget : low <= plan.partialTarget
+    bool oppositeSetup = plan.dir == 1 ? (shortShockSetup or shortRangeSetup) : (longShockSetup or longRangeSetup)
+
+    if planExpired
+        cancelReason := "EXPIRED"
+    else if hardTrendVeto
+        cancelReason := "HARD_TREND_VETO"
+    else if missedTP1
+        cancelReason := "MISSED_TP1"
+    else if oppositeSetup
+        cancelReason := "OPPOSITE_SETUP"
+
+    if cancelReason != ""
+        strategy.cancel(f_entryOrderId(plan.dir))
+        alert(f_executionMessage("PLAN_CANCEL", plan.dir, plan.mode, na, cancelReason), alert.freq_all)
+        plan.reset()
+
+// Create or replace Signal Setup only when there is no plan and no position.
+if allowBarCloseDecision and not plan.active and currentPositionSize == 0.0 and canEnter
+    broker.shockZCandidates += (longShockZCandidate ? 1 : 0) + (shortShockZCandidate ? 1 : 0)
+    broker.shockMoveCandidates += (longShockMoveCandidate ? 1 : 0) + (shortShockMoveCandidate ? 1 : 0)
+    broker.shockEnvironmentPass += (longShockEnvironmentCandidate ? 1 : 0) + (shortShockEnvironmentCandidate ? 1 : 0)
+    broker.shockDecelerationPass += (longShockDecelerationCandidate ? 1 : 0) + (shortShockDecelerationCandidate ? 1 : 0)
+    broker.shockRejectionPass += (longShockRejectionCandidate ? 1 : 0) + (shortShockRejectionCandidate ? 1 : 0)
+
+    if longShockSetup
+        broker.shockSetups += 1
+        signal.setupBar := bar_index
+        signal.setupDir := 1
+        signal.setupMode := 2
+        signalSetupEventBar := bar_index
+        signalSetupEventDir := 1
+        signalSetupEventMode := 2
+    else if shortShockSetup
+        broker.shockSetups += 1
+        signal.setupBar := bar_index
+        signal.setupDir := -1
+        signal.setupMode := 2
+        signalSetupEventBar := bar_index
+        signalSetupEventDir := -1
+        signalSetupEventMode := 2
+    else if longRangeSetup
+        signal.setupBar := bar_index
+        signal.setupDir := 1
+        signal.setupMode := 1
+        signalSetupEventBar := bar_index
+        signalSetupEventDir := 1
+        signalSetupEventMode := 1
+    else if shortRangeSetup
+        signal.setupBar := bar_index
+        signal.setupDir := -1
+        signal.setupMode := 1
+        signalSetupEventBar := bar_index
+        signalSetupEventDir := -1
+        signalSetupEventMode := 1
+
+// Existing Setup expiry and statistical invalidation.
+if allowBarCloseDecision and not na(signal.setupBar)
+    int allowedAge = signal.setupMode == 2 ? shockSetupBars : rangeSetupBars
+    if bar_index - signal.setupBar > allowedAge
+        signal.setupBar := na
+        signal.setupDir := 0
+        signal.setupMode := 0
+
+if allowBarCloseDecision and not na(signal.setupBar) and signal.setupDir * z <= -stopZ
+    signal.setupBar := na
+    signal.setupDir := 0
+    signal.setupMode := 0
+
+// ============================================================================
+// Existing Entry Confirmation formulas; confirmation now creates a plan
+// ============================================================================
+
+float entryZ = signal.setupMode == 2 ? shockEntryZ : rangeEntryZ
+bool candleOK = signal.setupDir == 1 ? (not requireCandleConfirm or close > close[1]) : signal.setupDir == -1 ? (not requireCandleConfirm or close < close[1]) : false
+bool zReclaim = signal.setupDir == 1 ? (signal.setupMode == 2 ? zCrossOverNegShock : zCrossOverNegRange) : signal.setupDir == -1 ? (signal.setupMode == 2 ? zCrossUnderPosShock : zCrossUnderPosRange) : false
+bool priceBandReclaim = signal.setupDir == 1 ? close > mean15 - entryZ * safeStd : signal.setupDir == -1 ? close < mean15 + entryZ * safeStd : false
+bool bandOK = not requireBandReclaim or priceBandReclaim
+bool longEntrySignal = barstate.isconfirmed and not plan.active and currentPositionSize == 0.0 and not hardTrendVeto and signal.setupDir == 1 and not na(signal.setupBar) and zReclaim and bandOK and candleOK
+bool shortEntrySignal = barstate.isconfirmed and not plan.active and currentPositionSize == 0.0 and not hardTrendVeto and signal.setupDir == -1 and not na(signal.setupBar) and zReclaim and bandOK and candleOK
+
+if allowBarCloseDecision and (longEntrySignal or shortEntrySignal)
+    int newDir = longEntrySignal ? 1 : -1
+    int newMode = signal.setupMode
+    bool shockPlan = newMode == 2
+    float newEntryZ = shockPlan ? shockEntryZ : rangeEntryZ
+    float partialZ = shockPlan ? shockPartialZ : rangePartialZ
+    float finalZ = shockPlan ? shockExitZ : rangeExitZ
+    int validBars = shockPlan ? shockPlanValidBars : rangePlanValidBars
+
+    plan.active := true
+    plan.dir := newDir
+    plan.mode := newMode
+    plan.createdBar := bar_index
+    plan.expiryBar := bar_index + validBars
+    plan.frozenMean := mean15
+    plan.frozenStd := safeStd
+    plan.frozenATR := safeATR
+    plan.frozenHalfLife := halfLife
+    plan.entryLimit := f_roundToTick(plan.frozenMean - newDir * newEntryZ * plan.frozenStd)
+    plan.partialTarget := f_roundToTick(plan.frozenMean - newDir * partialZ * plan.frozenStd)
+    plan.finalTarget := f_roundToTick(plan.frozenMean - newDir * finalZ * plan.frozenStd)
+
+    float atrStop = plan.entryLimit - newDir * hardStopATR * plan.frozenATR
+    float statStop = plan.frozenMean - newDir * stopZ * plan.frozenStd
+    float tightStop = newDir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
+    float looseStop = newDir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
+    float balancedStop = looseStop + (tightStop - looseStop) * balancedWeight
+    float selectedStop = stopMode == "Tight" ? tightStop : stopMode == "Loose" ? looseStop : balancedStop
+    plan.baseStop := f_roundToTick(selectedStop)
+    plan.activeStop := plan.baseStop
+
+    float rawTimeStop = na(plan.frozenHalfLife) ? fallbackTimeStopBars : plan.frozenHalfLife * timeStopMultiplier
+    float limitedTimeStop = math.min(maxTimeStopBars, math.max(minTimeStopBars, rawTimeStop))
+    plan.frozenTimeStop := int(math.round(limitedTimeStop))
+
+    bool orderedGeometry = newDir == 1 ? plan.baseStop < plan.entryLimit and plan.entryLimit < plan.partialTarget and plan.partialTarget < plan.finalTarget : plan.baseStop > plan.entryLimit and plan.entryLimit > plan.partialTarget and plan.partialTarget > plan.finalTarget
+    bool nonMarketableLimit = newDir == 1 ? plan.entryLimit < close : plan.entryLimit > close
+    bool validGeometry = orderedGeometry and nonMarketableLimit
+
+    signal.setupBar := na
+    signal.setupDir := 0
+    signal.setupMode := 0
+
+    if validGeometry
+        broker.shockConfirmedEntries += newMode == 2 ? 1 : 0
+        strategy.entry(f_entryOrderId(newDir), newDir == 1 ? strategy.long : strategy.short, limit = plan.entryLimit, alert_message = f_executionMessage("ENTRY_LIMIT_ORDER", newDir, newMode, na, ""))
+        alert(f_executionMessage("PLAN_CREATE", newDir, newMode, na, ""), alert.freq_all)
+    else
+        alert(f_executionMessage("PLAN_REJECT", newDir, newMode, na, "INVALID_GEOMETRY"), alert.freq_all)
+        plan.reset()
+
+// Confirmed-close state exits retain the V3 trend and time mathematics.
+if allowBarCloseDecision and plan.active and plan.entryFilled and currentPositionSize != 0.0 and plan.closeIntentReason == 0
+    bool trendFailed = plan.dir * htfSlopeATR <= -vetoHtfSlope or plan.dir * localSlopeATR <= -vetoLocalSlope
+    bool timeFailed = not na(plan.frozenTimeStop) and not na(plan.entryFillBar) and bar_index > plan.entryFillBar and (bar_index - plan.entryFillBar) >= plan.frozenTimeStop
+
+    if trendFailed or timeFailed
+        int stateExitReason = trendFailed ? R_TREND : R_TIME
+        string stateExitEvent = trendFailed ? "TREND_FAIL" : "TIMEOUT"
+        plan.closeIntentReason := stateExitReason
+        plan.closeIntentBar := bar_index
+        strategy.cancel("MR4-TP1")
+        strategy.cancel("MR4-TP2")
+        strategy.close(f_entryOrderId(plan.dir), comment = stateExitEvent, alert_message = f_executionMessage(stateExitEvent, plan.dir, plan.mode, na, "CONFIRMED_CLOSE"))
+        alert(f_executionMessage(stateExitEvent, plan.dir, plan.mode, na, "CONFIRMED_CLOSE"), alert.freq_all)
+
+// Commit Broker observations after all fill synchronization.
+broker.previousPositionSize := currentPositionSize
+broker.observedClosedTrades := closedTradesNow
+
+// Derived events feed the unchanged plot/label/Data Window footprint.
+bool setupEvent = signalSetupEventBar == bar_index
+int setupEventDir = signalSetupEventDir
+int setupEventMode = signalSetupEventMode
+bool entryEvent = executionEventBar == bar_index and executionEventKind == 1
+int entryEventDir = executionEventDir
+bool partialEvent = executionEventBar == bar_index and executionEventKind == 2
+int partialEventDir = executionEventDir
+bool exitEvent = executionEventBar == bar_index and executionEventKind == 3
+int exitEventDir = executionEventDir
+int exitReason = executionEventReason
+int eventMode = executionEventMode
+float eventPrice = executionEventPrice
+
+// ============================================================================
+// Plot Mean
+// ============================================================================
+
+plot(mean15, "Local Mean", color = color.yellow, linewidth = 2)
+
+
+// ============================================================================
+// Bands
+// ============================================================================
+
+pRangeUpper = plot(showBands ? upperRangeBand : na, "Range +Z", color = color.new(color.orange, 35))
+pRangeLower = plot(showBands ? lowerRangeBand : na, "Range -Z", color = color.new(color.aqua, 35))
+
+pShockUpper = plot(showBands ? upperShockBand : na, "Shock +Z", color = color.new(color.red, 35))
+pShockLower = plot(showBands ? lowerShockBand : na, "Shock -Z", color = color.new(color.green, 35))
+
+pStopUpper = plot(showBands ? upperStopBand : na, "Extreme +Z", color = color.new(color.red, 75))
+pStopLower = plot(showBands ? lowerStopBand : na, "Extreme -Z", color = color.new(color.red, 75))
+
+fill(pShockUpper, pStopUpper, color = color.new(color.red, 94))
+fill(pShockLower, pStopLower, color = color.new(color.green, 94))
+
+
+// ============================================================================
+// Background
+// ============================================================================
+
+color bgCol = na
+
+if showBackground
+    if rangeEnvironment
+        bgCol := color.new(color.blue, 92)
+    else if shockEnvironment
+        bgCol := color.new(color.purple, 94)
+
+bgcolor(bgCol, title = "Mean Reversion Environment")
+
+
+// ============================================================================
+// Active Trade Lines
+// ============================================================================
+
+float activePartialLine = na
+float activeFinalLine = na
+float activeRiskLine = na
+
+if plan.active
+    activePartialLine := plan.partialTarget
+    activeFinalLine := plan.finalTarget
+    activeRiskLine := plan.activeStop
+
+plot(showTradeLevels ? activePartialLine : na, "T减目标 / Trim", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeFinalLine : na, "T平目标 / Target", color = color.white, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels ? activeRiskLine : na, "风险线 / Risk", color = color.red, linewidth = 2, style = plot.style_linebr)
+
+
+// ============================================================================
+// Setup Labels
+// ============================================================================
+// 用 label.new 而非 plotshape:plotshape 的 text 是 const string,无法随
+// lang 切换;label.new 的 text 是 series string,可接 f_tr()。
+
+if showSetup and setupEvent and setupEventMode == 1 and setupEventDir == 1
+    label.new(bar_index, low, f_tr("R观察", "R obs"), style = label.style_label_up, color = color.new(color.green, 55), textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 1 and setupEventDir == -1
+    label.new(bar_index, high, f_tr("R观察", "R obs"), style = label.style_label_down, color = color.new(color.red, 55), textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 2 and setupEventDir == 1
+    label.new(bar_index, low, f_tr("S观察", "S obs"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.tiny)
+
+if showSetup and setupEvent and setupEventMode == 2 and setupEventDir == -1
+    label.new(bar_index, high, f_tr("S观察", "S obs"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// Entry
+// ============================================================================
+
+if entryEvent and entryEventDir == 1
+    label.new(bar_index, low, f_tr("T买", "T Long"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small)
+
+if entryEvent and entryEventDir == -1
+    label.new(bar_index, high, f_tr("T空", "T Short"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+
+
+// ============================================================================
+// Partial
+// ============================================================================
+
+if partialEvent and partialEventDir == 1
+    label.new(bar_index, high, f_tr("T减", "T Trim"), style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
+
+if partialEvent and partialEventDir == -1
+    label.new(bar_index, low, f_tr("T减", "T Trim"), style = label.style_label_up, color = color.aqua, textcolor = color.black, size = size.tiny)
+
+
+// ============================================================================
+// Exits (Final / Stop / Trend / Time / BE)
+// ============================================================================
+
+if exitEvent and exitReason == R_FINAL and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T平", "T Close"), style = label.style_label_down, color = color.lime, textcolor = color.black, size = size.small)
+
+if exitEvent and exitReason == R_FINAL and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T平", "T Close"), style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+
+if exitEvent and exitReason == R_STOP and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T止损", "T Stop"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_STOP and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T止损", "T Stop"), style = label.style_label_up, color = color.red, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TREND and exitEventDir == 1
+    label.new(bar_index, high, f_tr("趋势失效", "Trend fail"), style = label.style_label_down, color = color.purple, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TREND and exitEventDir == -1
+    label.new(bar_index, low, f_tr("趋势失效", "Trend fail"), style = label.style_label_up, color = color.purple, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TIME and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T超时", "T Timeout"), style = label.style_label_down, color = color.gray, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_TIME and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T超时", "T Timeout"), style = label.style_label_up, color = color.gray, textcolor = color.white, size = size.small)
+
+if exitEvent and exitReason == R_BE and exitEventDir == 1
+    label.new(bar_index, high, f_tr("T保本", "T BE"), style = label.style_label_down, color = color.gray, textcolor = color.white, size = size.tiny)
+
+if exitEvent and exitReason == R_BE and exitEventDir == -1
+    label.new(bar_index, low, f_tr("T保本", "T BE"), style = label.style_label_up, color = color.gray, textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// Data Window
+// ============================================================================
+// Keep the production Data Window compact: market context, Logic parity fields,
+// Broker position/recovery facts, and Range/Shock statistics. Execution-only
+// transition diagnostics remain in the Panel so they do not consume plot budget.
+
+plot(z, "Z-score", display = display.data_window)
+plot(regimeScore, "Regime Score", display = display.data_window)
+plot(halfLife, "Half-Life", display = display.data_window)
+plot(shockMove, "Shock ATR", display = display.data_window)
+plot(previousShockMove, "Previous Shock ATR", display = display.data_window)
+plot(localER, "15m ER", display = display.data_window)
+plot(htfER, "1H ER", display = display.data_window)
+plot(localSlopeATR, "15m Slope", display = display.data_window)
+plot(htfSlopeATR, "1H Slope", display = display.data_window)
+plot(plan.entryFilled ? plan.dir : 0, "Logic Position", display = display.data_window)
+plot(plan.partialFilled ? 1 : 0, "Logic Partial Taken", display = display.data_window)
+plot(plan.actualEntryPrice, "Logic Entry Price", display = display.data_window)
+plot(plan.partialTarget, "Logic Partial Target", display = display.data_window)
+plot(plan.finalTarget, "Logic Final Target", display = display.data_window)
+plot(plan.active ? plan.activeStop : na, "Logic Active Stop", display = display.data_window)
+plot(executionEventKind, "Logic Event Code", display = display.data_window)
+plot(executionEventReason, "Logic Event Reason", display = display.data_window)
+plot(currentPositionSize, "Broker Position", display = display.data_window)
+plot(broker.brokerEntryPrice, "Broker Entry Price", display = display.data_window)
+plot(broker.recoveryCount, "Broker Recovery Count", display = display.data_window)
+plot(consistencyState, "Broker Consistency State", display = display.data_window)
+plot(broker.rangeEntries, "Range Entries", display = display.data_window)
+plot(broker.rangeClosed, "Range Closed", display = display.data_window)
+plot(broker.rangeWins, "Range Wins", display = display.data_window)
+plot(broker.shockEntries, "Shock Entries", display = display.data_window)
+plot(broker.shockClosed, "Shock Closed", display = display.data_window)
+plot(broker.shockWins, "Shock Wins", display = display.data_window)
+
+
+// ============================================================================
+// Panel
+// ============================================================================
+
+var table panel = table.new(position.top_right, 2, 21, border_width = 1)
+
+if showPanel
+
+    string envText = f_tr("禁做T", "No T")
+    color envColor = color.gray
+
+    if rangeEnvironment
+        envText := "Range"
+        envColor := color.aqua
+    else if shockEnvironment
+        envText := "Shock Only"
+        envColor := color.purple
+
+    bool consistencyError = consistencyState >= CONSISTENCY_STALE_ACTIVE_FLAT and consistencyState <= CONSISTENCY_INVALID_CONTEXT
+    string stateText = consistencyError ? f_tr("状态错误", "STATE ERROR") : currentPositionDir == 1 ? f_tr("逻辑T多", "Logic Long") : currentPositionDir == -1 ? f_tr("逻辑T空", "Logic Short") : plan.active and plan.dir == 1 ? f_tr("待多头成交", "Pending Long") : plan.active and plan.dir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("逻辑空仓", "Logic Flat")
+
+    string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
+    string brokerAvgText = currentPositionSize == 0.0 ? "-" : str.tostring(strategy.position_avg_price, format.mintick)
+    string brokerStateText = plan.closeIntentReason != 0 ? f_tr("等待全平成交", "Full exit pending") : plan.active and not plan.entryFilled ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
+    string consistencyText = f_consistencyName(consistencyState)
+    color consistencyColor = consistencyError ? color.red : color.lime
+
+    string setupText = f_tr("无", "None")
+
+    if signal.setupMode == 1 and signal.setupDir == 1
+        setupText := f_tr("R等T买", "Range→Long")
+    else if signal.setupMode == 2 and signal.setupDir == 1
+        setupText := f_tr("S等T买", "Shock→Long")
+    else if signal.setupMode == 1 and signal.setupDir == -1
+        setupText := f_tr("R等T空", "Range→Short")
+    else if signal.setupMode == 2 and signal.setupDir == -1
+        setupText := f_tr("S等T空", "Shock→Short")
+
+    string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
+    string shockText = str.tostring(shockMove, "#.00") + " ATR"
+    string scoreText = str.tostring(regimeScore, "#")
+    string modeText = plan.active ? f_modeName(plan.mode) : "-"
+    string stopText = stopMode
+    string phaseText = plan.active ? not plan.entryFilled ? "PLAN_PENDING" : plan.partialFilled ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : "FLAT"
+    string entryText = not plan.active ? "-" : str.tostring(plan.entryLimit, format.mintick) + " / " + f_price(plan.actualEntryPrice)
+    string trimText = not plan.active ? "-" : str.tostring(plan.partialTarget, format.mintick)
+    string finalText = not plan.active ? "-" : str.tostring(plan.finalTarget, format.mintick)
+    string riskText = not plan.active ? "-" : str.tostring(plan.activeStop, format.mintick)
+    float testerProfitFactor = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+    string testerPLText = str.tostring(strategy.netprofit, format.mintick) + " / DD " + str.tostring(strategy.max_drawdown, format.mintick) + " / PF " + (na(testerProfitFactor) ? "-" : str.tostring(testerProfitFactor, "#.00"))
+    float testerWinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
+    string testerTradeText = str.tostring(strategy.closedtrades, "#") + " / " + (na(testerWinRate) ? "-" : str.tostring(testerWinRate, "#.0") + "%")
+    float brokerExecutionCost = currentPositionSize == 0.0 ? na : f_brokerExecutionCost(strategy.position_avg_price)
+    string brokerCostText = na(brokerExecutionCost) ? "-" : str.tostring(brokerExecutionCost, format.mintick)
+    string brokerDiagnosticsText = brokerStateText + " / R " + str.tostring(broker.recoveryCount, "#") + " / Cost " + brokerCostText
+    float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
+    float shockWinRate = broker.shockClosed > 0 ? broker.shockWins / broker.shockClosed * 100.0 : na
+    string rangeStatsText = "E " + str.tostring(broker.rangeEntries, "#") + " / C " + str.tostring(broker.rangeClosed, "#") + " / W " + str.tostring(broker.rangeWins, "#") + " (" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
+    string shockStatsText = "E " + str.tostring(broker.shockEntries, "#") + " / C " + str.tostring(broker.shockClosed, "#") + " / W " + str.tostring(broker.shockWins, "#") + " (" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
+
+    table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
+    table.cell(panel, 1, 0, "15m")
+
+    table.cell(panel, 0, 1, f_tr("环境", "Env"))
+    table.cell(panel, 1, 1, envText, text_color = envColor)
+
+    table.cell(panel, 0, 2, "Score")
+    table.cell(panel, 1, 2, scoreText)
+
+    table.cell(panel, 0, 3, f_tr("状态", "State"))
+    table.cell(panel, 1, 3, stateText)
+
+    table.cell(panel, 0, 4, "Setup")
+    table.cell(panel, 1, 4, setupText)
+
+    table.cell(panel, 0, 5, "Z")
+    table.cell(panel, 1, 5, str.tostring(z, "#.00"))
+
+    table.cell(panel, 0, 6, "Shock")
+    table.cell(panel, 1, 6, shockText)
+
+    table.cell(panel, 0, 7, "Half-Life")
+    table.cell(panel, 1, 7, hlText)
+
+    table.cell(panel, 0, 8, f_tr("模式", "Mode"))
+    table.cell(panel, 1, 8, modeText)
+
+    table.cell(panel, 0, 9, f_tr("阶段", "Phase"))
+    table.cell(panel, 1, 9, phaseText)
+
+    table.cell(panel, 0, 10, f_tr("逻辑/成交入场价", "Logic / Broker entry"))
+    table.cell(panel, 1, 10, entryText)
+
+    table.cell(panel, 0, 11, f_tr("T减 / T平", "Trim / Final"))
+    table.cell(panel, 1, 11, trimText + " / " + finalText)
+
+    table.cell(panel, 0, 12, "Risk")
+    table.cell(panel, 1, 12, riskText + " (" + stopText + ")")
+
+    table.cell(panel, 0, 13, f_tr("Tester 净利/回撤/PF", "Tester P&L/DD/PF"))
+    table.cell(panel, 1, 13, testerPLText)
+
+    table.cell(panel, 0, 14, f_tr("Tester 交易 / 胜率", "Tester trades / win"))
+    table.cell(panel, 1, 14, testerTradeText)
+
+    table.cell(panel, 0, 15, f_tr("Range 进场 / 已平 / 盈利", "Range entries / closed / wins"))
+    table.cell(panel, 1, 15, rangeStatsText)
+
+    table.cell(panel, 0, 16, f_tr("Shock 进场 / 已平 / 盈利", "Shock entries / closed / wins"))
+    table.cell(panel, 1, 16, shockStatsText)
+
+    table.cell(panel, 0, 17, f_tr("Broker 仓位", "Broker Position"))
+    table.cell(panel, 1, 17, brokerPositionText)
+
+    table.cell(panel, 0, 18, f_tr("Broker 均价", "Broker Avg Price"))
+    table.cell(panel, 1, 18, brokerAvgText)
+
+    table.cell(panel, 0, 19, f_tr("Broker状态 / 恢复次数", "Broker State / Recovery Count"))
+    table.cell(panel, 1, 19, brokerDiagnosticsText)
+
+    table.cell(panel, 0, 20, f_tr("一致性", "Consistency"))
+    table.cell(panel, 1, 20, consistencyText, text_color = consistencyColor)
+
+else
+    table.clear(panel, 0, 0, 1, 20)
+
+
+// ============================================================================
+// Alerts
+// ============================================================================
+
+if setupEvent and allowBarCloseDecision
+    string setupEventName = setupEventMode == 2 ? "SHOCK_SETUP" : "RANGE_SETUP"
+    alert(f_executionMessage(setupEventName, setupEventDir, setupEventMode, close, "CONFIRMED_CLOSE"), alert.freq_all)
