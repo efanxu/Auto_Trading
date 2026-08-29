@@ -2,6 +2,25 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.3.0] — V2 Logic-State Parity
+
+This release makes the V2.0.0 logic state the sole source of MR-T lifecycle decisions while retaining real Strategy Tester execution and Broker diagnostics.
+
+### Changed
+
+- **Logic/Broker split** — `MRLogicState` owns the V2 lifecycle fields and decides Entry, Trim, Final, Stop/BE, Trend Fail, and Timeout. `MRBrokerState` owns order intents, actual position/fill facts, P&L diagnostics, and recovery.
+- **Immediate Logic mutation** — Entry sets `logic.entryPrice = close`, freezes the V2 context and cost, and sets `logic.pos` before `strategy.entry`. Trim sets `logic.partialTaken = true` before submitting `strategy.close(..., qty_percent = trimPct)`.
+- **V2 management parity** — Active Stop/BE, Final, Trend Fail, Timeout, and cooldown read Logic State only. Logic exits set `logic.pos = 0` and `logic.lastExitBar` before Broker flattening.
+- **Fill isolation** — `calc_on_order_fills` executions synchronize Broker facts only. Broker fills cannot create, reorder, or rewrite Logic Events; Broker recovery is execution-only and emits `BROKER RECOVERY` diagnostics.
+- **Stable Logic Events** — `logicEventBar`, `logicEventKind`, `logicEventDir`, `logicEventReason`, `logicEventMode`, and `logicEventPrice` persist through same-bar fill recalculation and clear only on a new bar. T labels are derived from these fields.
+- **Two-layer diagnostics** — Data Window adds Logic Position/Event/decision bars alongside Broker Position/fill/recovery/fill-bar fields. The existing 58 inputs, formulas, defaults, same-close settings, cross-date behavior, trim default of 50%, Shock funnel, and no-bracket order model are preserved.
+
+### Verification
+
+- `tests/MRT-v3.3.0-v2-logic-parity-harness.ps1` is the single static and dynamic V2 Logic-State parity harness.
+- `git diff --check` is required before release.
+- TradingView Pine v6 compilation and Strategy Tester runtime parity remain pending manual TradingView verification.
+
 ## [3.2.0] — V2 Decision-Parity Strategy fills
 
 This release aligns the Strategy Tester execution timeline with MR-T Production v2.0.0 while retaining real broker positions and a real partial exit.
@@ -21,7 +40,7 @@ This release aligns the Strategy Tester execution timeline with MR-T Production 
 
 ### Verification
 
-- `tests/MRT-v3.2.0-v2-parity-harness.ps1` is the single current static/lifecycle parity harness.
+- The release-specific v3.2.0 static/lifecycle parity harness covered that release's decision-versus-fill contract.
 - `git diff --check` is required before release.
 - TradingView Pine v6 compilation and Strategy Tester runtime/parity verification remain pending manual TradingView verification.
 
@@ -42,7 +61,7 @@ This patch keeps the confirmed-close MR-T decision model and real Strategy Teste
 
 ### Verification
 
-- The current regression contract is maintained by `tests/MRT-v3.2.0-v2-parity-harness.ps1`, which covers the decision-versus-fill timing and lifecycle checks introduced here.
+- The release-specific v3.1.1 regression harness covered the decision-versus-fill timing and lifecycle checks introduced here.
 - Static review and `git diff --check` are required before release.
 - Pine v6 compilation and Strategy Tester runtime verification remain pending manual TradingView verification.
 

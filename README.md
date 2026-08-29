@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md) · English
 
-A production-grade **V2 Decision-Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.2.0 makes every lifecycle decision from a confirmed **15-minute close**, then lets Strategy Tester fill the real market order on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
+A production-grade **V2 Logic-State Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.3.0 lets the V2 logic state decide every lifecycle point from a confirmed **15-minute close**, then lets Strategy Tester execute the resulting broker intent on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.2.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.0-informational)](CHANGELOG.md)
 
 ---
 
@@ -29,10 +29,10 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Half-life time stop | OU-process half-life estimates how long a reversion should take; fallback when unmeasurable |
 | Strategy Tester | Real `strategy.entry` and `strategy.close` market orders; formal P&L and positions come from Strategy Tester |
 | Partial exits | Configurable `trimPct` (default 50%) for T-trim; T-close exits the remaining position |
-| Cost-aware breakeven | Strategy Tester commission/slippage are the formal cost source; matching inputs size the post-trim breakeven estimate |
-| V2 Decision-Parity lifecycle | Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final are decided only at confirmed 15m closes and use same-close market fills |
-| Broker fill state | A dedicated `varip` fill state synchronizes real position transitions across `calc_on_order_fills` executions without making new decisions |
-| Broker/fill-state consistency | Classifies flat, pending, stale, mismatched, orphan, and direct-reversal states; invalid contexts are cleared or safely closed |
+| Cost-aware breakeven | V2 Logic BE uses commission cost from `commissionBps`; `slippageTicks` remains Broker execution diagnostics only |
+| V2 Logic-State Parity lifecycle | `MRLogicState` alone decides Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final at confirmed 15m closes |
+| Broker execution state | `MRBrokerState` submits order intents and records actual position, average fill price, P&L, and fill diagnostics |
+| Logic/Broker consistency | Classifies flat, pending, stale, mismatched, orphan, and direct-reversal states; recovery protects broker execution without rewriting Logic Events |
 | No intrabar brackets | Risk/Trim/Final levels are decision thresholds, not continuously resting stop/limit orders |
 | Bilingual | Panel, chart labels and error messages switch 中文 / English via the *Language* input; input labels are compile-time static, while alerts use structured dynamic messages |
 | Repaint-safe | Signals gated on confirmed bars; higher-timeframe data uses the last confirmed 1H bar; trade targets are frozen at entry |
@@ -54,16 +54,17 @@ flowchart TD
     RSETUP --> CONFIRM["Confirm on Z re-entry / candle / band"]
     SSETUP --> CONFIRM
     CONFIRM --> ENTRY["T-entry"]
-    ENTRY --> TRIM["T-trim - partial, stop moves to breakeven"]
-    TRIM --> CLOSE{"Full reversion?"}
+    ENTRY --> TRIM["Logic T-trim - Logic state changes immediately"]
+    TRIM --> BROKER["Broker strategy.close - qty_percent"]
+    BROKER --> CLOSE{"Full reversion?"}
     CLOSE -- "Yes" --> CLOSED["T-close"]
     CLOSE -- "No" --> EXITS["Exits: T-stop / Trend-fail / T-timeout / T-BE"]
 ```
 
 ### Lifecycle (per trade)
 
-`Observe` -> `T-buy / T-short` -> `T-trim` (real partial exit, moves the remaining stop to breakeven) -> `T-close` (remaining position, full reversion).
-Abnormal exits: `T-stop` (statistical or ATR risk line), `Trend-fail` (market turned trending), `T-timeout` (half-life exceeded), `T-BE` (breakeven after the first target).
+`Observe` -> `T-buy / T-short` -> Logic `T-trim` (immediate post-trim state and BE) -> Broker partial close -> Logic `T-close` (remaining position, full reversion).
+Abnormal exits: Logic `T-stop` (statistical or ATR risk line), `Trend-fail` (market turned trending), `T-timeout` (half-life exceeded), `T-BE` (breakeven after the first target).
 
 There is no session-end liquidation. Positions and pending mean-reversion setups may naturally remain active across trading dates.
 
@@ -89,7 +90,7 @@ There is no session-end liquidation. Positions and pending mean-reversion setups
 
 - **Market**: primarily A-share T+0 intraday (做T) on 15m. Re-validate **all** parameters before applying to another market or timeframe.
 - **Language**: set the *Language & Version -> Language* input to `zh` or `en`. This switches the panel, chart labels, and error messages. Input *labels* are bilingual-static — Pine pins their text to compile-time `const string`; alert messages use structured dynamic fields (see *Limitations*).
-- **Costs**: set `commissionBps` and `slippageTicks` to match the Strategy Tester **Properties** tab. The code defaults to `3.0 bp/side` commission and `0` ticks, which are also the defaults declared in `strategy()`; the inputs are used for the post-trim breakeven estimate.
+- **Costs**: set `commissionBps` and `slippageTicks` to match the Strategy Tester **Properties** tab. The code defaults to `3.0 bp/side` commission and `0` ticks, which are also the defaults declared in `strategy()`; `commissionBps` feeds the V2 Logic BE threshold and `slippageTicks` feeds Broker execution diagnostics.
 - **Alerts**: use `Any alert() function call` for setup/fill lifecycle messages, or `Order fills only` with `{{strategy.order.alert_message}}` for executable order events. The built-in strategy alert template also appends `{{strategy.order.price}}` as the actual fill price. Messages include `MR-T`, direction, event, mode, and price.
 
 ### Backtest workflow
@@ -212,19 +213,19 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 
 ## Cost model & Strategy Tester panel
 
-Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the post-trim breakeven estimate uses the same assumptions.
+Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the broker execution-cost diagnostic uses the same assumptions.
 
-After a real T-trim fill, the remaining stop is moved to `referenceEntryPrice +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock are lightweight auxiliary classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
+The V2 Logic State uses `logic.entryPrice = close` and `logic.cost = entryPrice * (2 * commissionBps) / 10000` for frozen targets, risk, and post-trim BE. `slippageTicks` is used only by the Broker execution-cost diagnostic; it never changes the V2 Logic BE threshold. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values. Range/Shock are lightweight Broker-side classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
 
-### v3.2.0 V2 Decision-Parity execution
+### v3.3.0 V2 Logic-State Parity execution
 
-The broker emulator uses confirmed-close market orders with `process_orders_on_close = true`. Entry, Trim, Final, Stop/BE, Trend Fail, and Timeout decisions are made only on a confirmed 15m close, and the corresponding market order fills on that same close. Custom `T-buy`, `T-short`, `T-trim`, and exit labels represent the MR-T decision event; native Strategy Tester order markers represent the Broker fill. `calc_on_order_fills = true` is used only to synchronize the real broker position, average price, and partial/full-fill lifecycle; a fill recalculation never creates another lifecycle decision.
+The V2 `MRLogicState` is the only source for `T-buy`, `T-short`, `T-trim`, `T-close`, Stop, Trend Fail, Timeout, and Breakeven. On a confirmed close, it mutates immediately and emits a Broker intent. `MRBrokerState` then submits `strategy.entry` or `strategy.close` and records the actual Strategy Tester position, average fill price, P&L, and fill bars. Native Strategy Tester order markers represent Broker execution; custom T labels represent Logic Events.
 
-The parity baseline sets `margin_long = 0` and `margin_short = 0`. This disables Broker Emulator margin liquidation so the strategy trajectory can reproduce the original MR-T indicator without Margin Call-driven position reductions. It is a V2 equivalence setting, not a recommendation for a live account's actual margin configuration. The chart levels remain confirmed-close decision thresholds, not intrabar stop/limit orders.
+`process_orders_on_close = true`, `calc_on_order_fills = true`, `calc_on_every_tick = false`, `pyramiding = 0`, and zero margin requirements preserve the same-close parity configuration. A Broker fill recalculation only synchronizes execution facts and never creates, reorders, or rewrites a Logic decision. Chart levels remain confirmed-close decision thresholds, not intrabar stop/limit orders.
 
-### Broker/fill-state consistency
+### Broker consistency and recovery
 
-`strategy.position_size` and `strategy.position_avg_price` are the broker emulator’s source of truth. `MRFillState` only stores the frozen signal context, lifecycle phase, exit reason, and auxiliary statistics. The script exposes a numeric consistency classifier in the Data Window:
+`strategy.position_size`, `strategy.position_avg_price`, `strategy.closedtrades`, and Strategy Tester P&L are Broker facts. `MRBrokerState` stores order intents, actual fills, recovery diagnostics, and auxiliary statistics; it does not own `partialTaken`, `entryBar`, `lastExitBar`, active stops, or any T-point lifecycle field. The script exposes a numeric consistency classifier in the Data Window:
 
 | Code | State | Meaning |
 |---:|---|---|
@@ -237,11 +238,11 @@ The parity baseline sets `margin_long = 0` and `margin_short = 0`. This disables
 | 7 | `DIRECT_REVERSAL` | The execution crossed from Long to Short or Short to Long |
 | 8 / 9 | `STALE_PENDING` / `INVALID_CONTEXT` | Pending or frozen context is no longer safe to manage |
 
-Stale context is cleared without incrementing Range/Shock Closed or Wins. An orphan or direct-reversal broker position cancels unfilled orders and is closed with `strategy.close_all()`; it is never initialized as a new trade from current mean/std values. Normal lifecycle management does not use `strategy.order`, `strategy.exit`, stop/limit prices, or OCA groups. Trade lines are shown only while a real broker position and a direction-matched active lifecycle both exist.
+Stale context is classified without changing the Logic State. An orphan or direct-reversal broker position cancels unfilled orders and is closed with `strategy.close_all()` as `BROKER RECOVERY`; recovery never creates a T label, changes `logic.lastExitBar`, or fabricates a Logic trade. Normal lifecycle management does not use `strategy.order`, `strategy.exit`, stop/limit prices, or OCA groups. Trade lines are shown from Logic levels while the Logic position is active.
 
-The lifecycle phases are: signal state → pending Entry → active pre-Trim → pending Trim fill → active post-Trim → pending Full Exit → flat. `entryDecisionBar`, `trimDecisionBar`, and `exitDecisionBar` are confirmed-close strategy anchors; `entryFillBar`, `trimFillBar`, and `fullExitFillBar` describe Broker Emulator executions. In the parity baseline, each decision bar equals its corresponding fill bar. `referenceEntryPrice` is the V2 decision-close price used by targets, risk thresholds, and BE; `brokerEntryPrice` is the actual `strategy.position_avg_price` used as the Broker fact. `partialTaken` becomes true only after `strategy.position_size` really shrinks, and the lifecycle resets only after it really reaches zero. `Consistency Recovery Count` should remain `0` for normal historical operation.
+The Logic phases are: Setup → active pre-Trim → active post-Trim → flat. `logic.entryBar`, `logic.trimDecisionBar`, and `logic.exitDecisionBar` are Logic decision anchors; `broker.entryFillBar`, `broker.trimFillBar`, and `broker.fullExitFillBar` record actual Broker fills. In the parity baseline, each decision bar should equal its corresponding fill bar. `logic.entryPrice` is the V2 decision-close price used by targets, risk thresholds, and BE; `broker.brokerEntryPrice` is the actual `strategy.position_avg_price`. `logic.partialTaken` becomes true on the confirmed Logic Trim decision, and `logic.pos`/`logic.lastExitBar` change on the Logic exit decision, before Broker fill synchronization. `Consistency Recovery Count` should remain `0` for normal historical operation.
 
-`f_manage()` returns one `int` action code for diagnostics (`MANAGE_NONE`, `MANAGE_STOP_BE`, `MANAGE_TREND`, `MANAGE_TIMEOUT`, `MANAGE_TRIM`, or `MANAGE_FINAL`). Lifecycle fields remain the source of truth for order submission.
+`f_logicManage()` returns one `int` action code for diagnostics (`MANAGE_NONE`, `MANAGE_STOP_BE`, `MANAGE_TREND`, `MANAGE_TIMEOUT`, `MANAGE_TRIM`, or `MANAGE_FINAL`). Logic lifecycle fields remain the source of truth for Broker order submission.
 
 Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Shock Move Candidates`, `Shock Environment Pass`, `Shock Deceleration Pass`, `Shock Rejection Pass`, `Shock Setups`, and `Shock Confirmed Entries`. Each pass includes the preceding layers and is counted during confirmed-close Entry eligibility, so the largest drop identifies the main filter.
 
@@ -250,34 +251,34 @@ Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Sho
 ## Repaint safety
 
 - Setup, Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final decisions are gated on the normal confirmed-bar decision phase. One bar can create at most one lifecycle decision.
-- `calc_on_order_fills` executions are reserved for synchronizing actual Entry/Trim/Exit state. Historical fill executions can still have `barstate.isconfirmed = true`, so a detected broker-position change suppresses decisions on that execution.
+- `calc_on_order_fills` executions are reserved for synchronizing actual Entry/Trim/Exit state. Historical fill executions can still have `barstate.isconfirmed = true`, so a detected broker-position change suppresses the Logic decision phase on that execution.
 - Higher-timeframe values are the **last confirmed 1H bar** (`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`) - no future leak.
-- The confirmed signal bar queues a same-close market order; the V2 decision thresholds are frozen from `referenceEntryPrice = close` and the signal-bar regime context, while `brokerEntryPrice = strategy.position_avg_price` records the actual Tester fill.
+- The confirmed signal bar mutates Logic immediately and queues a same-close market order; V2 thresholds are frozen from `logic.entryPrice = close` and the signal-bar regime context, while `broker.brokerEntryPrice = strategy.position_avg_price` records the actual Tester fill.
 - The half-life estimate uses only past data.
 
-The confirmed Entry signal bar is stored as `entryDecisionBar`; the same-close Broker Emulator fill is stored as `entryFillBar`. Entry-fill recalculation only synchronizes the real price, size, and frozen context; the Entry decision bar itself cannot also be managed because management requires `bar_index > entryDecisionBar`. The next confirmed close is the first management opportunity. A Trim signal stores `trimDecisionBar`; its same-close reduction is stored as `trimFillBar`. Trim-fill recalculation only synchronizes the reduced broker position; the next confirmed close may perform BE/Final management because `bar_index > trimDecisionBar`. A full-exit decision stores `exitDecisionBar`, and `fullExitFillBar` records the same-close flat transition; `lastExitBar` uses that actual bar for cooldown.
+The confirmed Entry decision stores `logic.entryBar`; the same-close Broker Emulator fill is stored as `broker.entryFillBar`. Entry-fill recalculation only synchronizes the real price and size; the next confirmed close is the first management opportunity because Logic management requires `bar_index > logic.entryBar`. A Logic Trim decision immediately sets `logic.partialTaken`; its same-close real reduction is stored as `broker.trimFillBar`. A full-exit decision immediately sets `logic.pos = 0` and `logic.lastExitBar`; `broker.fullExitFillBar` records the later or same-close flat transition. Logic cooldown uses `logic.lastExitBar`, never Broker flatness.
 
-### v3.2.0 TradingView validation checklist
+### v3.3.0 TradingView validation checklist
 
 After compiling in TradingView on a 15-minute chart:
 
 1. Pine v6 compiles successfully on a 15m chart.
 2. `MR-L` / `MR-S` fills on the same confirmed signal close; `Entry Decision Bar = Entry Fill Bar`.
-3. Entry fill execution only synchronizes state; the Entry decision bar does not trigger Trim, Stop, Trend Fail, or Timeout, and the next confirmed close is the first management bar.
+3. Entry fill execution only synchronizes Broker state; the Entry Logic decision bar does not trigger Trim, Stop, Trend Fail, or Timeout, and the next confirmed close is the first management bar.
 4. Trim triggers only when the confirmed close reaches the frozen Trim level.
 5. The real broker position is reduced by `trimPct` (default 50%).
-6. Trim fill execution only synchronizes state; the Trim decision bar does not trigger BE or Final, and the next confirmed close is eligible for them.
+6. Trim decision immediately sets `Logic Partial Taken = 1`; Trim fill execution only synchronizes Broker state. The Trim decision bar does not trigger BE or Final, and the next confirmed close is eligible for them.
 7. Stop triggers only when the confirmed close crosses the displayed Risk level.
 8. Trend Fail is evaluated only at a confirmed close.
 9. Timeout is evaluated only at a confirmed close.
 10. Long and Short behavior is mirrored, and positions can cross trading dates.
-11. Broker Position and FillState direction remain consistent through every fill.
-12. `Exit Decision Bar = Full Exit Fill Bar`, and `lastExitBar` is that same bar.
-13. `Reference Entry Price` is the decision close and `Broker Entry Price` is `strategy.position_avg_price`.
+11. Broker Position and `MRBrokerState` fill diagnostics remain consistent through every fill; Logic position remains the lifecycle source.
+12. `Logic Exit Decision Bar` and `Logic Last Exit Bar` are set before Broker flattening; `Broker Full Exit Fill Bar` records the actual flat transition.
+13. `Logic Entry Price` is the decision close and `Broker Entry Price` is `strategy.position_avg_price`.
 14. `Margin Call` does not occur under the parity settings, and `Consistency Recovery Count` remains `0` on normal historical paths.
 15. At a final flat state, Range + Shock Entries equals Range + Shock Closed (apart from a genuinely pending order).
 16. No normal order list contains `MR-L/MR-S-STOP`, `-TRIM`, or `-FINAL` bracket IDs.
-17. Entry/Trim fill executions never make lifecycle decisions, and one confirmed close never emits more than one lifecycle action. Bar Magnifier OFF/ON should not materially alter lifecycle decisions.
+17. Entry/Trim fill executions never make Logic decisions, one confirmed close never emits more than one Logic lifecycle action, and Logic Event fields persist through same-bar fill recalculation. Bar Magnifier OFF/ON should not materially alter Logic lifecycle decisions.
 
 The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 
@@ -285,7 +286,7 @@ The source-level static review and `git diff --check` do not replace TradingView
 
 - **Hard-coded 15m contract.** The script refuses to run on other timeframes. This is deliberate (window lengths are in bars and were tuned on 15m); rescaling to other timeframes requires re-tuning.
 - **Input labels are bilingual-static.** Pine input titles are compile-time `const string`; a runtime language toggle cannot localize them. The panel, chart labels and error messages follow the `lang` input. Strategy order messages are dynamic and the default alert template includes the actual fill-price placeholder.
-- **Costs have two settings surfaces.** Pine requires the Strategy Tester commission/slippage defaults in `strategy()` to be compile-time values. The `commissionBps` and `slippageTicks` inputs keep BE calculations aligned, but changing them does not rewrite the Properties tab automatically.
+- **Costs have two settings surfaces.** Pine requires the Strategy Tester commission/slippage defaults in `strategy()` to be compile-time values. `commissionBps` feeds V2 Logic cost/BE and `slippageTicks` feeds Broker execution-cost diagnostics; changing either input does not rewrite the Properties tab automatically.
 - **A-shares T+0 bias.** The engine assumes intraday reversion against a held position. Applying it to trending crypto/forex without re-tuning will disappoint.
 - **Not financial advice.** No performance guarantees, express or implied.
 
@@ -293,7 +294,7 @@ The source-level static review and `git diff --check` do not replace TradingView
 
 ## Contributing
 
-Issues and PRs welcome. Keep changes backward-compatible, keep confirmed-bar state in `MRState` and fill lifecycle state in `MRFillState`, and bump `CHANGELOG.md` + `SCRIPT_VERSION` with each behavioral change.
+Issues and PRs welcome. Keep V2 decision fields in `MRLogicState`, execution facts in `MRBrokerState`, and bump `CHANGELOG.md` + `SCRIPT_VERSION` with each behavioral change.
 
 ## License
 

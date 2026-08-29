@@ -2,11 +2,11 @@
 
 English · [简体中文](README.zh-CN.md)
 
-一个运行于 TradingView 的生产级 **V2 Decision-Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.2.0 的全部生命周期决策都来自已确认的 **15 分钟收盘**,随后由 Strategy Tester 在同一根 K 线收盘执行真实市场订单。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
+一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.0 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.2.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.0-informational)](CHANGELOG.md)
 
 ---
 
@@ -29,10 +29,10 @@ English · [简体中文](README.zh-CN.md)
 | 半衰期计时 | OU 过程半衰期估计回归应耗时多久;无法估计时退化为固定值 |
 | Strategy Tester | 真实 `strategy.entry` 与 `strategy.close` 市场订单;正式 P&L 与仓位来自 Strategy Tester |
 | 真实分批退出 | `trimPct` 控制 T减比例(默认 50%);T平退出剩余仓位 |
-| 成本感知保本 | Strategy Tester 手续费/滑点是正式成本来源;匹配输入用于计算 T减后的保本位 |
-| V2 Decision-Parity 生命周期 | Entry、Stop/BE、Trend Fail、Timeout、Trim、Final 都只在 confirmed 15m close 决策,并使用同收盘市场成交 |
-| Broker 成交状态 | 专用 `varip` fill state 在 `calc_on_order_fills` execution 间同步真实仓位变化,不产生新决策 |
-| Broker / FillState 一致性 | 分类空仓、等待成交、stale、方向冲突、孤儿仓位与直接反向;无效上下文会清理或安全平仓 |
+| 成本感知保本 | V2 Logic BE 使用 `commissionBps` 成本;`slippageTicks` 只用于 Broker 执行成本诊断 |
+| V2 Logic-State Parity 生命周期 | `MRLogicState` 单独决定 Entry、Stop/BE、Trend Fail、Timeout、Trim、Final |
+| Broker 执行状态 | `MRBrokerState` 提交 Broker intent,记录真实仓位、成交价、P&L 与 fill diagnostics |
+| Logic / Broker 一致性 | 分类空仓、等待成交、stale、方向冲突、孤儿仓位与直接反向;Recovery 只保护 Broker,不重写 Logic Event |
 | 无盘中 bracket | Risk/T减/T平 水平只是收盘决策阈值,不是持续挂出的 stop/limit 订单 |
 | 中英双语 | 面板 / 图表标签 / 报错随 *语言* 输入切换;输入项标签是编译期静态文本,策略警报使用结构化动态消息 |
 | 防重绘 | 信号门控于已确认 K 线;高周期数据取上一根已确认的 1H bar;目标价进场时冻结 |
@@ -54,16 +54,17 @@ flowchart TD
     RSETUP --> CONFIRM["Z 回归确认 / K线 / 区间确认"]
     SSETUP --> CONFIRM
     CONFIRM --> ENTRY["T买 / T空"]
-    ENTRY --> TRIM["T减 - 部分了结,止损移到保本"]
-    TRIM --> CLOSE{"完全回归?"}
+    ENTRY --> TRIM["Logic T减 - Logic 状态当场切换"]
+    TRIM --> BROKER["Broker strategy.close - qty_percent"]
+    BROKER --> CLOSE{"完全回归?"}
     CLOSE -- "是" --> CLOSED["T平"]
     CLOSE -- "否" --> EXITS["异常退出: T止损 / 趋势失效 / T超时 / T保本"]
 ```
 
 ### 生命周期(每笔)
 
-`观察` → `T买 / T空` → `T减`(真实部分退出,剩余止损上移保本)→ `T平`(退出剩余仓位,完全回归)。
-异常退出:`T止损`(统计或 ATR 风险线)、`趋势失效`(市场转为趋势)、`T超时`(超过半衰期)、`T保本`(首目标后触发)。
+`观察` → `T买 / T空` → Logic `T减`(Logic 状态当场进入 post-trim/BE)→ Broker 真实部分退出 → Logic `T平`(退出剩余仓位,完全回归)。
+异常退出:Logic `T止损`(统计或 ATR 风险线)、`趋势失效`(市场转为趋势)、`T超时`(超过半衰期)、`T保本`(首目标后触发)。
 
 策略没有日终强制清仓。持仓与等待均值回归的 Setup 可以自然跨越交易日。
 
@@ -89,7 +90,7 @@ flowchart TD
 
 - **市场**:主要用于 A 股 T+0 日内做T,15 分钟周期。换品种 / 周期前必须**重新评估全部参数**。
 - **语言**:将 *⑫ 语言与版本 → 语言* 设为 `zh` 或 `en`,切换面板、图表标签与报错。输入项*标签*为双语静态文本(Pine 限制),策略警报使用结构化动态文本(见 *局限*)。
-- **成本**:将 `commissionBps` 与 `slippageTicks` 设为和 Strategy Tester **Properties** 一致。代码默认每边手续费 `3.0 bp`、滑点 `0` tick,`strategy()` 中的默认值也相同;输入用于 T减后的保本估算。
+- **成本**:将 `commissionBps` 与 `slippageTicks` 设为和 Strategy Tester **Properties** 一致。代码默认每边手续费 `3.0 bp`、滑点 `0` tick,`strategy()` 中的默认值也相同;`commissionBps` 进入 V2 Logic BE,`slippageTicks` 只进入 Broker 执行成本诊断。
 - **警报**:使用 `Any alert() function call` 接收观察/成交生命周期消息,或使用 `Order fills only` 配合 `{{strategy.order.alert_message}}` 接收可执行订单事件。消息包含 `MR-T`、方向、事件、模式与价格。
 
 ### 回测流程
@@ -212,19 +213,19 @@ flowchart TD
 
 ## 成本模型与 Strategy Tester 面板
 
-Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 T减后的保本估算使用相同假设。
+Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 Broker 执行成本诊断使用相同假设。
 
-启用 `moveStopToBE` 后,真实 T减成交后剩余仓位的止损移动到 `referenceEntryPrice +/- transaction cost`。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值,不再使用旧的虚拟 P&L 计数器。Range/Shock 是轻量辅助分类,面板分别显示进场 / 已平 / 盈利数量,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
+V2 Logic State 使用 `logic.entryPrice = close` 与 `logic.cost = entryPrice * (2 * commissionBps) / 10000` 冻结目标、风险和 T减后的 BE。`slippageTicks` 只用于 Broker 执行成本诊断,不进入 V2 Logic BE 阈值。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值。Range/Shock 是轻量 Broker 辅助分类,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
 
-### v3.2.0 V2 Decision-Parity 执行模型
+### v3.3.0 V2 Logic-State Parity 执行模型
 
-Broker Emulator 使用 confirmed-close 市场订单,并设置 `process_orders_on_close = true`。Entry、T减、T平、Stop/BE、Trend Fail 与 Timeout 只在 confirmed 15m close 决策,对应市场订单也在该收盘成交。主图自定义 `T买`、`T空`、`T减` 与退出标签表示 MR-T decision event,TradingView 原生 Strategy Tester 标记表示 Broker fill。`calc_on_order_fills = true` 只用于同步真实 broker 仓位、成交均价与部分/全部成交生命周期;成交 recalculation 不产生新的生命周期决策。
+V2 `MRLogicState` 是 `T买`、`T空`、`T减`、`T平`、Stop、Trend Fail、Timeout 与 BE 的唯一来源。每个 confirmed close 立即更新 Logic 并产生 Broker intent;`MRBrokerState` 再提交 `strategy.entry` 或 `strategy.close`,记录真实仓位、成交均价、P&L 与 fill bar。主图 T 标签表示 Logic Event,TradingView 原生标记表示 Broker fill。
 
-Parity 基线设置 `margin_long = 0`、`margin_short = 0`,关闭 Broker Emulator 的保证金强制清算,从而复现原 MR-T indicator 不受 Margin Call 导致的仓位缩减影响的决策轨迹。这是 V2 等价性设置,不代表真实交易账户应采用的保证金配置。图表水平仍然只是 confirmed-close 决策阈值,不是盘中 stop/limit 挂单。
+`process_orders_on_close = true`、`calc_on_order_fills = true`、`calc_on_every_tick = false`、`pyramiding = 0` 与零保证金要求保持 same-close parity。Broker fill recalculation 只同步执行事实,不会创建、重排或重写 Logic decision。图表水平仍然只是 confirmed-close 决策阈值,不是盘中 stop/limit 挂单。
 
-### Broker / FillState 一致性
+### Broker 一致性与 Recovery
 
-`strategy.position_size` 与 `strategy.position_avg_price` 是 Broker Emulator 的最终事实来源。`MRFillState` 只保存冻结的信号上下文、生命周期阶段、退出原因与辅助统计。Data Window 暴露以下数值一致性分类器:
+`strategy.position_size`、`strategy.position_avg_price`、`strategy.closedtrades` 与 Strategy Tester P&L 都是 Broker 事实。`MRBrokerState` 保存 order intent、实际 fill、Recovery 诊断和辅助统计,不保存 `partialTaken`、`entryBar`、`lastExitBar`、active stop 或任何 T 点生命周期字段。Data Window 暴露以下数值一致性分类器:
 
 | 编码 | 状态 | 含义 |
 |---:|---|---|
@@ -237,11 +238,11 @@ Parity 基线设置 `margin_long = 0`、`margin_short = 0`,关闭 Broker Emulato
 | 7 | `DIRECT_REVERSAL` | 本次 execution 从 Long 直接变为 Short,或反向 |
 | 8 / 9 | `STALE_PENDING` / `INVALID_CONTEXT` | pending 或冻结上下文已不安全,不能继续管理 |
 
-Stale 上下文会被清除,不会增加 Range/Shock 的 Closed 或 Wins。孤儿仓位与直接反向会取消未成交订单,再用 `strategy.close_all()` 安全收口;绝不会用当前 mean/std 伪造为新交易。正常生命周期不使用 `strategy.order`、`strategy.exit`、stop/limit 价格单或 OCA 组。只有真实 Broker 仓位存在、active lifecycle 有效且方向一致时才绘制交易线。
+Stale 上下文只被分类,不会改变 Logic State。孤儿仓位与直接反向会取消未成交订单,再用 `strategy.close_all()` 以 `BROKER RECOVERY` 安全收口;Recovery 不生成 T 标签、不修改 `logic.lastExitBar`、不伪造 Logic trade。正常生命周期不使用 `strategy.order`、`strategy.exit`、stop/limit 价格单或 OCA 组。交易线使用 Logic levels。
 
-生命周期阶段明确区分为:Signal → Pending Entry → Active pre-trim → Pending Trim fill → Active post-trim → Pending Full Exit → Flat。`entryDecisionBar`、`trimDecisionBar` 与 `exitDecisionBar` 是 confirmed-close 策略时间锚点;`entryFillBar`、`trimFillBar` 与 `fullExitFillBar` 记录 Broker Emulator 的实际成交 bar。Parity 基线下每个 decision bar 都应等于对应 fill bar。`referenceEntryPrice` 是 V2 决策收盘价,用于目标、风险阈值与 BE;`brokerEntryPrice` 是实际 `strategy.position_avg_price`,作为 Broker 事实。只有 `strategy.position_size` 真实减少后才设置 `partialTaken`,只有真实归零后才 reset。正常历史运行的 `Consistency Recovery Count` 应为 `0`。
+Logic 阶段为:Setup → active pre-Trim → active post-Trim → flat。`logic.entryBar`、`logic.trimDecisionBar`、`logic.exitDecisionBar` 是 Logic decision anchor;`broker.entryFillBar`、`broker.trimFillBar`、`broker.fullExitFillBar` 记录真实 Broker fill。Parity 基线下两类 bar 应一致。`logic.entryPrice` 是 V2 决策收盘价,`broker.brokerEntryPrice` 是实际 `strategy.position_avg_price`。`logic.partialTaken` 在 Logic T减 decision 当场变为 true;`logic.pos` 与 `logic.lastExitBar` 在 Logic exit decision 当场更新,不等待 Broker fill。正常历史运行的 `Consistency Recovery Count` 应为 `0`。
 
-`f_manage()` 为诊断统一返回一个 `int` 动作编码(`MANAGE_NONE`、`MANAGE_STOP_BE`、`MANAGE_TREND`、`MANAGE_TIMEOUT`、`MANAGE_TRIM` 或 `MANAGE_FINAL`);订单提交仍以生命周期字段为唯一事实来源。
+`f_logicManage()` 为诊断统一返回一个 `int` 动作编码(`MANAGE_NONE`、`MANAGE_STOP_BE`、`MANAGE_TREND`、`MANAGE_TIMEOUT`、`MANAGE_TRIM` 或 `MANAGE_FINAL`);Broker intent 仍以 Logic lifecycle 字段为唯一事实来源。
 
 Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Candidates`、`Shock Environment Pass`、`Shock Deceleration Pass`、`Shock Rejection Pass`、`Shock Setups`、`Shock Confirmed Entries`。每一层都包含前置条件,并只在 confirmed-close Entry eligibility 阶段计数,最大跌落层就是主要过滤来源。
 
@@ -250,34 +251,34 @@ Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Cand
 ## 防重绘
 
 - Setup、Entry、Stop/BE、Trend Fail、Timeout、T减与T平决策只允许在正常的 confirmed-bar 决策阶段运行;每根 bar 最多产生一个生命周期决策。
-- `calc_on_order_fills` execution 只同步真实 Entry/T减/T平状态。历史成交重算中 `barstate.isconfirmed` 仍可能为 `true`,所以检测到 Broker 仓位变化时会抑制该 execution 的决策。
+- `calc_on_order_fills` execution 只同步真实 Entry/T减/T平 Broker 状态。历史成交重算中 `barstate.isconfirmed` 仍可能为 `true`,所以检测到 Broker 仓位变化时会抑制该 execution 的 Logic decision 阶段。
 - 高周期数据取**上一根已确认的 1H bar**(`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`)——无未来数据泄漏。
-- 已确认信号 bar 先排队同收盘市场订单;V2 决策阈值以 `referenceEntryPrice = close` 与信号 bar 环境上下文冻结,`brokerEntryPrice = strategy.position_avg_price` 记录真实 Tester 成交价。
+- 已确认信号 bar 先更新 Logic 再排队同收盘市场订单;V2 决策阈值以 `logic.entryPrice = close` 与信号 bar 环境上下文冻结,`broker.brokerEntryPrice = strategy.position_avg_price` 记录真实 Tester 成交价。
 - 半衰期估计只用历史数据。
 
-confirmed Entry signal bar 保存为 `entryDecisionBar`,同收盘 Broker Emulator 成交 bar 保存为 `entryFillBar`。Entry fill execution 只同步真实成交价、仓位与冻结上下文;Entry decision bar 本身因管理要求 `bar_index > entryDecisionBar` 不会再次管理,下一根 confirmed close 才是第一次管理。T减 signal 保存 `trimDecisionBar`,同收盘真实减仓 bar 保存为 `trimFillBar`;Trim fill execution 只同步真实仓位减少,下一根 confirmed close 因 `bar_index > trimDecisionBar` 才可判断 BE/T平。完整退出 decision 保存 `exitDecisionBar`,同收盘归零 bar 保存为 `fullExitFillBar`,`lastExitBar` 直接使用该退出 bar。
+confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator 成交 bar 保存为 `broker.entryFillBar`。Entry fill execution 只同步真实成交价和仓位;下一根 confirmed close 因 Logic 管理要求 `bar_index > logic.entryBar` 才是第一次管理。Logic T减 decision 当场设置 `logic.partialTaken`,同收盘真实减仓 bar 保存为 `broker.trimFillBar`。完整退出 decision 当场设置 `logic.pos = 0` 与 `logic.lastExitBar`;`broker.fullExitFillBar` 记录真实归零 bar。Cooldown 只使用 Logic lastExitBar。
 
-### v3.2.0 TradingView 验收清单
+### v3.3.0 TradingView 验收清单
 
 在 15 分钟图于 TradingView 编译后:
 
 1. Pine v6 在 15m 图编译成功。
 2. `MR-L` / `MR-S` 在 confirmed signal 同一收盘成交;`Entry Decision Bar = Entry Fill Bar`。
-3. Entry fill execution 只同步状态;Entry decision bar 不触发 T减、Stop、Trend Fail 或 Timeout,下一根 confirmed close 才是第一次管理。
+3. Entry fill execution 只同步 Broker 状态;Entry Logic decision bar 不触发 T减、Stop、Trend Fail 或 Timeout,下一根 confirmed close 才是第一次管理。
 4. T减只在 confirmed close 达到冻结的 T减水平时触发。
 5. 真实 Broker 仓位按 `trimPct` 减少(默认 50%)。
-6. Trim fill execution 只同步状态;Trim decision bar 不触发 BE 或 T平,下一根 confirmed close 才可判断。
+6. Trim decision 当场设置 `Logic Partial Taken = 1`;Trim fill execution 只同步 Broker 状态。Trim decision bar 不触发 BE 或 T平,下一根 confirmed close 才可判断。
 7. Stop 只在 confirmed close 穿越图表 Risk 时触发。
 8. Trend Fail 只在 confirmed close 判断。
 9. Timeout 只在 confirmed close 判断。
 10. Long / Short 完全镜像,持仓可自然跨交易日。
-11. Broker Position 与 FillState 方向在每次成交后保持一致。
-12. `Exit Decision Bar = Full Exit Fill Bar`,且 `lastExitBar` 为同一根 bar。
-13. `Reference Entry Price` 是决策收盘价,`Broker Entry Price` 是 `strategy.position_avg_price`。
+11. Broker Position 与 `MRBrokerState` fill diagnostics 在每次成交后保持一致;Logic position 仍是生命周期事实来源。
+12. `Logic Exit Decision Bar` 与 `Logic Last Exit Bar` 在 Broker 平仓前设置;`Broker Full Exit Fill Bar` 记录真实归零 bar。
+13. `Logic Entry Price` 是决策收盘价,`Broker Entry Price` 是 `strategy.position_avg_price`。
 14. Parity 设置下不出现 `Margin Call`,正常历史路径的 `Consistency Recovery Count` 为 `0`。
 15. 最终 Flat 且无 pending order 时,Range + Shock Entries 等于 Range + Shock Closed。
 16. 正常订单列表没有 `MR-L/MR-S-STOP`、`-TRIM`、`-FINAL` bracket ID。
-17. Entry/Trim fill execution 不产生生命周期决策,且一次 confirmed close 最多产生一个生命周期动作;Bar Magnifier 开关不应实质改变生命周期决策。
+17. Entry/Trim fill execution 不产生 Logic decision;一次 confirmed close 最多产生一个 Logic lifecycle action;Logic Event 字段跨 same-bar fill recalculation 保持稳定。Bar Magnifier 开关不应实质改变 Logic lifecycle decision。
 
 源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 
@@ -285,7 +286,7 @@ confirmed Entry signal bar 保存为 `entryDecisionBar`,同收盘 Broker Emulato
 
 - **硬编码 15 分钟契约。** 脚本拒绝在其它周期运行。这是刻意的(窗口长度以 K 数计,且是在 15m 上调出来的);换周期必须重新调参。
 - **输入项标签为双语静态文本。** Pine 的 input 标题要求编译期 `const string`,运行时语言开关无法本地化。面板、图表标签与报错随 `lang` 输入切换;策略成交消息动态包含真实成交占位符。
-- **成本有两个设置界面。** Pine 要求 `strategy()` 中的 Strategy Tester 手续费 / 滑点默认值为编译期常量。`commissionBps` 与 `slippageTicks` 用于保持 BE 计算一致,但修改输入不会自动改写 Properties。
+- **成本有两个设置界面。** Pine 要求 `strategy()` 中的 Strategy Tester 手续费 / 滑点默认值为编译期常量。`commissionBps` 进入 V2 Logic cost/BE,`slippageTicks` 只进入 Broker 执行成本诊断;修改输入不会自动改写 Properties。
 - **A 股 T+0 偏好。** 引擎假设针对持有仓位做日内回归。不做重调参就套到趋势性强的加密 / 外汇上,会很失望。
 - **不构成投资建议。** 不做任何明示或暗示的业绩承诺。
 
@@ -293,7 +294,7 @@ confirmed Entry signal bar 保存为 `entryDecisionBar`,同收盘 Broker Emulato
 
 ## 贡献
 
-欢迎 issue 与 PR。请保持向后兼容,将 confirmed-bar 状态放在 `MRState`,将成交生命周期状态放在 `MRFillState`,每次行为变更都同步更新 `CHANGELOG.md` 与 `SCRIPT_VERSION`。
+欢迎 issue 与 PR。请保持向后兼容,将 V2 decision fields 放在 `MRLogicState`,将执行事实放在 `MRBrokerState`,每次行为变更都同步更新 `CHANGELOG.md` 与 `SCRIPT_VERSION`。
 
 ## 许可证
 
