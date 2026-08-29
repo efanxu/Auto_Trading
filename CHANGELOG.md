@@ -2,6 +2,13 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.3.0] — Standalone V4 Execution Accounting
+
+- Reworked `MRT_V4.pine` around `MRV4ExecutionState`, the sole source of V4 entry price, trade return, compounded Net, Profit Factor, Win Rate, and PREPLAN usage.
+- Kept the V3 confirmed-close Logic event clock, previous-bar PREPLAN assist, and Strategy Tester Broker order path unchanged.
+- Removed the separate comparison ledger, comparison fields, and four one-bar Chart Data export series; result output now uses `V4_RESULT` alerts and the existing 21-row Panel.
+- Extended `tests/MRT-v4-execution-plan-harness.ps1` for standalone V4 selection, accounting, presentation, alert, and regression checks.
+
 ## [4.2.1] — Shadow observability / export
 
 - Surfaced Shadow trade/reference metrics in the existing panel.
