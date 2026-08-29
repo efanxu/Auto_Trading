@@ -3,12 +3,13 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-strategy("MR-T Strategy v4.1.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
+strategy("MR-T Strategy v4.2.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v4.1.0
+// Mean Reversion T (MR-T) · Strategy v4.2.0
 // V3.3.2 = confirmed-close Logic reference (MRT.pine).
 // V4.1.0 = V3-aligned Logic + previous-confirmed-bar execution assist.
+// V4.2.0 = V4.1.0 + independent Shadow Execution Accounting.
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -19,12 +20,15 @@ strategy("MR-T Strategy v4.1.0", shorttitle = "MR-T v4", overlay = true, pyramid
 // 生命周期 / Lifecycle    观察 → T买/T空 → T减 → T平
 // 执行辅助 / Execution    confirmed source bar → next-bar PREPLAN alert
 // 架构 / Architecture     MRLogicState → MRExecutionAssistState → MRBrokerState
+//                            ↘ MRShadowExecutionState (independent ledger)
 //
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
 // confirmed-close Logic 决策继续与 V3 对齐;PREPLAN 只输出实盘执行辅助 alert;
+// Shadow 只记账 PREPLAN 入场价格改善,不改变 Logic 或 Strategy Tester 订单路径。
 // 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v4.1.0 —— V3-Aligned Execution Assist。变更见 CHANGELOG.md。
+// 版本 / Version: v4.2.0 —— V3-Aligned Logic + Previous-Bar PREPLAN + Shadow Execution Accounting。
+// 变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -42,7 +46,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "4.1.0"
+string SCRIPT_VERSION = "4.2.0"
 
 
 // ============================================================================
@@ -567,6 +571,64 @@ type MRBrokerState
 
 var MRBrokerState broker = MRBrokerState.new()
 
+// MRShadowExecutionState is an independent, normalized-capital accounting
+// ledger. It reads confirmed Logic events and the current-bar PREPLAN snapshot,
+// but it never writes Logic, Broker, or Strategy Tester state.
+type MRShadowExecutionState
+    varip bool   active = false
+    varip int    dir = 0
+    varip int    mode = 0
+    varip int    entryBar = na
+
+    varip float  logicEntryPrice = na
+    varip float  shadowEntryPrice = na
+    varip bool   entryFromPreplan = false
+    varip int    preplanSourceBar = na
+    varip int    preplanValidBar = na
+    varip float  preplanTrigger = na
+    varip float  preplanLimit = na
+    varip float  preplanTP1 = na
+    varip float  preplanTP2 = na
+    varip float  preplanStop = na
+    varip bool   preplanTriggerTouched = false
+
+    varip bool   trimTaken = false
+    varip int    trimBar = na
+    varip float  trimPrice = na
+    varip float  trimFraction = na
+
+    varip int    exitBar = na
+    varip float  exitPrice = na
+    varip int    exitReason = 0
+
+    varip float  lastEntryImprovementPct = na
+    varip float  lastTradeReturnPct = na
+    varip float  lastReferenceReturnPct = na
+    varip float  lastDeltaPct = na
+
+    varip int    lastDir = 0
+    varip int    lastMode = 0
+    varip int    lastEntryBar = na
+    varip int    lastExitBar = na
+    varip float  lastLogicEntryPrice = na
+    varip float  lastShadowEntryPrice = na
+    varip float  lastTrimPrice = na
+    varip float  lastExitPrice = na
+    varip int    lastExitReason = 0
+
+    varip float  shadowEquityIndex = 1.0
+    varip float  referenceEquityIndex = 1.0
+    varip float  shadowGrossProfit = 0.0
+    varip float  shadowGrossLoss = 0.0
+    varip float  referenceGrossProfit = 0.0
+    varip float  referenceGrossLoss = 0.0
+    varip int    shadowTrades = 0
+    varip int    shadowWins = 0
+    varip int    shadowPreplanEntries = 0
+    varip int    confirmedEntries = 0
+
+var MRShadowExecutionState shadow = MRShadowExecutionState.new()
+
 // Setup and Logic events use rollback-safe snapshots for chart labels/alerts.
 varip int logicSetupEventBar = na
 varip int logicSetupEventDir = 0
@@ -672,6 +734,205 @@ f_preplanMessage(string eventName, int dir, int mode, int sourceBar, int validBa
       "|tp2_provisional=" + f_price(tp2) +
       "|stop_provisional=" + f_price(stop) +
       suffix
+
+// --------------------------------------------------------------------------
+// V4 Shadow Execution Accounting
+// --------------------------------------------------------------------------
+// This ledger intentionally uses normalized initial capital (1.0). It is not
+// Strategy Tester net profit and it never creates an order. The PREPLAN fill
+// rule below is a Historical Stop-Limit Fill Approximation: a touched
+// previous-bar Stop-Limit is assumed filled at its already published limit.
+// It is not TradingView tick-level real-fill proof; live trading remains
+// subject to the exchange's actual fill.
+f_pct(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.#####")
+
+f_shadowEntryImprovement(int dir, float logicPrice, float shadowPrice) =>
+    logicPrice != 0.0 ? (dir == 1 ? (logicPrice - shadowPrice) / logicPrice : (shadowPrice - logicPrice) / logicPrice) * 100.0 : na
+
+// Commission is charged once on entry and on each confirmed-close exit leg.
+// No additional Shadow slippage or intrabar exit price is introduced here.
+f_shadowTradeReturn(int dir, float entryPrice, bool didTrim, float trimPrice, float trimFraction, float exitPrice) =>
+    float c = commissionBps / 10000.0
+    if didTrim
+        float remainderFraction = 1.0 - trimFraction
+        float grossTrim = trimFraction * dir * (trimPrice - entryPrice) / entryPrice
+        float grossRemainder = remainderFraction * dir * (exitPrice - entryPrice) / entryPrice
+        float entryFee = c
+        float trimExitFee = trimFraction * c * trimPrice / entryPrice
+        float finalExitFee = remainderFraction * c * exitPrice / entryPrice
+        grossTrim + grossRemainder - entryFee - trimExitFee - finalExitFee
+    else
+        float grossReturn = dir * (exitPrice - entryPrice) / entryPrice
+        float entryFee = c
+        float exitFee = c * exitPrice / entryPrice
+        grossReturn - entryFee - exitFee
+
+f_shadowNetPct(MRShadowExecutionState this) =>
+    (this.shadowEquityIndex - 1.0) * 100.0
+
+f_referenceNetPct(MRShadowExecutionState this) =>
+    (this.referenceEquityIndex - 1.0) * 100.0
+
+f_shadowVsReferencePct(MRShadowExecutionState this) =>
+    f_shadowNetPct(this) - f_referenceNetPct(this)
+
+f_shadowProfitFactor(MRShadowExecutionState this) =>
+    this.shadowGrossLoss > 0.0 ? this.shadowGrossProfit / this.shadowGrossLoss : na
+
+f_referenceProfitFactor(MRShadowExecutionState this) =>
+    this.referenceGrossLoss > 0.0 ? this.referenceGrossProfit / this.referenceGrossLoss : na
+
+f_shadowUsagePct(MRShadowExecutionState this) =>
+    this.confirmedEntries > 0 ? this.shadowPreplanEntries / this.confirmedEntries * 100.0 : na
+
+f_shadowWinRate(MRShadowExecutionState this) =>
+    this.shadowTrades > 0 ? this.shadowWins / this.shadowTrades * 100.0 : na
+
+method resetTrade(MRShadowExecutionState this) =>
+    this.active := false
+    this.dir := 0
+    this.mode := 0
+    this.entryBar := na
+    this.logicEntryPrice := na
+    this.shadowEntryPrice := na
+    this.entryFromPreplan := false
+    this.preplanSourceBar := na
+    this.preplanValidBar := na
+    this.preplanTrigger := na
+    this.preplanLimit := na
+    this.preplanTP1 := na
+    this.preplanTP2 := na
+    this.preplanStop := na
+    this.preplanTriggerTouched := false
+    this.trimTaken := false
+    this.trimBar := na
+    this.trimPrice := na
+    this.trimFraction := na
+    this.exitBar := na
+    this.exitPrice := na
+    this.exitReason := 0
+
+method enter(MRShadowExecutionState this, int entryDir, int entryMode, float logicPrice, bool fromPreplan, int planSourceBar, int planValidBar, float planTrigger, float planLimit, float planTP1, float planTP2, float planStop, bool planTriggerTouched) =>
+    float selectedEntryPrice = fromPreplan ? planLimit : logicPrice
+    this.active := true
+    this.dir := entryDir
+    this.mode := entryMode
+    this.entryBar := bar_index
+    this.logicEntryPrice := logicPrice
+    this.shadowEntryPrice := selectedEntryPrice
+    this.entryFromPreplan := fromPreplan
+    this.preplanSourceBar := planSourceBar
+    this.preplanValidBar := planValidBar
+    this.preplanTrigger := planTrigger
+    this.preplanLimit := planLimit
+    this.preplanTP1 := planTP1
+    this.preplanTP2 := planTP2
+    this.preplanStop := planStop
+    this.preplanTriggerTouched := planTriggerTouched
+    this.trimTaken := false
+    this.trimBar := na
+    this.trimPrice := na
+    this.trimFraction := na
+    this.exitBar := na
+    this.exitPrice := na
+    this.exitReason := 0
+    this.lastEntryImprovementPct := f_shadowEntryImprovement(entryDir, logicPrice, selectedEntryPrice)
+    this.confirmedEntries += 1
+    if fromPreplan
+        this.shadowPreplanEntries += 1
+
+method recordTrim(MRShadowExecutionState this, int decisionBar, float decisionPrice, float fraction) =>
+    if this.active and not this.trimTaken
+        this.trimTaken := true
+        this.trimBar := decisionBar
+        this.trimPrice := decisionPrice
+        this.trimFraction := fraction
+
+method closeTrade(MRShadowExecutionState this, int decisionBar, float decisionPrice, int reason) =>
+    if this.active
+        float shadowTradeReturn = f_shadowTradeReturn(this.dir, this.shadowEntryPrice, this.trimTaken, this.trimPrice, this.trimFraction, decisionPrice)
+        float referenceTradeReturn = f_shadowTradeReturn(this.dir, this.logicEntryPrice, this.trimTaken, this.trimPrice, this.trimFraction, decisionPrice)
+        float shadowEquityBeforeTrade = this.shadowEquityIndex
+        float referenceEquityBeforeTrade = this.referenceEquityIndex
+        float shadowTradePnLIndex = shadowEquityBeforeTrade * shadowTradeReturn
+        float referenceTradePnLIndex = referenceEquityBeforeTrade * referenceTradeReturn
+
+        this.shadowEquityIndex *= 1.0 + shadowTradeReturn
+        this.referenceEquityIndex *= 1.0 + referenceTradeReturn
+        if shadowTradePnLIndex > 0.0
+            this.shadowGrossProfit += shadowTradePnLIndex
+        else if shadowTradePnLIndex < 0.0
+            this.shadowGrossLoss += math.abs(shadowTradePnLIndex)
+        if referenceTradePnLIndex > 0.0
+            this.referenceGrossProfit += referenceTradePnLIndex
+        else if referenceTradePnLIndex < 0.0
+            this.referenceGrossLoss += math.abs(referenceTradePnLIndex)
+
+        this.shadowTrades += 1
+        if shadowTradeReturn > 0.0
+            this.shadowWins += 1
+
+        this.lastDir := this.dir
+        this.lastMode := this.mode
+        this.lastEntryBar := this.entryBar
+        this.lastExitBar := decisionBar
+        this.lastLogicEntryPrice := this.logicEntryPrice
+        this.lastShadowEntryPrice := this.shadowEntryPrice
+        this.lastTrimPrice := this.trimTaken ? this.trimPrice : na
+        this.lastExitPrice := decisionPrice
+        this.lastExitReason := reason
+        this.lastTradeReturnPct := shadowTradeReturn * 100.0
+        this.lastReferenceReturnPct := referenceTradeReturn * 100.0
+        this.lastDeltaPct := this.lastTradeReturnPct - this.lastReferenceReturnPct
+        this.exitBar := decisionBar
+        this.exitPrice := decisionPrice
+        this.exitReason := reason
+        this.resetTrade()
+
+f_shadowEntryMessage(string eventName, MRShadowExecutionState this) =>
+    "MR-T-V4|event=" + eventName +
+      "|direction=" + f_directionName(this.dir) +
+      "|mode=" + f_modeName(this.mode) +
+      "|entry_bar=" + str.tostring(this.entryBar) +
+      "|logic_entry=" + f_price(this.logicEntryPrice) +
+      "|shadow_entry=" + f_price(this.shadowEntryPrice) +
+      "|entry_improvement_pct=" + f_pct(this.lastEntryImprovementPct) +
+      "|shadow_from_preplan=" + (this.entryFromPreplan ? "true" : "false") +
+      "|preplan_source_bar=" + str.tostring(this.preplanSourceBar) +
+      "|preplan_valid_bar=" + str.tostring(this.preplanValidBar) +
+      "|preplan_trigger=" + f_price(this.preplanTrigger) +
+      "|preplan_limit=" + f_price(this.preplanLimit) +
+      "|tp1_provisional=" + f_price(this.preplanTP1) +
+      "|tp2_provisional=" + f_price(this.preplanTP2) +
+      "|stop_provisional=" + f_price(this.preplanStop) +
+      "|preplan_trigger_touched=" + (this.preplanTriggerTouched ? "true" : "false")
+
+f_shadowResultMessage(MRShadowExecutionState this) =>
+    "MR-T-V4|event=SHADOW_RESULT" +
+      "|direction=" + f_directionName(this.lastDir) +
+      "|mode=" + f_modeName(this.lastMode) +
+      "|entry_bar=" + str.tostring(this.lastEntryBar) +
+      "|exit_bar=" + str.tostring(this.lastExitBar) +
+      "|logic_entry=" + f_price(this.lastLogicEntryPrice) +
+      "|shadow_entry=" + f_price(this.lastShadowEntryPrice) +
+      "|trim_price=" + f_price(this.lastTrimPrice) +
+      "|exit_price=" + f_price(this.lastExitPrice) +
+      "|exit_reason=" + f_exitName(this.lastExitReason) +
+      "|entry_improvement_pct=" + f_pct(this.lastEntryImprovementPct) +
+      "|shadow_trade_pct=" + f_pct(this.lastTradeReturnPct) +
+      "|reference_trade_pct=" + f_pct(this.lastReferenceReturnPct) +
+      "|delta_trade_pct=" + f_pct(this.lastDeltaPct) +
+      "|shadow_net_pct=" + f_pct(f_shadowNetPct(this)) +
+      "|reference_net_pct=" + f_pct(f_referenceNetPct(this)) +
+      "|shadow_pf=" + f_pct(f_shadowProfitFactor(this)) +
+      "|reference_pf=" + f_pct(f_referenceProfitFactor(this)) +
+      "|shadow_win_rate=" + f_pct(f_shadowWinRate(this)) +
+      "|shadow_usage_pct=" + f_pct(f_shadowUsagePct(this)) +
+      "|shadow_trades=" + str.tostring(this.shadowTrades) +
+      "|shadow_wins=" + str.tostring(this.shadowWins) +
+      "|shadow_preplan_entries=" + str.tostring(this.shadowPreplanEntries) +
+      "|confirmed_entries=" + str.tostring(this.confirmedEntries)
 
 // --------------------------------------------------------------------------
 // Broker transition detection and fill synchronization.
@@ -1155,9 +1416,9 @@ f_logicManage(int dir) =>
 // Only these close-processed orders enter the Strategy Tester. PREPLAN never
 // calls strategy.entry/order and never changes strategy.position_size.
 
-if allowBarCloseDecision and officialEntryDecision and preplanForCurrentBar
-    string entryAssistEvent = previousPreplanTriggerTouched ? "ENTRY_CONFIRMED" : "ENTRY_CONFIRMED_NO_PREPLAN_FILL"
-    alert(f_preplanMessage(entryAssistEvent, previousPreplanDir, previousPreplanMode, previousPreplanSourceBar, previousPreplanValidBar, previousPreplanTrigger, previousPreplanLimit, previousPreplanTP1, previousPreplanTP2, previousPreplanStop, "|preplan_trigger_touched=" + (previousPreplanTriggerTouched ? "true" : "false")), alert.freq_all)
+int officialEntryDir = longEntrySignal ? 1 : shortEntrySignal ? -1 : 0
+int officialEntryMode = officialEntryDir != 0 ? logic.setupMode : 0
+bool shadowEntryFromPreplan = officialEntryDecision and preplanForCurrentBar and previousPreplanDir == officialEntryDir and previousPreplanMode == officialEntryMode and previousPreplanTriggerTouched and not na(previousPreplanLimit)
 
 if allowBarCloseDecision
     if longEntrySignal
@@ -1184,10 +1445,23 @@ if allowBarCloseDecision
             strategy.entry("MR-S", strategy.short, alert_message = f_orderMessage(-1, "Short Entry", entryMode, close))
 
     if officialEntryDecision
+        // Snapshot the previous-bar PREPLAN before reset(). Only the matching,
+        // touched plan may replace the official close in the independent ledger.
+        shadow.enter(officialEntryDir, officialEntryMode, logic.entryPrice, shadowEntryFromPreplan, preplanForCurrentBar ? previousPreplanSourceBar : na, preplanForCurrentBar ? previousPreplanValidBar : na, preplanForCurrentBar ? previousPreplanTrigger : na, preplanForCurrentBar ? previousPreplanLimit : na, preplanForCurrentBar ? previousPreplanTP1 : na, preplanForCurrentBar ? previousPreplanTP2 : na, preplanForCurrentBar ? previousPreplanStop : na, preplanForCurrentBar and previousPreplanTriggerTouched)
+        string entryAssistEvent = shadowEntryFromPreplan ? "ENTRY_CONFIRMED" : "ENTRY_CONFIRMED_NO_PREPLAN_FILL"
+        alert(f_shadowEntryMessage(entryAssistEvent, shadow), alert.freq_all)
         assist.reset()
 
     f_logicManage(1)
     f_logicManage(-1)
+
+    // Shadow Trim and Full Exit are always driven by the same confirmed-close
+    // Logic event bar and close price. They never create a second exit path.
+    if logic.logicEventBar == bar_index and logic.logicEventKind == 2
+        shadow.recordTrim(bar_index, close, trimPct / 100.0)
+    if logic.logicEventBar == bar_index and logic.logicEventKind == 3 and shadow.active
+        shadow.closeTrade(bar_index, close, logic.logicEventReason)
+        alert(f_shadowResultMessage(shadow), alert.freq_all)
 
 // A confirmed Logic full exit owns the cleanup handoff. Cleanup is allowed
 // only after this formal decision and is never a new Logic signal.
@@ -1456,8 +1730,8 @@ plot(logic.entryPrice, "Logic Entry Price", display = display.data_window)
 plot(logic.partialTarget, "Logic Partial Target", display = display.data_window)
 plot(logic.finalTarget, "Logic Final Target", display = display.data_window)
 plot(logic.pos != 0 ? f_logicActiveStop(logic.pos) : na, "Logic Active Stop", display = display.data_window)
-plot(executionEventKind, "Logic Event Code", display = display.data_window)
-plot(executionEventReason, "Logic Event Reason", display = display.data_window)
+plot(logic.logicEventKind, "Logic Event Code", display = display.data_window)
+plot(logic.logicEventReason, "Logic Event Reason", display = display.data_window)
 plot(currentPositionSize, "Broker Position", display = display.data_window)
 plot(broker.brokerEntryPrice, "Broker Entry Price", display = display.data_window)
 plot(broker.recoveryCount, "Broker Recovery Count", display = display.data_window)
@@ -1468,6 +1742,14 @@ plot(broker.rangeWins, "Range Wins", display = display.data_window)
 plot(broker.shockEntries, "Shock Entries", display = display.data_window)
 plot(broker.shockClosed, "Shock Closed", display = display.data_window)
 plot(broker.shockWins, "Shock Wins", display = display.data_window)
+plot(shadow.shadowEntryPrice, "V4 Shadow Entry Price", display = display.data_window)
+plot(shadow.lastEntryImprovementPct, "V4 Entry Improvement %", display = display.data_window)
+plot(shadow.lastTradeReturnPct, "V4 Shadow Last Trade %", display = display.data_window)
+plot(shadow.lastReferenceReturnPct, "V3 Reference Last Trade %", display = display.data_window)
+plot(f_shadowNetPct(shadow), "V4 Shadow Net %", display = display.data_window)
+plot(f_referenceNetPct(shadow), "V3 Reference Net %", display = display.data_window)
+plot(f_shadowVsReferencePct(shadow), "V4 vs V3 Delta %", display = display.data_window)
+plot(f_shadowProfitFactor(shadow), "V4 Shadow Profit Factor", display = display.data_window)
 
 
 // ============================================================================
@@ -1514,7 +1796,7 @@ if showPanel
     string modeText = logic.pos != 0 ? f_modeName(logic.tradeMode) : broker.entryIntentPending ? f_modeName(broker.entryIntentMode) : "-"
     string stopText = stopMode
     string phaseText = logic.pos != 0 ? logic.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : broker.trimIntentPending ? "TRIM_PENDING" : broker.entryIntentPending ? "ENTRY_PENDING" : "FLAT"
-    string entryText = logic.pos == 0 ? "-" : str.tostring(logic.entryPrice, format.mintick) + " / " + f_price(broker.brokerEntryPrice)
+    string entryText = logic.pos == 0 ? "-" : f_price(logic.entryPrice) + " / " + f_price(shadow.shadowEntryPrice)
     string trimText = logic.pos == 0 ? "-" : str.tostring(logic.partialTarget, format.mintick)
     string finalText = logic.pos == 0 ? "-" : str.tostring(logic.finalTarget, format.mintick)
     string riskText = logic.pos == 0 ? "-" : str.tostring(f_logicActiveStop(logic.pos), format.mintick)
@@ -1560,7 +1842,7 @@ if showPanel
     table.cell(panel, 0, 9, f_tr("阶段", "Phase"))
     table.cell(panel, 1, 9, phaseText)
 
-    table.cell(panel, 0, 10, f_tr("逻辑/成交入场价", "Logic / Broker entry"))
+    table.cell(panel, 0, 10, f_tr("逻辑/V4执行入场价", "Logic / V4 Shadow entry"))
     table.cell(panel, 1, 10, entryText)
 
     table.cell(panel, 0, 11, f_tr("T减 / T平", "Trim / Final"))

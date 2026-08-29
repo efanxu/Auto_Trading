@@ -2,6 +2,12 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.2.0] — Shadow Execution Accounting
+
+- Added an independent V4 Shadow Execution ledger that uses a touched, matching previous-bar PREPLAN limit as the historical entry fill approximation while keeping the official V3 confirmed-close Strategy Tester timeline unchanged.
+- Added V3 Reference comparison, compounded normalized equity, trade returns, delta, Profit Factor, Win Rate, PREPLAN usage, entry improvement, Data Window fields, and `SHADOW_RESULT` alerts.
+- Extended `tests/MRT-v4-execution-plan-harness.ps1` with Shadow state, pricing, lifecycle, accounting, and regression checks.
+
 ## [4.1.0] — V3-Aligned Execution Assist
 
 - Execution Assist now uses a previous-confirmed-bar rolling one-bar PREPLAN.

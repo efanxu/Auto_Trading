@@ -146,6 +146,100 @@ function Get-V3ManageDecision {
     return 'NONE'
 }
 
+function Get-ShadowEntrySelection {
+    param(
+        [int]$OfficialDir,
+        [int]$OfficialMode,
+        [double]$LogicEntry,
+        [bool]$PreplanForCurrentBar,
+        [int]$PreplanDir,
+        [int]$PreplanMode,
+        [bool]$TriggerTouched,
+        [double]$PreplanLimit
+    )
+
+    $fromPreplan = $PreplanForCurrentBar -and
+        $PreplanDir -eq $OfficialDir -and
+        $PreplanMode -eq $OfficialMode -and
+        $TriggerTouched -and
+        $null -ne $PreplanLimit
+    $shadowEntry = if ($fromPreplan) { $PreplanLimit } else { $LogicEntry }
+    $improvement = if ($OfficialDir -eq 1) {
+        ($LogicEntry - $shadowEntry) / $LogicEntry * 100.0
+    }
+    else {
+        ($shadowEntry - $LogicEntry) / $LogicEntry * 100.0
+    }
+
+    [pscustomobject]@{
+        FromPreplan = $fromPreplan
+        ShadowEntry = $shadowEntry
+        ImprovementPct = $improvement
+    }
+}
+
+function Get-ShadowTradeReturn {
+    param(
+        [int]$Dir,
+        [double]$Entry,
+        [bool]$DidTrim,
+        [double]$TrimPrice,
+        [double]$TrimFraction,
+        [double]$Exit,
+        [double]$CommissionBps = 3.0
+    )
+
+    $c = $CommissionBps / 10000.0
+    if ($DidTrim) {
+        $remainder = 1.0 - $TrimFraction
+        $grossTrim = $TrimFraction * $Dir * ($TrimPrice - $Entry) / $Entry
+        $grossRemainder = $remainder * $Dir * ($Exit - $Entry) / $Entry
+        $entryFee = $c
+        $trimExitFee = $TrimFraction * $c * $TrimPrice / $Entry
+        $finalExitFee = $remainder * $c * $Exit / $Entry
+        return $grossTrim + $grossRemainder - $entryFee - $trimExitFee - $finalExitFee
+    }
+
+    $grossReturn = $Dir * ($Exit - $Entry) / $Entry
+    $entryFee = $c
+    $exitFee = $c * $Exit / $Entry
+    return $grossReturn - $entryFee - $exitFee
+}
+
+function New-ShadowLedgerModel {
+    [pscustomobject]@{
+        ShadowEquity = 1.0
+        ReferenceEquity = 1.0
+        ShadowGrossProfit = 0.0
+        ShadowGrossLoss = 0.0
+        ReferenceGrossProfit = 0.0
+        ReferenceGrossLoss = 0.0
+        ShadowTrades = 0
+        ShadowWins = 0
+        ShadowPreplanEntries = 0
+        ConfirmedEntries = 0
+    }
+}
+
+function Add-ShadowLedgerTrade {
+    param(
+        $Ledger,
+        [double]$ShadowReturn,
+        [double]$ReferenceReturn
+    )
+
+    $shadowPnlIndex = $Ledger.ShadowEquity * $ShadowReturn
+    $referencePnlIndex = $Ledger.ReferenceEquity * $ReferenceReturn
+    $Ledger.ShadowEquity *= 1.0 + $ShadowReturn
+    $Ledger.ReferenceEquity *= 1.0 + $ReferenceReturn
+    if ($shadowPnlIndex -gt 0.0) { $Ledger.ShadowGrossProfit += $shadowPnlIndex }
+    elseif ($shadowPnlIndex -lt 0.0) { $Ledger.ShadowGrossLoss += [math]::Abs($shadowPnlIndex) }
+    if ($referencePnlIndex -gt 0.0) { $Ledger.ReferenceGrossProfit += $referencePnlIndex }
+    elseif ($referencePnlIndex -lt 0.0) { $Ledger.ReferenceGrossLoss += [math]::Abs($referencePnlIndex) }
+    $Ledger.ShadowTrades += 1
+    if ($ShadowReturn -gt 0.0) { $Ledger.ShadowWins += 1 }
+}
+
 function Invoke-RollingPreplanModel {
     param(
         [bool[]]$SetupValid,
@@ -233,15 +327,16 @@ $v3Source = [IO.File]::ReadAllText($v3Path)
 $changelog = [IO.File]::ReadAllText($changelogPath)
 $testCount = 0
 
-Write-Host 'MR-T v4.1.0 V3-Aligned Execution Assist Harness'
+Write-Host 'MR-T v4.2.0 V3-Aligned Execution Assist + Shadow Accounting Harness'
 Assert-True (Test-Path -LiteralPath $scriptPath) 'MRT_V4.pine must exist'
 
-Pass-Test 'Version and role are v4.1.0' {
-    Assert-Match $source 'strategy\("MR-T Strategy v4\.1\.0"' 'strategy version'
-    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.1\.0"' 'script version'
+Pass-Test 'Version and role are v4.2.0' {
+    Assert-Match $source 'strategy\("MR-T Strategy v4\.2\.0"' 'strategy version'
+    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.2\.0"' 'script version'
     Assert-Match $source 'V3-aligned Logic \+ previous-confirmed-bar execution assist' 'role comment'
+    Assert-Match $source 'V4\.2\.0\s*=\s*V4\.1\.0 \+ independent Shadow Execution Accounting' 'shadow role comment'
     Assert-Match $source 'sourceBar=N\s+uses this bar''s final values;\s*validBar=N\+1' 'source-bar comment'
-    Assert-Match $changelog '(?m)^## \[4\.1\.0\]' 'CHANGELOG v4.1.0 entry'
+    Assert-Match $changelog '(?m)^## \[4\.2\.0\]' 'CHANGELOG v4.2.0 entry'
 }
 
 Pass-Test 'Only the requested Execution Assist input exists' {
@@ -334,12 +429,12 @@ Pass-Test 'PREPLAN alerts carry required fields' {
     Assert-Match $source 'MR-T-V4\|event=' 'V4 prefix'
     $alertLines = @($source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*alert\(' })
     foreach ($alertLine in $alertLines) {
-        Assert-True ($alertLine -match 'f_preplanMessage\(|f_orderMessage\(') 'alert bypasses formatter'
+        Assert-True ($alertLine -match 'f_preplanMessage\(|f_orderMessage\(|f_shadowEntryMessage\(|f_shadowResultMessage\(') 'alert bypasses formatter'
     }
 }
 
 Pass-Test 'Case A confirmed entry reports trigger touch' {
-    Assert-Match $source 'entryAssistEvent\s*=\s*previousPreplanTriggerTouched\s*\?\s*"ENTRY_CONFIRMED"\s*:\s*"ENTRY_CONFIRMED_NO_PREPLAN_FILL"' 'entry outcome event'
+    Assert-Match $source 'entryAssistEvent\s*=\s*shadowEntryFromPreplan\s*\?\s*"ENTRY_CONFIRMED"\s*:\s*"ENTRY_CONFIRMED_NO_PREPLAN_FILL"' 'entry outcome event'
     Assert-Match $source '\|preplan_trigger_touched=' 'touch result field'
     Assert-Match $source 'ENTRY_CONFIRMED_NO_PREPLAN_FILL' 'case D event'
 }
@@ -458,11 +553,19 @@ Pass-Test 'Active Trade Lines show only formal Logic position' {
     Assert-NotMatch (Get-Section $source '// Active Trade Lines' '// Setup Labels') 'assist\.entryTrigger|assist\.tp1Provisional|assist\.tp2Provisional|assist\.stopProvisional' 'provisional lines plotted'
 }
 
-Pass-Test 'Plot and Data Window footprint is unchanged' {
+Pass-Test 'Chart-visible plot footprint is unchanged and Shadow adds exactly 8 Data Window fields' {
     $plotPattern = '(?m)^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\('
-    Assert-True ([regex]::Matches($source, $plotPattern).Count -eq [regex]::Matches($v3Source, $plotPattern).Count) 'plot count changed'
-    Assert-True ([regex]::Matches($source, 'display\s*=\s*display\.data_window').Count -eq [regex]::Matches($v3Source, 'display\s*=\s*display\.data_window').Count) 'Data Window count changed'
+    $v4PlotLines = @($source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
+    $v3PlotLines = @($v3Source -split '\r?\n' | Where-Object { $_ -match '^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?plot\(' })
+    $v4VisiblePlots = @($v4PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
+    $v3VisiblePlots = @($v3PlotLines | Where-Object { $_ -notmatch 'display\s*=\s*display\.data_window' })
+    Assert-True ($v4VisiblePlots.Count -eq $v3VisiblePlots.Count) 'chart-visible plot count changed'
+    Assert-True ($v4PlotLines.Count -eq $v3PlotLines.Count + 8) 'total plot count did not add exactly 8 Shadow fields'
+    Assert-True ([regex]::Matches($source, 'display\s*=\s*display\.data_window').Count -eq [regex]::Matches($v3Source, 'display\s*=\s*display\.data_window').Count + 8) 'Data Window count did not add exactly 8 fields'
     Assert-True ([regex]::Matches($source, '\bplotshape\(').Count -eq [regex]::Matches($v3Source, '\bplotshape\(').Count) 'plotshape count changed'
+    foreach ($field in @('V4 Shadow Entry Price', 'V4 Entry Improvement %', 'V4 Shadow Last Trade %', 'V3 Reference Last Trade %', 'V4 Shadow Net %', 'V3 Reference Net %', 'V4 vs V3 Delta %', 'V4 Shadow Profit Factor')) {
+        Assert-Match $source ([regex]::Escape($field)) "missing Shadow Data Window field: $field"
+    }
 }
 
 Pass-Test 'Panel remains exactly 21 rows' {
@@ -516,7 +619,7 @@ Pass-Test 'Long and Short provisional stop math mirrors' {
     Assert-True ($long.Stop -lt $long.EntryTrigger -and $short.Stop -gt $short.EntryTrigger) 'stop direction'
 }
 
-Pass-Test 'V3 vs V4.1 Logic Timeline parity model' {
+Pass-Test 'V3 vs V4.2 Logic Timeline parity model' {
     $bars = @(
         [pscustomobject]@{ Index = 1; Action = 'ENTRY_LONG'; TriggerTouched = $true },
         [pscustomobject]@{ Index = 2; Action = 'TRIM'; TriggerTouched = $true },
@@ -539,6 +642,232 @@ Pass-Test 'V3 vs V4.1 Logic Timeline parity model' {
     Assert-Match $source 'allowBarCloseDecision\s*=\s*isNewLogicDecisionBar' 'confirmed Logic scheduler'
 }
 
-Assert-True ($testCount -eq 41) "expected 41 tests, ran $testCount"
-Write-Host "PASS: $testCount/$testCount V4.1 execution-assist tests"
+Pass-Test 'Shadow state is a fourth layer and cannot write the other layers' {
+    $shadowSection = Get-Section $source '// MRShadowExecutionState' '// Setup and Logic events'
+    Assert-Match $shadowSection 'varip bool\s+active\s*=\s*false' 'active field'
+    Assert-Match $shadowSection 'logicEntryPrice|shadowEntryPrice|entryFromPreplan' 'entry accounting fields'
+    Assert-Match $shadowSection 'trimBar|trimPrice|trimFraction|exitBar|exitPrice|exitReason' 'exit accounting fields'
+    Assert-Match $source 'MRLogicState[\s\S]*?MRExecutionAssistState[\s\S]*?MRBrokerState[\s\S]*?MRShadowExecutionState' 'four state layers'
+    Assert-NotMatch $shadowSection 'strategy\.(entry|order|close|close_all)\(' 'Shadow state submits orders'
+}
+
+Pass-Test 'Shadow Entry requires matching PREPLAN direction, mode, and touch' {
+    Assert-Match $source 'shadowEntryFromPreplan\s*=\s*officialEntryDecision[\s\S]*?preplanForCurrentBar[\s\S]*?previousPreplanDir\s*==\s*officialEntryDir[\s\S]*?previousPreplanMode\s*==\s*officialEntryMode[\s\S]*?previousPreplanTriggerTouched' 'Shadow Entry gate'
+    Assert-Match $source 'shadow\.enter\([\s\S]*?preplanForCurrentBar[\s\S]*?assist\.reset\(\)' 'PREPLAN snapshot precedes assist reset'
+}
+
+Pass-Test 'Valid touched PREPLAN selects its published limit' {
+    $selection = Get-ShadowEntrySelection 1 1 79330.75 $true 1 1 $true 79000.0
+    Assert-True $selection.FromPreplan 'valid touched PREPLAN was not selected'
+    Assert-Near $selection.ShadowEntry 79000.0 'Shadow Entry did not use PREPLAN limit'
+    Assert-True ($selection.ImprovementPct -gt 0.0) 'Long lower PREPLAN limit should improve entry'
+    Assert-Match $source 'selectedEntryPrice\s*=\s*fromPreplan\s*\?\s*planLimit\s*:\s*logicPrice' 'published limit selection'
+}
+
+Pass-Test 'No touch, no PREPLAN, and mismatched PREPLAN fall back to Logic close' {
+    $noTouch = Get-ShadowEntrySelection 1 1 79330.75 $true 1 1 $false 79000.0
+    $noPlan = Get-ShadowEntrySelection 1 1 79330.75 $false 0 0 $false 79000.0
+    $wrongMode = Get-ShadowEntrySelection 1 1 79330.75 $true 1 2 $true 79000.0
+    Assert-True (-not $noTouch.FromPreplan -and -not $noPlan.FromPreplan -and -not $wrongMode.FromPreplan) 'invalid PREPLAN selected'
+    Assert-Near $noTouch.ShadowEntry 79330.75 'no-touch fallback'
+    Assert-Near $noPlan.ShadowEntry 79330.75 'no-plan fallback'
+    Assert-Near $wrongMode.ShadowEntry 79330.75 'mode-mismatch fallback'
+    Assert-Match $source 'shadowEntryFromPreplan\s*=\s*officialEntryDecision' 'fallback gate is official-entry-only'
+}
+
+Pass-Test 'Shadow never uses a hindsight better-of-two price' {
+    $shadowEntry = Get-ShadowEntrySelection 1 1 79000.0 $true 1 1 $true 79330.0
+    Assert-Near $shadowEntry.ShadowEntry 79330.0 'adverse touched limit was replaced'
+    Assert-True ($shadowEntry.ImprovementPct -lt 0.0) 'adverse Long limit was not recorded as worse'
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-NotMatch $shadowSection 'math\.(min|max)\([^\r\n]*(logicPrice|shadowEntryPrice|planLimit)' 'hindsight price optimizer'
+}
+
+Pass-Test 'Long Entry Improvement has the specified positive and negative signs' {
+    $better = Get-ShadowEntrySelection 1 1 100.0 $true 1 1 $true 90.0
+    $worse = Get-ShadowEntrySelection 1 1 100.0 $true 1 1 $true 110.0
+    Assert-Near $better.ImprovementPct 10.0 'Long positive improvement'
+    Assert-Near $worse.ImprovementPct -10.0 'Long negative improvement'
+    Assert-Match $source 'dir\s*==\s*1\s*\?\s*\(logicPrice\s*-\s*shadowPrice\)' 'Long improvement formula'
+}
+
+Pass-Test 'Short Entry Improvement has the specified positive and negative signs' {
+    $better = Get-ShadowEntrySelection -1 1 100.0 $true -1 1 $true 110.0
+    $worse = Get-ShadowEntrySelection -1 1 100.0 $true -1 1 $true 90.0
+    Assert-Near $better.ImprovementPct 10.0 'Short positive improvement'
+    Assert-Near $worse.ImprovementPct -10.0 'Short negative improvement'
+    Assert-Match $source 'dir\s*==\s*1\s*\?\s*\(logicPrice\s*-\s*shadowPrice\)[\s\S]*?\(shadowPrice\s*-\s*logicPrice\)\s*/\s*logicPrice' 'Short improvement formula'
+}
+
+Pass-Test 'Historical Stop-Limit Fill Approximation is explicit and isolated' {
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'Historical Stop-Limit Fill Approximation' 'historical fill assumption'
+    Assert-Match $shadowSection 'not TradingView tick-level real-fill proof' 'approximation disclaimer'
+    Assert-Match $shadowSection 'live trading remains[\s\S]*exchange''s actual fill' 'live-fill disclaimer'
+    Assert-Match $source 'previousPreplanTriggerTouched\s*&&|previousPreplanTriggerTouched\s*and' 'touch fact is used'
+}
+
+Pass-Test 'Touched but unconfirmed PREPLAN does not create a Shadow trade' {
+    $unconfirmed = Get-Section $source '// A PREPLAN touch is an execution-assist fact' '// A new plan is generated only after this bar is confirmed'
+    Assert-Match $unconfirmed 'not officialEntryDecision and previousPreplanTriggerTouched' 'unconfirmed touch alert gate'
+    Assert-NotMatch $unconfirmed 'shadow\.enter\(|shadow\.closeTrade\(' 'unconfirmed touch created Shadow trade'
+    Assert-Match $source 'if officialEntryDecision[\s\S]*?shadow\.enter' 'Shadow Entry is official-only'
+}
+
+Pass-Test 'Official Entry keeps the same Logic Entry bar and price' {
+    Assert-Match $source 'logic\.entryPrice\s*:=\s*close[\s\S]*?logic\.entryBar\s*:=\s*bar_index' 'Logic Entry capture'
+    Assert-Match $source 'this\.entryBar\s*:=\s*bar_index[\s\S]*?this\.logicEntryPrice\s*:=\s*logicPrice' 'Shadow Entry capture'
+    Assert-Match $source 'shadow\.enter\([\s\S]*?logic\.entryPrice[\s\S]*?assist\.reset\(\)' 'same-bar Shadow capture'
+}
+
+Pass-Test 'Shadow Trim and Full Exit use the exact Logic event bar and close' {
+    $decisionBlock = Get-Section $source '// Official Logic Decision' '// Retry cleanup after a formal full-exit command'
+    Assert-Match $decisionBlock 'logic\.logicEventKind\s*==\s*2[\s\S]*?shadow\.recordTrim\(bar_index,\s*close,\s*trimPct\s*/\s*100\.0\)' 'Shadow Trim mapping'
+    Assert-Match $decisionBlock 'logic\.logicEventKind\s*==\s*3[\s\S]*?shadow\.closeTrade\(bar_index,\s*close,\s*logic\.logicEventReason\)' 'Shadow Full Exit mapping'
+    Assert-Match $source 'this\.trimBar\s*:=\s*decisionBar[\s\S]*?this\.trimPrice\s*:=\s*decisionPrice' 'Trim provenance'
+}
+
+Pass-Test 'Final, Stop, BE, Trend Fail, and Timeout remain Logic reasons' {
+    $manage = Get-Section $source '// V3 Logic Manage' '// Official Logic Decision'
+    foreach ($reason in @('R_STOP', 'R_BE', 'R_TREND', 'R_TIME', 'R_FINAL')) {
+        Assert-Match $manage "f_logicExit\(dir, $reason\)" "missing Logic exit reason $reason"
+    }
+    Assert-Match $source 'shadow\.closeTrade\(bar_index,\s*close,\s*logic\.logicEventReason\)' 'Shadow uses Logic exit reason'
+}
+
+Pass-Test 'No-Trim Shadow return formula is normalized and commission-aware' {
+    $actual = Get-ShadowTradeReturn 1 100.0 $false 0.0 0.0 110.0
+    $expected = (110.0 - 100.0) / 100.0 - 0.0003 - 0.0003 * 110.0 / 100.0
+    Assert-Near $actual $expected 'no-trim return'
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'float c\s*=\s*commissionBps\s*/\s*10000\.0' 'commission normalization'
+    Assert-Match $shadowSection 'float grossReturn\s*=\s*dir\s*\*\s*\(exitPrice\s*-\s*entryPrice\)\s*/\s*entryPrice' 'no-trim gross return'
+    Assert-Match $shadowSection 'grossReturn\s*-\s*entryFee\s*-\s*exitFee' 'no-trim net return'
+}
+
+Pass-Test 'Trim Shadow return formula uses confirmed-close Trim and Final prices' {
+    $actual = Get-ShadowTradeReturn 1 100.0 $true 105.0 0.5 110.0
+    $expected = 0.5 * (105.0 - 100.0) / 100.0 + 0.5 * (110.0 - 100.0) / 100.0 - 0.0003 - 0.5 * 0.0003 * 105.0 / 100.0 - 0.5 * 0.0003 * 110.0 / 100.0
+    Assert-Near $actual $expected 'trim return'
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'float remainderFraction\s*=\s*1\.0\s*-\s*trimFraction' 'remainder fraction'
+    Assert-Match $shadowSection 'float grossTrim\s*=\s*trimFraction\s*\*\s*dir\s*\*\s*\(trimPrice\s*-\s*entryPrice\)\s*/\s*entryPrice' 'trim gross return'
+    Assert-Match $shadowSection 'float grossRemainder\s*=\s*remainderFraction\s*\*\s*dir\s*\*\s*\(exitPrice\s*-\s*entryPrice\)' 'remainder gross return'
+}
+
+Pass-Test 'Entry, Trim Exit, and Final Exit commissions are all charged' {
+    $noTrimBeforeFees = Get-ShadowTradeReturn 1 100.0 $false 0.0 0.0 110.0 0.0
+    $noTrimAfterFees = Get-ShadowTradeReturn 1 100.0 $false 0.0 0.0 110.0 3.0
+    Assert-Near ($noTrimBeforeFees - $noTrimAfterFees) (0.0003 + 0.0003 * 110.0 / 100.0) 'entry/final commissions'
+    $trimBeforeFees = Get-ShadowTradeReturn 1 100.0 $true 105.0 0.5 110.0 0.0
+    $trimAfterFees = Get-ShadowTradeReturn 1 100.0 $true 105.0 0.5 110.0 3.0
+    Assert-Near ($trimBeforeFees - $trimAfterFees) (0.0003 + 0.5 * 0.0003 * 105.0 / 100.0 + 0.5 * 0.0003 * 110.0 / 100.0) 'entry/trim/final commissions'
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'trimExitFee\s*=\s*trimFraction\s*\*\s*c\s*\*\s*trimPrice\s*/\s*entryPrice' 'trim exit fee'
+}
+
+Pass-Test 'V3 Reference Ledger uses the same exits and only Logic Entry differs' {
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-Match $shadowSection 'f_shadowTradeReturn\(this\.dir,\s*this\.shadowEntryPrice[\s\S]*?this\.trimTaken[\s\S]*?decisionPrice' 'Shadow ledger return'
+    Assert-Match $shadowSection 'f_shadowTradeReturn\(this\.dir,\s*this\.logicEntryPrice[\s\S]*?this\.trimTaken[\s\S]*?decisionPrice' 'Reference ledger return'
+    Assert-Match $source 'logic_entry=|\|logic_entry=' 'Logic Entry payload'
+    $fallback = Get-ShadowEntrySelection 1 1 100.0 $true 1 1 $false 90.0
+    $shadowReturn = Get-ShadowTradeReturn 1 $fallback.ShadowEntry $false 0.0 0.0 110.0
+    $referenceReturn = Get-ShadowTradeReturn 1 100.0 $false 0.0 0.0 110.0
+    Assert-Near $shadowReturn $referenceReturn 'fallback Shadow must equal Reference'
+}
+
+Pass-Test 'Shadow and Reference equity compound independently from 1.0' {
+    $ledger = New-ShadowLedgerModel
+    Add-ShadowLedgerTrade $ledger 0.10 0.05
+    Add-ShadowLedgerTrade $ledger -0.05 -0.10
+    Add-ShadowLedgerTrade $ledger 0.20 0.10
+    Assert-Near $ledger.ShadowEquity 1.254 'Shadow compounded equity'
+    Assert-Near $ledger.ReferenceEquity 1.0395 'Reference compounded equity'
+    Assert-Near (($ledger.ShadowEquity - 1.0) * 100.0) 25.4 'Shadow net percent'
+    Assert-Near (($ledger.ReferenceEquity - 1.0) * 100.0) 3.95 'Reference net percent'
+    Assert-Near ((($ledger.ShadowEquity - 1.0) - ($ledger.ReferenceEquity - 1.0)) * 100.0) 21.45 'Shadow versus Reference delta'
+    Assert-Match $source 'varip float\s+shadowEquityIndex\s*=\s*1\.0[\s\S]*?varip float\s+referenceEquityIndex\s*=\s*1\.0' 'independent equity seeds'
+    $shadowSection = Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection'
+    Assert-NotMatch $shadowSection 'strategy\.netprofit' 'Shadow reads Strategy Tester net profit'
+}
+
+Pass-Test 'Shadow Profit Factor and Win Rate use complete trades only' {
+    $ledger = New-ShadowLedgerModel
+    Add-ShadowLedgerTrade $ledger 0.10 0.05
+    Add-ShadowLedgerTrade $ledger -0.05 -0.10
+    Add-ShadowLedgerTrade $ledger 0.20 0.10
+    $expectedShadowPF = (0.10 + 1.10 * 0.95 * 0.20) / (1.10 * 0.05)
+    $expectedReferencePF = (0.05 + 1.05 * 0.90 * 0.10) / (1.05 * 0.10)
+    Assert-Near ($ledger.ShadowGrossProfit / $ledger.ShadowGrossLoss) $expectedShadowPF 'Shadow PF'
+    Assert-Near ($ledger.ReferenceGrossProfit / $ledger.ReferenceGrossLoss) $expectedReferencePF 'Reference PF'
+    Assert-True ($ledger.ShadowTrades -eq 3 -and $ledger.ShadowWins -eq 2) 'Shadow wins/trades'
+    Assert-Match $source 'if shadowTradeReturn\s*>\s*0\.0[\s\S]*?this\.shadowWins\s*\+=\s*1' 'Shadow win count'
+    Assert-Match $source 'this\.shadowGrossProfit[\s\S]*?this\.shadowGrossLoss' 'Shadow PF accumulators'
+}
+
+Pass-Test 'Full-exit reset clears trade state but preserves cumulative statistics' {
+    $resetBlock = Get-Section $source 'method resetTrade' 'method enter'
+    Assert-NotMatch $resetBlock 'shadowEquityIndex|referenceEquityIndex|shadowGrossProfit|shadowGrossLoss|shadowTrades|shadowWins|confirmedEntries' 'trade reset erased cumulative stats'
+    Assert-Match $source 'this\.shadowTrades\s*\+=\s*1[\s\S]*?this\.resetTrade\(\)' 'full-exit reset'
+    Assert-Match $source 'this\.exitBar\s*:=\s*decisionBar[\s\S]*?this\.exitPrice\s*:=\s*decisionPrice[\s\S]*?this\.resetTrade\(\)' 'exit provenance before reset'
+}
+
+Pass-Test 'PREPLAN usage counts only matching touched official Entries' {
+    $ledger = New-ShadowLedgerModel
+    foreach ($case in @(
+        (Get-ShadowEntrySelection 1 1 100.0 $true 1 1 $true 90.0),
+        (Get-ShadowEntrySelection 1 1 100.0 $true 1 1 $false 90.0),
+        (Get-ShadowEntrySelection 1 1 100.0 $false 0 0 $false 90.0)
+    )) {
+        $ledger.ConfirmedEntries += 1
+        if ($case.FromPreplan) { $ledger.ShadowPreplanEntries += 1 }
+    }
+    Assert-True ($ledger.ConfirmedEntries -eq 3 -and $ledger.ShadowPreplanEntries -eq 1) 'PREPLAN usage count'
+    Assert-Near ($ledger.ShadowPreplanEntries / $ledger.ConfirmedEntries * 100.0) (100.0 / 3.0) 'PREPLAN usage percent'
+    Assert-Match $source 'this\.confirmedEntries\s*\+=\s*1[\s\S]*?if fromPreplan[\s\S]*?this\.shadowPreplanEntries\s*\+=\s*1' 'usage accumulator gate'
+    Assert-Match $source 'this\.confirmedEntries\s*>\s*0\s*\?\s*this\.shadowPreplanEntries\s*/\s*this\.confirmedEntries\s*\*\s*100\.0' 'usage formula'
+}
+
+Pass-Test 'Entry and result alerts expose Shadow accounting without changing state' {
+    Assert-Match $source 'f_shadowEntryMessage[\s\S]*?logic_entry[\s\S]*?shadow_entry[\s\S]*?entry_improvement_pct[\s\S]*?shadow_from_preplan' 'Entry alert fields'
+    Assert-Match $source 'alert\(f_shadowEntryMessage\(entryAssistEvent,\s*shadow\)' 'Entry alert emission'
+    Assert-Match $source 'f_shadowResultMessage[\s\S]*?event=SHADOW_RESULT[\s\S]*?shadow_net_pct[\s\S]*?reference_net_pct[\s\S]*?shadow_pf' 'result alert fields'
+    Assert-Match $source 'shadow\.closeTrade\([\s\S]*?alert\(f_shadowResultMessage\(shadow\)' 'result alert emission'
+    Assert-NotMatch (Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection') 'alert\(' 'Shadow helper emits an alert internally'
+}
+
+Pass-Test 'Strategy Tester order path remains official V3-only' {
+    Assert-Match $source 'strategy\.entry\("MR-L",\s*strategy\.long' 'official Long order'
+    Assert-Match $source 'strategy\.entry\("MR-S",\s*strategy\.short' 'official Short order'
+    Assert-Match $source 'strategy\.close\(trimEntryId[\s\S]*?strategy\.close\(closeEntryId' 'official close path'
+    Assert-NotMatch (Get-Section $source '// V4 Shadow Execution Accounting' '// Broker transition detection') 'strategy\.(entry|order|close|close_all)\(' 'Shadow added an order path'
+    Assert-NotMatch $source 'shadow\.shadowEntryPrice\s*:=|shadowEntryPrice\s*=\s*strategy\.' 'Shadow price mutated Strategy orders'
+}
+
+Pass-Test '1008-like Long Stop trade improves when PREPLAN entry is lower' {
+    $logicEntry = 79330.75
+    $shadowEntry = 79000.0
+    $exit = 78626.0
+    $shadowReturn = Get-ShadowTradeReturn 1 $shadowEntry $false 0.0 0.0 $exit
+    $referenceReturn = Get-ShadowTradeReturn 1 $logicEntry $false 0.0 0.0 $exit
+    Assert-True ($shadowReturn -lt 0.0 -and $referenceReturn -lt 0.0) '1008-like trade should lose'
+    Assert-True ($shadowReturn -gt $referenceReturn) 'Shadow loss was not smaller than Reference loss'
+    Assert-Match $source 'entryBar\s*=\s*bar_index|this\.entryBar\s*:=\s*bar_index' 'same entry bar field'
+}
+
+Pass-Test '1008-like adverse Long PREPLAN is recorded as worse' {
+    $logicEntry = 79000.0
+    $shadowEntry = 79330.0
+    $exit = 78626.0
+    $shadowReturn = Get-ShadowTradeReturn 1 $shadowEntry $false 0.0 0.0 $exit
+    $referenceReturn = Get-ShadowTradeReturn 1 $logicEntry $false 0.0 0.0 $exit
+    Assert-True ($shadowReturn -lt $referenceReturn) 'adverse Shadow result was optimized away'
+    $selection = Get-ShadowEntrySelection 1 1 $logicEntry $true 1 1 $true $shadowEntry
+    Assert-Near $selection.ShadowEntry $shadowEntry 'adverse PREPLAN limit changed'
+    Assert-True ($selection.ImprovementPct -lt 0.0) 'adverse improvement sign'
+}
+
+Assert-True ($testCount -eq 65) "expected 65 tests, ran $testCount"
+Write-Host "PASS: $testCount/$testCount V4.2 execution-assist + Shadow accounting tests"
 Write-Host 'Manual TradingView compile/backtest and live alert validation remain required.'
