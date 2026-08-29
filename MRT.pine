@@ -3,10 +3,10 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, max_labels_count = 500)
+strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v3.1.1
+// Mean Reversion T (MR-T) · Strategy v3.2.0
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -18,9 +18,10 @@ strategy("MR-T Strategy", shorttitle = "MR-T v3", overlay = true, pyramiding = 0
 // 异常退出 / Exits        T止损 / 趋势失效 / T超时 / T保本
 //
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
-// 收盘确认信号 → 下一可成交时点执行;换品种/周期前请重新评估全部参数。
+// confirmed-close 决策 → 当前 K 线收盘的 Strategy Tester 市价成交;
+// 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v3.1.1 —— Confirmed-close Strategy Tester 回测版本。变更见 CHANGELOG.md。
+// 版本 / Version: v3.2.0 —— V2 Decision-Parity Strategy 回测版本。变更见 CHANGELOG.md。
 // ============================================================================
 
 
@@ -38,7 +39,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "3.1.1"
+string SCRIPT_VERSION = "3.2.0"
 
 
 // ============================================================================
@@ -421,10 +422,11 @@ type MRState
     int    setupDir      = 0     // Setup 方向:+1 / -1
     int    setupMode     = 0     // 0 无 / 1 Range / 2 Shock
 
-    // Market order 在信号 bar 收盘生成,下一可成交时点才建立持仓。
+    // Market order 在 Entry decision bar 收盘生成,同一收盘建立持仓。
     int    pendingDir    = 0
     int    pendingMode   = 0
     int    pendingBar    = na
+    float  pendingReferenceEntryPrice = na
     float  pendingMean   = na
     float  pendingStd    = na
     float  pendingAtr    = na
@@ -448,6 +450,7 @@ type MRFillState
     varip int    pendingDir = 0
     varip int    pendingMode = 0
     varip int    pendingBar = na
+    varip float  pendingReferenceEntryPrice = na
     varip float  pendingMean = na
     varip float  pendingStd = na
     varip float  pendingAtr = na
@@ -460,7 +463,8 @@ type MRFillState
     // Fill bars record the Broker Emulator execution separately.
     varip int    entryDecisionBar = na
     varip int    entryFillBar = na
-    varip float  entryPrice = na
+    varip float  referenceEntryPrice = na
+    varip float  brokerEntryPrice = na
     varip float  entrySize = na
     varip float  mean = na
     varip float  std = na
@@ -472,9 +476,11 @@ type MRFillState
     varip int    tradeMode = 0
     varip float  cost = 0.0
     varip float  netProfitAtEntry = na
-    // lastExitBar is the confirmed-close exit decision bar used for cooldown.
+    // With same-close fills, lastExitBar is both the actual full-exit bar and
+    // the confirmed-close exit decision bar.
     varip int    lastExitBar = na
     varip int    exitDecisionBar = na
+    varip int    fullExitFillBar = na
     varip int    exitReasonPending = 0
     varip bool   exitRequested = false
     varip bool   marketClosePlaced = false
@@ -516,12 +522,22 @@ type MRFillState
     varip int    eventMode = 0
     varip float  eventPrice = na
 
+    // Decision events are emitted only by the confirmed-close lifecycle
+    // decision execution. They are distinct from the fill events above so
+    // custom chart labels retain MR-T decision semantics.
+    varip int    decisionEventKind = 0
+    varip int    decisionEventDir = 0
+    varip int    decisionEventReason = 0
+    varip int    decisionEventMode = 0
+    varip float  decisionEventPrice = na
+
 var MRFillState fillState = MRFillState.new()
 
 f_clearPendingSignal() =>
     t.pendingDir := 0
     t.pendingMode := 0
     t.pendingBar := na
+    t.pendingReferenceEntryPrice := na
     t.pendingMean := na
     t.pendingStd := na
     t.pendingAtr := na
@@ -531,25 +547,11 @@ f_clearTradeContext() =>
     fillState.active := false
     fillState.pos := 0
     fillState.partialTaken := false
-    fillState.trimDecisionBar := na
-    fillState.trimFillBar := na
     fillState.trimRequested := false
 
-    fillState.entryDecisionBar := na
-    fillState.entryFillBar := na
-    fillState.entryPrice := na
-    fillState.entrySize := na
-    fillState.mean := na
-    fillState.std := na
-    fillState.atr := na
-    fillState.partialTarget := na
-    fillState.finalTarget := na
-    fillState.baseStop := na
-    fillState.timeStop := na
-    fillState.tradeMode := 0
-    fillState.cost := 0.0
+    // Keep the last completed trade's decision/fill diagnostics visible in the
+    // Data Window. A new actual Entry overwrites every frozen field.
     fillState.netProfitAtEntry := na
-    fillState.exitDecisionBar := na
     fillState.exitReasonPending := 0
     fillState.exitRequested := false
     fillState.marketClosePlaced := false
@@ -558,6 +560,7 @@ f_clearTradeContext() =>
     fillState.pendingDir := 0
     fillState.pendingMode := 0
     fillState.pendingBar := na
+    fillState.pendingReferenceEntryPrice := na
     fillState.pendingMean := na
     fillState.pendingStd := na
     fillState.pendingAtr := na
@@ -569,7 +572,8 @@ f_clearTradeContext() =>
     t.setupMode := 0
 
 // 一次性事件:Pine 禁止在函数内重赋任何全局变量(CE10088),函数只能改对象字段。
-// 因此成交事件先写入 fillState 的捕获字段,全局作用域再派生为这些变量。
+// 因此 confirmed-close decision event 与 Broker fill event 都先写入
+// fillState 的捕获字段,全局作用域再派生图表标签与警报。
 bool setupEvent      = false
 int  setupEventDir   = 0
 int  setupEventMode  = 0
@@ -585,12 +589,18 @@ int  exitEventDir    = 0
 int  exitReason      = 0
 
 // 每次脚本 execution 重置当前事件。策略开启 calc_on_order_fills 后,同一根 K 线
-// 可能执行多次;事件只在实际成交的 execution 中产生。
+// 可能执行多次;decision event 只在 confirmed-close 决策 execution 中产生,
+// fill event 只在实际成交的 execution 中产生。
 fillState.eventKind := 0
 fillState.eventDir := 0
 fillState.eventReason := 0
 fillState.eventMode := 0
 fillState.eventPrice := na
+fillState.decisionEventKind := 0
+fillState.decisionEventDir := 0
+fillState.decisionEventReason := 0
+fillState.decisionEventMode := 0
+fillState.decisionEventPrice := na
 
 // 退出原因枚举
 int R_STOP  = 1
@@ -680,7 +690,7 @@ bool pendingDirectionMismatch = currentPositionSize != 0.0 and fillState.pending
 bool stalePendingEntry = currentPositionSize != 0.0 and fillState.pendingEntry and not positionEntered
 bool activePendingConflict = (fillState.active or fillState.pos != 0) and fillState.pendingEntry
 bool orphanBrokerPosition = currentPositionSize != 0.0 and not fillState.active and not fillState.pendingEntry
-bool frozenContextInvalid = fillState.active and (na(fillState.entryPrice) or na(fillState.entrySize) or fillState.entrySize <= 0.0 or na(fillState.partialTarget) or na(fillState.finalTarget) or na(fillState.baseStop))
+bool frozenContextInvalid = fillState.active and (na(fillState.referenceEntryPrice) or na(fillState.brokerEntryPrice) or na(fillState.entrySize) or fillState.entrySize <= 0.0 or na(fillState.partialTarget) or na(fillState.finalTarget) or na(fillState.baseStop))
 bool unexpectedSameDirectionReduction = positionReduced and fillState.active and not trimFilled
 bool unexpectedSameDirectionIncrease = sameDirectionPosition and math.abs(currentPositionSize) > math.abs(previousExecutionPositionSize) and fillState.active
 
@@ -753,8 +763,8 @@ if consistencyRecoveryRequired
         fillState.consistencyRecoveryClosePlaced := false
 
 // Fill recalculations may see confirmed historical OHLC values, so they may
-// synchronize real fills and maintain orders, but may not make bar-close
-// trading decisions. barstate.isconfirmed alone is not sufficient.
+// synchronize real fills and maintain lifecycle state, but may not make
+// bar-close trading decisions. barstate.isconfirmed alone is not sufficient.
 bool isFillSynchronizationExecution = positionChanged
 bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution and not consistencyRecoveryRequired
 
@@ -794,8 +804,8 @@ if allowBarCloseDecision and canEnter
     bool noSameLong  = na(t.setupBar) or t.setupDir != 1
     bool noSameShort = na(t.setupBar) or t.setupDir != -1
 
-    bool longShockSetup = longShockRejectionCandidate and noSameLong
-    bool shortShockSetup = shortShockRejectionCandidate and noSameShort
+    bool longShockSetup = allowLong and shockEnvironment and shockDown and z <= -shockEntryZ and decelerationOK and longRejectionOK and noSameLong
+    bool shortShockSetup = allowShort and shockEnvironment and shockUp and z >= shockEntryZ and decelerationOK and shortRejectionOK and noSameShort
     bool longRangeSetup = allowLong and rangeEnvironment and z <= -rangeEntryZ and noSameLong
     bool shortRangeSetup = allowShort and rangeEnvironment and z >= rangeEntryZ and noSameShort
 
@@ -901,7 +911,7 @@ f_activeStop(int dir) =>
     float s = fillState.baseStop
 
     if moveStopToBE and fillState.partialTaken
-        s := dir == 1 ? math.max(s, fillState.entryPrice + fillState.cost) : math.min(s, fillState.entryPrice - fillState.cost)
+        s := dir == 1 ? math.max(s, fillState.referenceEntryPrice + fillState.cost) : math.min(s, fillState.referenceEntryPrice - fillState.cost)
 
     s
 
@@ -945,14 +955,15 @@ f_recentExitPrice(float fallback) =>
 // ============================================================================
 // Entry lifecycle
 // ============================================================================
-// 信号 bar 只提交市场订单并冻结信号上下文。pendingBar 是 Entry decision bar;
-// 订单在下一可成交时点成交后,entryDecisionBar / entryFillBar 分别保存策略锚点
-// 与真实成交 bar,再用 strategy.position_avg_price 初始化实际交易。
+// Entry decision bar 只提交同收盘市场订单并冻结 V2 信号上下文。pendingBar
+// 是 Entry decision bar;成交后 entryDecisionBar / entryFillBar 分别保存策略
+// 锚点与 Broker Emulator 实际成交 bar,同时记录 reference/broker 两种价格。
 
 f_enter(int dir) =>
     t.pendingDir := dir
     t.pendingMode := t.setupMode
     t.pendingBar := bar_index
+    t.pendingReferenceEntryPrice := close
     t.pendingMean := mean15
     t.pendingStd := safeStd
     t.pendingAtr := safeATR
@@ -971,6 +982,7 @@ f_enter(int dir) =>
     fillState.pendingDir := dir
     fillState.pendingMode := t.pendingMode
     fillState.pendingBar := t.pendingBar
+    fillState.pendingReferenceEntryPrice := t.pendingReferenceEntryPrice
     fillState.pendingMean := t.pendingMean
     fillState.pendingStd := t.pendingStd
     fillState.pendingAtr := t.pendingAtr
@@ -980,15 +992,21 @@ f_enter(int dir) =>
     t.setupDir := 0
     t.setupMode := 0
 
+    fillState.decisionEventKind := 1
+    fillState.decisionEventDir := dir
+    fillState.decisionEventMode := fillState.pendingMode
+    fillState.decisionEventPrice := close
+
 f_initializeTrade(int dir) =>
     if not fillState.active and fillState.pendingEntry and fillState.pendingDir == dir
-        float filledPrice = strategy.position_avg_price
+        float brokerPrice = strategy.position_avg_price
 
         fillState.active := true
         fillState.pos := dir
         fillState.entryDecisionBar := fillState.pendingBar
         fillState.entryFillBar := bar_index
-        fillState.entryPrice := filledPrice
+        fillState.referenceEntryPrice := fillState.pendingReferenceEntryPrice
+        fillState.brokerEntryPrice := brokerPrice
         fillState.entrySize := math.abs(strategy.position_size)
         fillState.mean := fillState.pendingMean
         fillState.std := fillState.pendingStd
@@ -1000,6 +1018,7 @@ f_initializeTrade(int dir) =>
         fillState.trimFillBar := na
         fillState.trimRequested := false
         fillState.exitDecisionBar := na
+        fillState.fullExitFillBar := na
 
         float pz = fillState.tradeMode == 2 ? shockPartialZ : rangePartialZ
         float ez = fillState.tradeMode == 2 ? shockExitZ : rangeExitZ
@@ -1008,7 +1027,7 @@ f_initializeTrade(int dir) =>
         fillState.partialTarget := fillState.mean - dir * pz * fillState.std
         fillState.finalTarget := fillState.mean - dir * ez * fillState.std
 
-        float atrStop = fillState.entryPrice - dir * hardStopATR * fillState.atr
+        float atrStop = fillState.referenceEntryPrice - dir * hardStopATR * fillState.atr
         float statStop = fillState.mean - dir * stopZ * fillState.std
         float tightStop = dir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
         float looseStop = dir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
@@ -1021,7 +1040,7 @@ f_initializeTrade(int dir) =>
         else
             fillState.baseStop := balStop
 
-        fillState.cost := f_roundTripCost(fillState.entryPrice)
+        fillState.cost := f_roundTripCost(fillState.referenceEntryPrice)
         fillState.netProfitAtEntry := strategy.netprofit
         fillState.exitReasonPending := 0
         fillState.exitRequested := false
@@ -1036,6 +1055,7 @@ f_initializeTrade(int dir) =>
         fillState.pendingDir := 0
         fillState.pendingMode := 0
         fillState.pendingBar := na
+        fillState.pendingReferenceEntryPrice := na
         fillState.pendingMean := na
         fillState.pendingStd := na
         fillState.pendingAtr := na
@@ -1045,7 +1065,7 @@ f_initializeTrade(int dir) =>
         fillState.eventKind := 1
         fillState.eventDir := dir
         fillState.eventMode := fillState.tradeMode
-        fillState.eventPrice := fillState.entryPrice
+        fillState.eventPrice := fillState.brokerEntryPrice
 
 f_markPartial(int dir) =>
     if fillState.active and fillState.pos == dir and not fillState.partialTaken
@@ -1076,9 +1096,10 @@ f_exit(int dir, int reason) =>
             if winningTrade
                 fillState.shockWins += 1
 
-        // The broker reaches flat later, but cooldown follows the confirmed exit decision.
-        int cooldownDecisionBar = na(fillState.exitDecisionBar) ? bar_index : fillState.exitDecisionBar
-        fillState.lastExitBar := cooldownDecisionBar
+        // process_orders_on_close makes the Broker fill share this bar with the
+        // confirmed decision, so cooldown uses the actual full-exit bar directly.
+        fillState.fullExitFillBar := bar_index
+        fillState.lastExitBar := bar_index
         f_clearTradeContext()
 
         fillState.eventKind := 3
@@ -1137,6 +1158,13 @@ f_manage(int dir, bool allowBarCloseDecision, bool tradeContextValid) =>
             fillState.exitDecisionBar := bar_index
             decisionCode := MANAGE_FINAL
 
+        if decisionCode != MANAGE_NONE
+            fillState.decisionEventKind := decisionCode == MANAGE_TRIM ? 2 : 3
+            fillState.decisionEventDir := dir
+            fillState.decisionEventReason := decisionCode == MANAGE_TRIM ? 0 : fillState.exitReasonPending
+            fillState.decisionEventMode := fillState.tradeMode
+            fillState.decisionEventPrice := close
+
     decisionCode
 
 
@@ -1149,17 +1177,15 @@ if longEntrySignal
         fillState.shockConfirmedEntries += 1
     f_enter(1)
     strategy.entry("MR-L", strategy.long, alert_message = f_orderMessage(1, "Long Entry", t.pendingMode, close))
-    alert(f_orderMessage(1, "Long Entry", t.pendingMode, close), alert.freq_all)
     consistencyState := CONSISTENCY_PENDING_ENTRY
 else if shortEntrySignal
     if t.setupMode == 2
         fillState.shockConfirmedEntries += 1
     f_enter(-1)
     strategy.entry("MR-S", strategy.short, alert_message = f_orderMessage(-1, "Short Entry", t.pendingMode, close))
-    alert(f_orderMessage(-1, "Short Entry", t.pendingMode, close), alert.freq_all)
     consistencyState := CONSISTENCY_PENDING_ENTRY
 
-// 市场订单在下一可成交时点建立后,同步 Strategy Tester 的真实持仓。
+// 市场订单在同一 confirmed close 成交后,同步 Strategy Tester 的真实持仓。
 // Entry 的事实来源是 0 -> 非 0 的 broker position transition;pending state 只
 // 提供已经冻结的信号上下文,不能单独决定是否发生了成交。
 if entryFilled and entryContextAvailable and not consistencyRecoveryRequired
@@ -1173,7 +1199,7 @@ if trimFilled and not consistencyRecoveryRequired
 // A valid trade context must agree with the broker direction and contain every
 // frozen level used by confirmed-close management. Invalid contexts never
 // submit a lifecycle order or draw old trade lines.
-bool tradeContextValid = not consistencyRecoveryRequired and not fillState.consistencyRecoveryPending and fillState.active and fillState.pos != 0 and currentPositionSize * fillState.pos > 0.0 and currentPositionDir == fillState.pos and not na(fillState.entryPrice) and not na(fillState.entrySize) and fillState.entrySize > 0.0 and not na(fillState.partialTarget) and not na(fillState.finalTarget) and not na(fillState.baseStop)
+bool tradeContextValid = not consistencyRecoveryRequired and not fillState.consistencyRecoveryPending and fillState.active and fillState.pos != 0 and currentPositionSize * fillState.pos > 0.0 and currentPositionDir == fillState.pos and not na(fillState.referenceEntryPrice) and not na(fillState.brokerEntryPrice) and not na(fillState.entrySize) and fillState.entrySize > 0.0 and not na(fillState.partialTarget) and not na(fillState.finalTarget) and not na(fillState.baseStop)
 
 f_manage(1, allowBarCloseDecision, tradeContextValid)
 f_manage(-1, allowBarCloseDecision, tradeContextValid)
@@ -1182,14 +1208,14 @@ f_manage(-1, allowBarCloseDecision, tradeContextValid)
 // Entry ID. partialTaken remains false until the broker position really shrinks.
 if tradeContextValid and fillState.trimRequested and not fillState.partialTaken
     string trimEntryId = fillState.pos == 1 ? "MR-L" : "MR-S"
-    strategy.close(trimEntryId, comment = "Trim", qty_percent = trimPct, alert_message = f_orderMessage(fillState.pos, "Trim", fillState.tradeMode, close), immediately = false)
+    strategy.close(trimEntryId, comment = "Trim", qty_percent = trimPct, alert_message = f_orderMessage(fillState.pos, "Trim", fillState.tradeMode, close))
 
 // Stop/BE, Trend Fail, Timeout, and Final all close the actual remainder with a
 // market order. Lifecycle reset waits for the broker position to become flat.
 if tradeContextValid and fillState.exitRequested and not fillState.marketClosePlaced
     string closeEntryId = fillState.pos == 1 ? "MR-L" : "MR-S"
     string closeEvent = f_exitName(fillState.exitReasonPending)
-    strategy.close(closeEntryId, comment = closeEvent, alert_message = f_orderMessage(fillState.pos, closeEvent, fillState.tradeMode, close), immediately = false)
+    strategy.close(closeEntryId, comment = closeEvent, alert_message = f_orderMessage(fillState.pos, closeEvent, fillState.tradeMode, close))
     fillState.marketClosePlaced := true
 
 // 识别真实持仓归零,再 reset fillState。这样 Strategy Tester 的订单生命周期
@@ -1213,15 +1239,15 @@ fillState.previousExecutionPositionSize := currentPositionSize
 fillState.observedClosedTrades := closedTradesNow
 
 // 派生一次性显示事件(全局作用域写全局变量是允许的)
-entryEvent := fillState.eventKind == 1
-entryEventDir := fillState.eventDir
-partialEvent := fillState.eventKind == 2
-partialEventDir := fillState.eventDir
-exitEvent := fillState.eventKind == 3
-exitEventDir := fillState.eventDir
-exitReason := fillState.eventReason
-int eventMode = fillState.eventMode
-float eventPrice = fillState.eventPrice
+entryEvent := fillState.decisionEventKind == 1
+entryEventDir := fillState.decisionEventDir
+partialEvent := fillState.decisionEventKind == 2
+partialEventDir := fillState.decisionEventDir
+exitEvent := fillState.decisionEventKind == 3
+exitEventDir := fillState.decisionEventDir
+exitReason := fillState.decisionEventReason
+int eventMode = fillState.decisionEventMode
+float eventPrice = fillState.decisionEventPrice
 
 
 // ============================================================================
@@ -1388,14 +1414,18 @@ plot(fillState.trimRequested ? 1 : 0, "Pending Trim Fill", display = display.dat
 plot(fillState.exitRequested ? 1 : 0, "Pending Full Exit Fill", display = display.data_window)
 plot(fillState.latestClosedExitCode, "Latest Closed Entry ID Code", display = display.data_window)
 plot(fillState.eventKind, "Fill Event Type", display = display.data_window)
+plot(fillState.decisionEventKind, "Decision Event Type", display = display.data_window)
 plot(fillState.active ? 1 : 0, "Broker-synced Trade Active", display = display.data_window)
 plot(fillState.partialTaken ? 1 : 0, "Broker-synced Partial Taken", display = display.data_window)
 plot(fillState.entryDecisionBar, "Entry Decision Bar", display = display.data_window)
 plot(fillState.entryFillBar, "Entry Fill Bar", display = display.data_window)
+plot(fillState.referenceEntryPrice, "Reference Entry Price", display = display.data_window)
+plot(fillState.brokerEntryPrice, "Broker Entry Price", display = display.data_window)
 plot(fillState.trimDecisionBar, "Trim Decision Bar", display = display.data_window)
 plot(fillState.trimFillBar, "Trim Fill Bar", display = display.data_window)
 plot(fillState.exitDecisionBar, "Exit Decision Bar", display = display.data_window)
-plot(fillState.lastExitBar, "Last Exit Decision Bar", display = display.data_window)
+plot(fillState.fullExitFillBar, "Full Exit Fill Bar", display = display.data_window)
+plot(fillState.lastExitBar, "Last Exit Bar", display = display.data_window)
 plot(fillState.shockZCandidates, "Shock Z Candidates", display = display.data_window)
 plot(fillState.shockMoveCandidates, "Shock Move Candidates", display = display.data_window)
 plot(fillState.shockEnvironmentPass, "Shock Environment Pass", display = display.data_window)
@@ -1449,7 +1479,7 @@ if showPanel and barstate.islast
     string modeText = tradeContextValid ? f_modeName(fillState.tradeMode) : fillState.pendingEntry ? f_modeName(fillState.pendingMode) : "-"
     string stopText = stopMode
     string phaseText = tradeContextValid ? fillState.exitRequested ? f_tr("等待全平成交", "Full exit pending") : fillState.trimRequested ? f_tr("等待T减成交", "Trim fill pending") : fillState.partialTaken ? f_tr("T减后", "Final phase") : f_tr("等待T减", "Trim phase") : fillState.pendingEntry ? f_tr("等待进场成交", "Entry pending") : "-"
-    string entryText = not tradeContextValid ? "-" : str.tostring(fillState.entryPrice, format.mintick)
+    string entryText = not tradeContextValid ? "-" : str.tostring(fillState.brokerEntryPrice, format.mintick)
     string trimText = not tradeContextValid ? "-" : str.tostring(fillState.partialTarget, format.mintick)
     string finalText = not tradeContextValid ? "-" : str.tostring(fillState.finalTarget, format.mintick)
     string riskText = not tradeContextValid ? "-" : str.tostring(f_activeStop(fillState.pos), format.mintick)
@@ -1539,7 +1569,7 @@ if setupEvent
     alert(f_orderMessage(setupEventDir, setupEventName, setupEventMode, close), alert.freq_all)
 
 if entryEvent
-    alert(f_orderMessage(entryEventDir, "Entry Fill", eventMode, eventPrice), alert.freq_all)
+    alert(f_orderMessage(entryEventDir, "Entry Decision", eventMode, eventPrice), alert.freq_all)
 
 if partialEvent
     alert(f_orderMessage(partialEventDir, "Trim", eventMode, eventPrice), alert.freq_all)

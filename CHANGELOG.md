@@ -2,6 +2,29 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] — V2 Decision-Parity Strategy fills
+
+This release aligns the Strategy Tester execution timeline with MR-T Production v2.0.0 while retaining real broker positions and a real partial exit.
+
+### Changed
+
+- **Same-close confirmed execution** — `process_orders_on_close = true`, `calc_on_order_fills = true`, `calc_on_every_tick = false`, and `pyramiding = 0`. Entry, Trim, Final, Stop/BE, Trend Fail, and Timeout remain confirmed-close decisions; their market orders fill on that same close.
+- **V2 parity margin baseline** — `margin_long = 0` and `margin_short = 0` disable Broker Emulator margin liquidation for parity testing. This does not model a live account's margin configuration.
+- **Frozen V2 reference price** — `referenceEntryPrice` is the Entry decision close used by ATR stop and BE thresholds; `brokerEntryPrice` records the actual `strategy.position_avg_price` separately.
+- **Strict lifecycle phase boundary** — Entry and Trim fill recalculations only synchronize broker state. Entry management begins on the next bar, and post-Trim BE/Final management begins on the next bar after Trim.
+- **Direct fill diagnostics** — Data Window exposes Entry/Trim/Exit decision bars, Entry/Trim/Full Exit fill bars, reference/broker entry prices, and the consistency recovery counter. Same-close parity requires each decision bar to equal its corresponding fill bar.
+
+### Preserved
+
+- V2 Range/ Shock setup logic, Shock priority and funnel, Regime Score, Hard Trend Veto, Z reclaim and band reclaim, frozen mean/std/ATR/Half-Life, Tight/Balanced/Loose stop construction, Trend Fail, Timeout, cooldown, lifecycle priority, cross-date holding, and consistency recovery protection.
+- Real `trimPct` partial close (default 50%), Strategy Tester commission/slippage defaults, and the absence of intrabar `strategy.order`, `strategy.exit`, stop/limit brackets, and OCA groups.
+
+### Verification
+
+- `tests/MRT-v3.2.0-v2-parity-harness.ps1` is the single current static/lifecycle parity harness.
+- `git diff --check` is required before release.
+- TradingView Pine v6 compilation and Strategy Tester runtime/parity verification remain pending manual TradingView verification.
+
 ## [3.1.1] — Compile fix and decision-bar timing alignment
 
 This patch keeps the confirmed-close MR-T decision model and real Strategy Tester broker fills while separating strategy decision bars from actual fill bars.
@@ -19,7 +42,7 @@ This patch keeps the confirmed-close MR-T decision model and real Strategy Teste
 
 ### Verification
 
-- `tests/MRT-v3.1.1-confirmed-close-harness.ps1` covers Entry/Trim decision-versus-fill timing, TimeStop, cooldown, fill-only synchronization, unified `f_manage()` return typing, function branch scanning, Long/Short symmetry, consistency recovery, and unchanged order contracts.
+- The current regression contract is maintained by `tests/MRT-v3.2.0-v2-parity-harness.ps1`, which covers the decision-versus-fill timing and lifecycle checks introduced here.
 - Static review and `git diff --check` are required before release.
 - Pine v6 compilation and Strategy Tester runtime verification remain pending manual TradingView verification.
 

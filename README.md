@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md) · English
 
-A production-grade **Confirmed-close MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.1.1 makes every lifecycle decision from a confirmed **15-minute close**, then lets Strategy Tester fill the real market order at the next available tick. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
+A production-grade **V2 Decision-Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.2.0 makes every lifecycle decision from a confirmed **15-minute close**, then lets Strategy Tester fill the real market order on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.1.1-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.2.0-informational)](CHANGELOG.md)
 
 ---
 
@@ -30,7 +30,7 @@ Most mean-reversion indicators fire a signal the moment price strays from the me
 | Strategy Tester | Real `strategy.entry` and `strategy.close` market orders; formal P&L and positions come from Strategy Tester |
 | Partial exits | Configurable `trimPct` (default 50%) for T-trim; T-close exits the remaining position |
 | Cost-aware breakeven | Strategy Tester commission/slippage are the formal cost source; matching inputs size the post-trim breakeven estimate |
-| Confirmed-close lifecycle | Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final are decided only at confirmed 15m closes |
+| V2 Decision-Parity lifecycle | Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final are decided only at confirmed 15m closes and use same-close market fills |
 | Broker fill state | A dedicated `varip` fill state synchronizes real position transitions across `calc_on_order_fills` executions without making new decisions |
 | Broker/fill-state consistency | Classifies flat, pending, stale, mismatched, orphan, and direct-reversal states; invalid contexts are cleared or safely closed |
 | No intrabar brackets | Risk/Trim/Final levels are decision thresholds, not continuously resting stop/limit orders |
@@ -96,8 +96,8 @@ There is no session-end liquidation. Positions and pending mean-reversion setups
 
 1. Add `MRT.pine` to a **15m** chart. The script intentionally errors on other chart timeframes.
 2. Open **Strategy Tester -> Properties** and confirm commission is `0.03%` per order (3 bp) and slippage is `0` ticks, or change both the Properties values and the matching script inputs.
-3. Confirm `Pyramiding` is `0` and choose the desired default order size in Properties. The script defaults to 100% of equity for a single position.
-4. Verify the tester trade markers: entry fills on the next available tick after a confirmed signal; T-trim reduces the position by `trimPct`; T-close exits the remainder.
+3. Confirm `Pyramiding` is `0`, `Margin for long positions` and `Margin for short positions` are `0%`, and choose the desired default order size in Properties. The script defaults to 100% of equity for a single position.
+4. Verify the tester trade markers: entry fills on the same close as the confirmed signal; T-trim reduces the position by `trimPct`; T-close exits the remainder on the same close as its decision.
 5. Use the chart’s Risk/Trim/Final lines and the panel’s Tester rows for inspection. Net profit, win rate, drawdown, profit factor, and trade count in Strategy Tester are the formal results.
 
 ---
@@ -214,11 +214,15 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 
 Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the post-trim breakeven estimate uses the same assumptions.
 
-After a real T-trim fill, the remaining stop is moved to `entry +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock are lightweight auxiliary classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
+After a real T-trim fill, the remaining stop is moved to `referenceEntryPrice +/- transaction cost` when `moveStopToBE` is enabled. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values; it does not use the former virtual P&L counters. Range/Shock are lightweight auxiliary classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
 
-The broker emulator uses standard market-order handling. A confirmed-close Entry, Trim, Final, Stop/BE, Trend Fail, or Timeout decision creates an order that fills at the next available tick because `process_orders_on_close = false` and every `strategy.close` uses `immediately = false`. The chart levels are thresholds for the decision close; they are not guaranteed fill prices.
+### v3.2.0 V2 Decision-Parity execution
 
-### v3.1.1 confirmed-close broker/fill-state consistency
+The broker emulator uses confirmed-close market orders with `process_orders_on_close = true`. Entry, Trim, Final, Stop/BE, Trend Fail, and Timeout decisions are made only on a confirmed 15m close, and the corresponding market order fills on that same close. Custom `T-buy`, `T-short`, `T-trim`, and exit labels represent the MR-T decision event; native Strategy Tester order markers represent the Broker fill. `calc_on_order_fills = true` is used only to synchronize the real broker position, average price, and partial/full-fill lifecycle; a fill recalculation never creates another lifecycle decision.
+
+The parity baseline sets `margin_long = 0` and `margin_short = 0`. This disables Broker Emulator margin liquidation so the strategy trajectory can reproduce the original MR-T indicator without Margin Call-driven position reductions. It is a V2 equivalence setting, not a recommendation for a live account's actual margin configuration. The chart levels remain confirmed-close decision thresholds, not intrabar stop/limit orders.
+
+### Broker/fill-state consistency
 
 `strategy.position_size` and `strategy.position_avg_price` are the broker emulator’s source of truth. `MRFillState` only stores the frozen signal context, lifecycle phase, exit reason, and auxiliary statistics. The script exposes a numeric consistency classifier in the Data Window:
 
@@ -235,7 +239,7 @@ The broker emulator uses standard market-order handling. A confirmed-close Entry
 
 Stale context is cleared without incrementing Range/Shock Closed or Wins. An orphan or direct-reversal broker position cancels unfilled orders and is closed with `strategy.close_all()`; it is never initialized as a new trade from current mean/std values. Normal lifecycle management does not use `strategy.order`, `strategy.exit`, stop/limit prices, or OCA groups. Trade lines are shown only while a real broker position and a direction-matched active lifecycle both exist.
 
-The lifecycle phases are: signal state → pending Entry → active pre-Trim → pending Trim fill → active post-Trim → pending Full Exit → flat. `entryDecisionBar`, `trimDecisionBar`, and `exitDecisionBar` are confirmed-close strategy anchors; `entryFillBar` and `trimFillBar` describe Broker Emulator executions. `partialTaken` becomes true only after `strategy.position_size` really shrinks, and the lifecycle resets only after it really reaches zero. `Consistency Recovery Count` should remain `0` for normal historical operation.
+The lifecycle phases are: signal state → pending Entry → active pre-Trim → pending Trim fill → active post-Trim → pending Full Exit → flat. `entryDecisionBar`, `trimDecisionBar`, and `exitDecisionBar` are confirmed-close strategy anchors; `entryFillBar`, `trimFillBar`, and `fullExitFillBar` describe Broker Emulator executions. In the parity baseline, each decision bar equals its corresponding fill bar. `referenceEntryPrice` is the V2 decision-close price used by targets, risk thresholds, and BE; `brokerEntryPrice` is the actual `strategy.position_avg_price` used as the Broker fact. `partialTaken` becomes true only after `strategy.position_size` really shrinks, and the lifecycle resets only after it really reaches zero. `Consistency Recovery Count` should remain `0` for normal historical operation.
 
 `f_manage()` returns one `int` action code for diagnostics (`MANAGE_NONE`, `MANAGE_STOP_BE`, `MANAGE_TREND`, `MANAGE_TIMEOUT`, `MANAGE_TRIM`, or `MANAGE_FINAL`). Lifecycle fields remain the source of truth for order submission.
 
@@ -248,30 +252,32 @@ Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Sho
 - Setup, Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final decisions are gated on the normal confirmed-bar decision phase. One bar can create at most one lifecycle decision.
 - `calc_on_order_fills` executions are reserved for synchronizing actual Entry/Trim/Exit state. Historical fill executions can still have `barstate.isconfirmed = true`, so a detected broker-position change suppresses decisions on that execution.
 - Higher-timeframe values are the **last confirmed 1H bar** (`f_erPrev` / `f_slopeATRPrev` + `barmerge.lookahead_on`) - no future leak.
-- The confirmed signal bar queues an order; after the fill, targets/stops are **frozen from the actual `strategy.position_avg_price`** and the signal-bar regime context.
+- The confirmed signal bar queues a same-close market order; the V2 decision thresholds are frozen from `referenceEntryPrice = close` and the signal-bar regime context, while `brokerEntryPrice = strategy.position_avg_price` records the actual Tester fill.
 - The half-life estimate uses only past data.
 
-The confirmed Entry signal bar is stored as `entryDecisionBar`; the actual Broker Emulator fill is stored as `entryFillBar`. Entry-fill recalculation only synchronizes the real price, size, and frozen context, while the confirmed close of that fill bar may perform the first management because `bar_index > entryDecisionBar`. A Trim signal stores `trimDecisionBar`; its real reduction is stored as `trimFillBar`. Trim-fill recalculation only synchronizes the reduced broker position, while that bar's confirmed close may perform BE/Final management because `bar_index > trimDecisionBar`. A full-exit decision stores `exitDecisionBar`, and the broker's later flat transition uses that decision bar for cooldown.
+The confirmed Entry signal bar is stored as `entryDecisionBar`; the same-close Broker Emulator fill is stored as `entryFillBar`. Entry-fill recalculation only synchronizes the real price, size, and frozen context; the Entry decision bar itself cannot also be managed because management requires `bar_index > entryDecisionBar`. The next confirmed close is the first management opportunity. A Trim signal stores `trimDecisionBar`; its same-close reduction is stored as `trimFillBar`. Trim-fill recalculation only synchronizes the reduced broker position; the next confirmed close may perform BE/Final management because `bar_index > trimDecisionBar`. A full-exit decision stores `exitDecisionBar`, and `fullExitFillBar` records the same-close flat transition; `lastExitBar` uses that actual bar for cooldown.
 
-### v3.1.1 TradingView validation checklist
+### v3.2.0 TradingView validation checklist
 
 After compiling in TradingView on a 15-minute chart:
 
 1. Pine v6 compiles successfully on a 15m chart.
-2. `MR-L` / `MR-S` fills at the next available tick after the confirmed signal close.
-3. Entry fill execution only synchronizes state; the confirmed close of the Entry fill bar may trigger Trim, Stop, Trend Fail, or Timeout.
+2. `MR-L` / `MR-S` fills on the same confirmed signal close; `Entry Decision Bar = Entry Fill Bar`.
+3. Entry fill execution only synchronizes state; the Entry decision bar does not trigger Trim, Stop, Trend Fail, or Timeout, and the next confirmed close is the first management bar.
 4. Trim triggers only when the confirmed close reaches the frozen Trim level.
 5. The real broker position is reduced by `trimPct` (default 50%).
-6. Trim fill execution only synchronizes state; BE and Final are eligible at the confirmed close of the Trim fill bar.
+6. Trim fill execution only synchronizes state; the Trim decision bar does not trigger BE or Final, and the next confirmed close is eligible for them.
 7. Stop triggers only when the confirmed close crosses the displayed Risk level.
 8. Trend Fail is evaluated only at a confirmed close.
 9. Timeout is evaluated only at a confirmed close.
 10. Long and Short behavior is mirrored, and positions can cross trading dates.
 11. Broker Position and FillState direction remain consistent through every fill.
-12. `Consistency Recovery Count` remains 0 on normal historical paths.
-13. At a final flat state, Range + Shock Entries equals Range + Shock Closed (apart from a genuinely pending order).
-14. No normal order list contains `MR-L/MR-S-STOP`, `-TRIM`, or `-FINAL` bracket IDs.
-15. Entry/Trim fill executions never make lifecycle decisions, and one confirmed close never emits more than one lifecycle action. Bar Magnifier OFF/ON should not materially alter lifecycle decisions.
+12. `Exit Decision Bar = Full Exit Fill Bar`, and `lastExitBar` is that same bar.
+13. `Reference Entry Price` is the decision close and `Broker Entry Price` is `strategy.position_avg_price`.
+14. `Margin Call` does not occur under the parity settings, and `Consistency Recovery Count` remains `0` on normal historical paths.
+15. At a final flat state, Range + Shock Entries equals Range + Shock Closed (apart from a genuinely pending order).
+16. No normal order list contains `MR-L/MR-S-STOP`, `-TRIM`, or `-FINAL` bracket IDs.
+17. Entry/Trim fill executions never make lifecycle decisions, and one confirmed close never emits more than one lifecycle action. Bar Magnifier OFF/ON should not materially alter lifecycle decisions.
 
 The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 
