@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $repoRoot 'MRT.pine'
-$baselineCommit = '07cbe31a1c9adbdf5d96a6c84558184adfb0cdfb'
+$baselineCommit = 'cb3e18714c1eecf17f9561e5bb33f76fb747ba5c'
 $v2Commit = 'fdb2a7d0ff0cf082af2ee15476e8bdb03b708151'
 
 function Assert-True {
@@ -86,23 +86,34 @@ function Get-Decision {
         [double]$PartialTarget,
         [double]$FinalTarget,
         [bool]$PartialTaken,
-        [double]$High,
-        [double]$Low,
         [double]$Close,
+        [double]$RoundTripCost,
         [bool]$TrendExit = $false,
         [bool]$Timeout = $false
     )
 
     $activeStop = if ($PartialTaken) {
-        if ($Dir -eq 1) { [math]::Max($BaseStop, $EntryPrice) } else { [math]::Min($BaseStop, $EntryPrice) }
+        if ($Dir -eq 1) {
+            [math]::Max($BaseStop, $EntryPrice + $RoundTripCost)
+        }
+        else {
+            [math]::Min($BaseStop, $EntryPrice - $RoundTripCost)
+        }
     } else {
         $BaseStop
     }
 
-    $stopReached = if ($Dir -eq 1) { $Low -le $activeStop } else { $High -ge $activeStop }
-    $partialPriceReached = if ($Dir -eq 1) { $High -ge $PartialTarget } else { $Low -le $PartialTarget }
-    $partialReached = (-not $PartialTaken) -and $partialPriceReached
-    $finalReached = if ($Dir -eq 1) { $High -ge $FinalTarget } else { $Low -le $FinalTarget }
+    $stopReached = if ($Dir -eq 1) { $Close -le $activeStop } else { $Close -ge $activeStop }
+
+    $partialReached = $false
+    if (-not $PartialTaken) {
+        $partialReached = if ($Dir -eq 1) { $Close -ge $PartialTarget } else { $Close -le $PartialTarget }
+    }
+
+    $finalReached = $false
+    if ($PartialTaken) {
+        $finalReached = if ($Dir -eq 1) { $Close -ge $FinalTarget } else { $Close -le $FinalTarget }
+    }
 
     if ($stopReached) { return 'STOP' }
     if ($TrendExit) { return 'TREND' }
@@ -119,10 +130,9 @@ function Invoke-LifecycleCase {
         [double]$BaseStop,
         [double]$PartialTarget,
         [double]$FinalTarget,
-        [double]$TrimHigh,
-        [double]$TrimLow,
-        [double]$FinalHigh,
-        [double]$FinalLow
+        [double]$TrimClose,
+        [double]$FinalClose,
+        [double]$RoundTripCost
     )
 
     $partialTaken = $false
@@ -130,13 +140,13 @@ function Invoke-LifecycleCase {
     $exitDecisionBar = $null
     $events = [System.Collections.Generic.List[string]]::new()
 
-    $trimDecision = Get-Decision $Dir $EntryPrice $BaseStop $PartialTarget $FinalTarget $partialTaken $TrimHigh $TrimLow $PartialTarget
+    $trimDecision = Get-Decision $Dir $EntryPrice $BaseStop $PartialTarget $FinalTarget $partialTaken $TrimClose $RoundTripCost
     Assert-True ($trimDecision -eq 'TRIM') "trim decision should be TRIM"
     $partialTaken = $true
     $trimDecisionBar = 2
     $events.Add("2:TRIM")
 
-    $finalDecision = Get-Decision $Dir $EntryPrice $BaseStop $PartialTarget $FinalTarget $partialTaken $FinalHigh $FinalLow $FinalTarget
+    $finalDecision = Get-Decision $Dir $EntryPrice $BaseStop $PartialTarget $FinalTarget $partialTaken $FinalClose $RoundTripCost
     Assert-True ($finalDecision -eq 'FINAL') "post-trim final decision should be FINAL"
     $partialTaken = $false
     $exitDecisionBar = 3
@@ -154,13 +164,13 @@ $source = [System.IO.File]::ReadAllText($scriptPath)
 $baselineSource = ((& git -C $repoRoot show "$($baselineCommit):MRT.pine") -join [Environment]::NewLine)
 $v2Source = ((& git -C $repoRoot show "$($v2Commit):MRT.pine") -join [Environment]::NewLine)
 
-Write-Host 'MRT v3.3.0 V2 Logic-State Parity Harness'
+Write-Host 'MRT v3.3.1 V2 Logic-State Parity Harness'
 Write-Host "Repo: $repoRoot"
 Write-Host "Current baseline: $baselineCommit"
 Write-Host "V2 baseline: $v2Commit"
 
 # Version, settings, and input compatibility.
-Assert-Match $source 'SCRIPT_VERSION\s*=\s*"3\.3\.0"' 'SCRIPT_VERSION must be 3.3.0'
+Assert-Match $source 'SCRIPT_VERSION\s*=\s*"3\.3\.1"' 'SCRIPT_VERSION must be 3.3.1'
 Assert-Match $source 'strategy\([^\r\n]*commission_type\s*=\s*strategy\.commission\.percent[^\r\n]*commission_value\s*=\s*0\.03' 'strategy commission settings changed'
 Assert-Match $source 'strategy\([^\r\n]*slippage\s*=\s*0' 'strategy slippage setting changed'
 
@@ -338,33 +348,131 @@ Assert-Match $source 'if entryEvent[\s\S]{0,500}label\.new' 'entry T labels must
 Assert-Match $source 'if partialEvent[\s\S]{0,500}label\.new' 'trim T labels must be Logic-event based'
 Assert-Match $source 'if exitEvent[\s\S]{0,500}label\.new' 'exit T labels must be Logic-event based'
 
-# Required data-window diagnostics.
+# Required long-lived Data Window diagnostics.
 foreach ($dataWindowLabel in @(
+    'Z-score', 'Regime Score', 'Half-Life', 'Shock ATR', 'Previous Shock ATR',
+    '15m ER', '1H ER', '15m Slope', '1H Slope',
     'Logic Position', 'Logic Partial Taken', 'Logic Entry Bar', 'Logic Entry Price',
-    'Logic Partial Target', 'Logic Final Target', 'Logic Base Stop', 'Logic Active Stop',
-    'Logic Time Stop', 'Logic Last Exit Bar', 'Logic Event Code', 'Logic Event Reason',
+    'Logic Partial Target', 'Logic Final Target', 'Logic Active Stop', 'Logic Time Stop',
+    'Logic Last Exit Bar', 'Logic Event Code', 'Logic Event Reason',
+    'Logic Trim Decision Bar', 'Logic Exit Decision Bar',
     'Broker Position', 'Broker Entry Price', 'Broker Fill Event', 'Broker Recovery Count',
-    'Broker Consistency State', 'Direction Reversal Detected', 'Logic Trim Decision Bar',
-    'Broker Trim Fill Bar', 'Logic Exit Decision Bar', 'Broker Full Exit Fill Bar'
+    'Broker Consistency State', 'Broker Entry Fill Bar', 'Broker Trim Fill Bar',
+    'Broker Full Exit Fill Bar',
+    'Range Entries', 'Range Closed', 'Range Wins', 'Shock Entries', 'Shock Closed', 'Shock Wins',
+    'Latest Closed Entry ID Code', 'Shock Z Candidates', 'Shock Move Candidates',
+    'Shock Environment Pass', 'Shock Deceleration Pass', 'Shock Rejection Pass',
+    'Shock Setups', 'Shock Confirmed Entries'
 )) {
     Assert-Match $source ([regex]::Escape($dataWindowLabel)) "missing Data Window field: $dataWindowLabel"
 }
 
-# Dynamic lifecycle checks for the two reported failure modes and cooldown semantics.
-$caseA = Invoke-LifecycleCase -Dir -1 -EntryPrice 100 -BaseStop 101 -PartialTarget 95 -FinalTarget 90 -TrimHigh 100 -TrimLow 95 -FinalHigh 94 -FinalLow 90
-Assert-True ($caseA.Events -join ',' -eq '2:TRIM,3:FINAL') 'Case A must trim on bar 2 and final-exit on the next bar'
+# These fields remain available in the Panel or Strategy Tester, but must not
+# consume permanent Data Window plot counts.
+foreach ($removedDataWindowLabel in @(
+    'Strategy Tester Net P&L', 'Strategy Position Avg Price', 'Broker Fill Event Bar',
+    'Previous Execution Position Size', 'Direction Reversal Detected',
+    'Broker Entry Intent Pending', 'Broker Trim Intent Pending', 'Broker Full Exit Intent Pending',
+    'Broker Execution Cost Estimate', 'Logic Base Stop', 'Logic Entry Decision Bar'
+)) {
+    Assert-NotMatch $source ([regex]::Escape($removedDataWindowLabel)) "冗余 Data Window field remains: $removedDataWindowLabel"
+}
+
+# Plot budget: TradingView counts Data Window plots too. The current script has
+# const-color fills, so they do not add a dynamic fill plot count.
+$plotFunctionPatterns = [ordered]@{
+    'plot()' = '(?m)\bplot\s*\('
+    'plotshape()' = '(?m)\bplotshape\s*\('
+    'plotchar()' = '(?m)\bplotchar\s*\('
+    'plotarrow()' = '(?m)\bplotarrow\s*\('
+    'plotbar()' = '(?m)\bplotbar\s*\('
+    'plotcandle()' = '(?m)\bplotcandle\s*\('
+    'alertcondition()' = '(?m)\balertcondition\s*\('
+    'bgcolor()' = '(?m)\bbgcolor\s*\('
+    'barcolor()' = '(?m)\bbarcolor\s*\('
+    'fill()' = '(?m)\bfill\s*\('
+}
+$plotCounts = [ordered]@{}
+foreach ($entry in $plotFunctionPatterns.GetEnumerator()) {
+    $plotCounts[$entry.Key] = [regex]::Matches($source, $entry.Value).Count
+}
+$dataWindowPlotLines = @($source -split '\r?\n' | Where-Object {
+    $_ -match '^\s*plot\s*\(' -and $_ -match 'display\s*=\s*display\.data_window'
+})
+$dataWindowPlotCount = $dataWindowPlotLines.Count
+$dynamicFillLines = @($source -split '\r?\n' | Where-Object {
+    $_ -match '^\s*fill\s*\(' -and $_ -notmatch 'color\s*=\s*color\.new\(color\.(red|green),\s*94\)'
+})
+$dynamicFillCount = $dynamicFillLines.Count
+$expectedPlotCount = $plotCounts['plot()'] + $plotCounts['plotshape()'] + $plotCounts['plotchar()'] + $plotCounts['plotarrow()'] + $plotCounts['plotbar()'] + $plotCounts['plotcandle()'] + $plotCounts['alertcondition()'] + $plotCounts['bgcolor()'] + $plotCounts['barcolor()'] + $dynamicFillCount
+
+Assert-True ($dataWindowPlotCount -le 47) "Data Window plot() budget exceeded: $dataWindowPlotCount"
+Assert-True ($plotCounts['plot()'] -le 57) "plot() call budget exceeded: $($plotCounts['plot()'])"
+Assert-True ($plotCounts['fill()'] -eq 2) "expected two Shock fill() calls, found $($plotCounts['fill()'])"
+Assert-True ($plotCounts['bgcolor()'] -eq 1) "expected one bgcolor() call, found $($plotCounts['bgcolor()'])"
+Assert-True ($dynamicFillCount -eq 0) "dynamic fill colors consume unexpected plot counts: $dynamicFillCount"
+Assert-Match $source 'fill\(pShockUpper,\s*pStopUpper,\s*color\s*=\s*color\.new\(color\.red,\s*94\)\)' 'upper Shock fill must use const color'
+Assert-Match $source 'fill\(pShockLower,\s*pStopLower,\s*color\s*=\s*color\.new\(color\.green,\s*94\)\)' 'lower Shock fill must use const color'
+Assert-True ($expectedPlotCount -le 60) "expected TradingView plot-count budget exceeded: $expectedPlotCount"
+
+# Confirmed-close-only regression checks for both the Pine management function
+# and this harness's own dynamic decision model.
+$pineManageBody = Get-FunctionBody $source 'f_logicManage'
+Assert-Match $pineManageBody 'stopHit\s*=.*close\s*<=\s*activeStop.*close\s*>=\s*activeStop' 'Pine Stop must use close only'
+Assert-Match $pineManageBody 'partialReached\s*=.*close\s*>=\s*logic\.partialTarget.*close\s*<=\s*logic\.partialTarget' 'Pine Trim must use close only'
+Assert-Match $pineManageBody 'finalReached\s*=.*close\s*>=\s*logic\.finalTarget.*close\s*<=\s*logic\.finalTarget' 'Pine Final must use close only'
+Assert-NotMatch $pineManageBody '\b(high|low)\b' 'Pine management must not use High/Low intrabar touches'
+
+$harnessSource = [System.IO.File]::ReadAllText($PSCommandPath)
+$decisionMatch = [regex]::Match($harnessSource, '(?ms)^function Get-Decision\s*\{(?<body>.*?)(?=^function\s|\z)')
+Assert-True $decisionMatch.Success 'Get-Decision function body missing'
+$decisionBody = $decisionMatch.Groups['body'].Value
+Assert-Match $decisionBody '\$Close' 'Get-Decision must use Close'
+Assert-NotMatch $decisionBody '\$(High|Low)|\bHigh\b|\bLow\b' 'Get-Decision must not use High/Low'
+
+# Dynamic Case A: Short T-trim followed by next-bar T-close. Both decisions
+# use only the confirmed close, and Final requires PartialTaken = true.
+$caseA = Invoke-LifecycleCase -Dir -1 -EntryPrice 100 -BaseStop 110 -PartialTarget 95 -FinalTarget 90 -TrimClose 95 -FinalClose 90 -RoundTripCost 0.06
+Assert-True ($caseA.Events -join ',' -eq '2:TRIM,3:FINAL') 'Case A must produce Short T空 -> T减 -> next-bar T平'
 Assert-True ($caseA.PartialTaken -eq $false) 'Case A must be flat in Logic after final exit'
 Assert-True ($caseA.TrimDecisionBar -eq 2 -and $caseA.ExitDecisionBar -eq 3) 'Case A decision bars are wrong'
 
-$caseBDecision = Get-Decision 1 100 101 105 108 $false 102 100 101
-Assert-True ($caseBDecision -eq 'STOP') 'Case B long stop must win before trim/final logic'
-$caseBNoTrimAfterStop = Get-Decision 1 100 101 105 108 $false 102 100 101
-Assert-True ($caseBNoTrimAfterStop -ne 'TRIM') 'Case B must not emit trim after stop'
+# Dynamic Case B: a Long confirmed close reaches Stop before either target.
+$caseBPosition = 1
+$caseBPartialTaken = $false
+$caseBEvents = [System.Collections.Generic.List[string]]::new()
+$caseBDecision = Get-Decision 1 100 101 105 108 $caseBPartialTaken 101 0.0
+Assert-True ($caseBDecision -eq 'STOP') 'Case B long Stop must win before Trim/Final'
+if ($caseBDecision -eq 'STOP') {
+    $caseBPosition = 0
+    $caseBEvents.Add('2:STOP')
+}
+Assert-True ($caseBPosition -eq 0) 'Case B Logic must be flat immediately after Stop'
+$caseBNextDecision = if ($caseBPosition -eq 0) { 'NONE' } else { Get-Decision 1 100 101 105 108 $caseBPartialTaken 105 0.0 }
+Assert-True ($caseBNextDecision -ne 'TRIM' -and ($caseBEvents -join ',') -eq '2:STOP') 'Case B must not emit a later Trim after Stop'
 
-$beDecision = Get-Decision 1 100 95 105 110 $true 104 100.5 103
-Assert-True ($beDecision -eq 'NONE') 'post-trim BE stop must not trigger on a bar that only touches below target'
-$beStopDecision = Get-Decision 1 100 95 105 110 $true 101 99 99
-Assert-True ($beStopDecision -eq 'STOP') 'post-trim BE stop must control the next bar'
+# Dynamic BE checks: the frozen V2 round-trip commission cost is part of the
+# active stop, and a BE-triggered Stop maps to R_BE in the lifecycle layer.
+$moveStopToBE = $true
+$longEntryPrice = 100.0
+$longRoundTripCost = 0.06
+$longActiveStop = [math]::Max(95.0, $longEntryPrice + $longRoundTripCost)
+Assert-True ([math]::Abs($longActiveStop - 100.06) -lt 1e-9) 'Long BE stop must equal Entry + RoundTripCost'
+$longBEContinue = Get-Decision 1 $longEntryPrice 95 105 110 $true 100.10 $longRoundTripCost
+Assert-True ($longBEContinue -eq 'NONE') 'Long BE must not trigger above Entry + cost'
+$longBEDecision = Get-Decision 1 $longEntryPrice 95 105 110 $true 100.05 $longRoundTripCost
+Assert-True ($longBEDecision -eq 'STOP') 'Long BE must trigger below Entry + cost'
+$longBEReason = if ($longBEDecision -eq 'STOP' -and $moveStopToBE) { 'R_BE' } else { 'R_STOP' }
+Assert-True ($longBEReason -eq 'R_BE') 'Long BE Stop must map to R_BE'
+
+$shortEntryPrice = 100.0
+$shortRoundTripCost = 0.06
+$shortActiveStop = [math]::Min(105.0, $shortEntryPrice - $shortRoundTripCost)
+Assert-True ([math]::Abs($shortActiveStop - 99.94) -lt 1e-9) 'Short BE stop must equal Entry - RoundTripCost'
+$shortBEContinue = Get-Decision -1 $shortEntryPrice 105 95 90 $true 99.90 $shortRoundTripCost
+Assert-True ($shortBEContinue -eq 'NONE') 'Short BE must not trigger below Entry - cost'
+$shortBEDecision = Get-Decision -1 $shortEntryPrice 105 95 90 $true 99.95 $shortRoundTripCost
+Assert-True ($shortBEDecision -eq 'STOP') 'Short BE must trigger above Entry - cost'
 
 $cooldownBars = 2
 $lastExitBar = 10
@@ -372,7 +480,14 @@ Assert-True ((10 - $lastExitBar) -lt [math]::Max($cooldownBars, 1)) 'same-bar ex
 Assert-True ((12 - $lastExitBar) -ge [math]::Max($cooldownBars, 1)) 'cooldown must release after the configured number of bars'
 
 Write-Host 'PASS: static V2 Logic-State parity checks'
-Write-Host 'PASS: dynamic Case A short trim -> next-bar final exit'
-Write-Host 'PASS: dynamic Case B long stop precedence and no trim'
-Write-Host 'PASS: dynamic post-trim BE and cooldown checks'
-Write-Host 'All MRT v3.3.0 V2 Logic-State Parity checks passed.'
+Write-Host 'PASS: static close-only Stop/Trim/Final and plot-budget checks'
+Write-Host 'PASS: dynamic Case A Short T空 -> T减 -> next-bar T平'
+Write-Host 'PASS: dynamic Case B Long T买 -> T止损 Stop precedence'
+Write-Host 'PASS: dynamic Long/Short BE with V2 round-trip cost'
+Write-Host 'PASS: dynamic Logic cooldown checks'
+Write-Host "Number of plot() calls: $($plotCounts['plot()'])"
+Write-Host "Number of Data Window plot() calls: $dataWindowPlotCount"
+Write-Host "Number of fill() calls: $($plotCounts['fill()'])"
+Write-Host "Number of bgcolor() calls: $($plotCounts['bgcolor()'])"
+Write-Host "Expected plot-count budget: $expectedPlotCount / 60"
+Write-Host 'All MRT v3.3.1 V2 Logic-State Parity checks passed.'

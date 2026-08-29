@@ -2,11 +2,11 @@
 
 English · [简体中文](README.zh-CN.md)
 
-一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.0 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
+一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.1 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.3.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.1-informational)](CHANGELOG.md)
 
 ---
 
@@ -90,7 +90,7 @@ flowchart TD
 
 - **市场**:主要用于 A 股 T+0 日内做T,15 分钟周期。换品种 / 周期前必须**重新评估全部参数**。
 - **语言**:将 *⑫ 语言与版本 → 语言* 设为 `zh` 或 `en`,切换面板、图表标签与报错。输入项*标签*为双语静态文本(Pine 限制),策略警报使用结构化动态文本(见 *局限*)。
-- **成本**:将 `commissionBps` 与 `slippageTicks` 设为和 Strategy Tester **Properties** 一致。代码默认每边手续费 `3.0 bp`、滑点 `0` tick,`strategy()` 中的默认值也相同;`commissionBps` 进入 V2 Logic BE,`slippageTicks` 只进入 Broker 执行成本诊断。
+- **成本**:将 `commissionBps` 与 `slippageTicks` 设为和 Strategy Tester **Properties** 一致。代码默认每边手续费 `3.0 bp`、滑点 `0` tick,`strategy()` 中的默认值也相同;`commissionBps` 进入 V2 Logic BE,`slippageTicks` 只进入 Panel 中的 Broker 成本估算。
 - **警报**:使用 `Any alert() function call` 接收观察/成交生命周期消息,或使用 `Order fills only` 配合 `{{strategy.order.alert_message}}` 接收可执行订单事件。消息包含 `MR-T`、方向、事件、模式与价格。
 
 ### 回测流程
@@ -213,15 +213,17 @@ flowchart TD
 
 ## 成本模型与 Strategy Tester 面板
 
-Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 Broker 执行成本诊断使用相同假设。
+Strategy Tester 是正式绩效来源。默认每笔订单手续费为 `0.03%`(每边 3 bp),滑点为 `0` tick。若要改变回测,请先修改 Strategy Tester **Properties**,再同步设置 `commissionBps` 与 `slippageTicks`,使 Panel 中的 Broker 成本估算使用相同假设。
 
-V2 Logic State 使用 `logic.entryPrice = close` 与 `logic.cost = entryPrice * (2 * commissionBps) / 10000` 冻结目标、风险和 T减后的 BE。`slippageTicks` 只用于 Broker 执行成本诊断,不进入 V2 Logic BE 阈值。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值。Range/Shock 是轻量 Broker 辅助分类,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
+V2 Logic State 使用 `logic.entryPrice = close` 与 `logic.cost = entryPrice * (2 * commissionBps) / 10000` 冻结目标、风险和 T减后的 BE。`slippageTicks` 只用于 Panel 中的 Broker 成本估算,不进入 V2 Logic BE 阈值。面板中的净利润、回撤、已平交易数与胜率明确标记为 **Tester** 值。Range/Shock 是轻量 Broker 辅助分类,胜率使用 `盈利 / 已平` 而不是 `盈利 / 进场`。
 
-### v3.3.0 V2 Logic-State Parity 执行模型
+### v3.3.1 V2 Logic-State Parity 执行模型
 
 V2 `MRLogicState` 是 `T买`、`T空`、`T减`、`T平`、Stop、Trend Fail、Timeout 与 BE 的唯一来源。每个 confirmed close 立即更新 Logic 并产生 Broker intent;`MRBrokerState` 再提交 `strategy.entry` 或 `strategy.close`,记录真实仓位、成交均价、P&L 与 fill bar。主图 T 标签表示 Logic Event,TradingView 原生标记表示 Broker fill。
 
 `process_orders_on_close = true`、`calc_on_order_fills = true`、`calc_on_every_tick = false`、`pyramiding = 0` 与零保证金要求保持 same-close parity。Broker fill recalculation 只同步执行事实,不会创建、重排或重写 Logic decision。图表水平仍然只是 confirmed-close 决策阈值,不是盘中 stop/limit 挂单。
+
+v3.3.1 保持 v3.3.0 的 Logic/Broker 架构,并精简常驻诊断以避开 TradingView plot 上限。Data Window 现在保留 44 个长期 parity 序列,脚本包含 54 个 `plot()`、1 个 `bgcolor()` 与 2 个 const-color Shock `fill()`(静态预算估算为 55)。Strategy Tester 的 P&L/均价与 pending intent 继续在 Tester 或 Panel 中查看,Broker 成本估算也移到 Panel。发布 harness 强制检查 `Data Window plot() <= 47` 与 `plot() <= 57`。
 
 ### Broker 一致性与 Recovery
 
@@ -258,12 +260,12 @@ Data Window 还提供累计 Shock 漏斗:`Shock Z Candidates`、`Shock Move Cand
 
 confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator 成交 bar 保存为 `broker.entryFillBar`。Entry fill execution 只同步真实成交价和仓位;下一根 confirmed close 因 Logic 管理要求 `bar_index > logic.entryBar` 才是第一次管理。Logic T减 decision 当场设置 `logic.partialTaken`,同收盘真实减仓 bar 保存为 `broker.trimFillBar`。完整退出 decision 当场设置 `logic.pos = 0` 与 `logic.lastExitBar`;`broker.fullExitFillBar` 记录真实归零 bar。Cooldown 只使用 Logic lastExitBar。
 
-### v3.3.0 TradingView 验收清单
+### v3.3.1 TradingView 验收清单
 
 在 15 分钟图于 TradingView 编译后:
 
 1. Pine v6 在 15m 图编译成功。
-2. `MR-L` / `MR-S` 在 confirmed signal 同一收盘成交;`Entry Decision Bar = Entry Fill Bar`。
+2. `MR-L` / `MR-S` 在 confirmed signal 同一收盘成交;`Logic Entry Bar = Broker Entry Fill Bar`。
 3. Entry fill execution 只同步 Broker 状态;Entry Logic decision bar 不触发 T减、Stop、Trend Fail 或 Timeout,下一根 confirmed close 才是第一次管理。
 4. T减只在 confirmed close 达到冻结的 T减水平时触发。
 5. 真实 Broker 仓位按 `trimPct` 减少(默认 50%)。
@@ -280,13 +282,13 @@ confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator �
 16. 正常订单列表没有 `MR-L/MR-S-STOP`、`-TRIM`、`-FINAL` bracket ID。
 17. Entry/Trim fill execution 不产生 Logic decision;一次 confirmed close 最多产生一个 Logic lifecycle action;Logic Event 字段跨 same-bar fill recalculation 保持稳定。Bar Magnifier 开关不应实质改变 Logic lifecycle decision。
 
-源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
+运行本地 parity 检查:`powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.1-v2-logic-parity-harness.ps1`。它覆盖 V2 静态审计、confirmed-close-only Stop/Trim/Final、含 V2 成本的 Long/Short BE、生命周期 Case 与 plot budget。源码静态审查与 `git diff --check` 不能替代 TradingView 编译和 Strategy Tester 运行时验证。
 
 ## 局限与边界
 
 - **硬编码 15 分钟契约。** 脚本拒绝在其它周期运行。这是刻意的(窗口长度以 K 数计,且是在 15m 上调出来的);换周期必须重新调参。
 - **输入项标签为双语静态文本。** Pine 的 input 标题要求编译期 `const string`,运行时语言开关无法本地化。面板、图表标签与报错随 `lang` 输入切换;策略成交消息动态包含真实成交占位符。
-- **成本有两个设置界面。** Pine 要求 `strategy()` 中的 Strategy Tester 手续费 / 滑点默认值为编译期常量。`commissionBps` 进入 V2 Logic cost/BE,`slippageTicks` 只进入 Broker 执行成本诊断;修改输入不会自动改写 Properties。
+- **成本有两个设置界面。** Pine 要求 `strategy()` 中的 Strategy Tester 手续费 / 滑点默认值为编译期常量。`commissionBps` 进入 V2 Logic cost/BE,`slippageTicks` 只进入 Panel 的 Broker 成本估算;修改输入不会自动改写 Properties。
 - **A 股 T+0 偏好。** 引擎假设针对持有仓位做日内回归。不做重调参就套到趋势性强的加密 / 外汇上,会很失望。
 - **不构成投资建议。** 不做任何明示或暗示的业绩承诺。
 

@@ -2,6 +2,27 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.3.1] — Plot-budget and parity-harness correctness patch
+
+This patch keeps the v3.3.0 MRLogicState / MRBrokerState architecture and transaction logic unchanged.
+
+### Fixed
+
+- **TradingView plot budget** — reduced permanent Data Window diagnostics from 55 to 44, retained the V2 Logic/Broker parity fields and Shock funnel, and moved the Broker cost estimate to the existing Panel. The 54 remaining `plot()` calls stay below the static budget of 57.
+- **Const-color fills** — the two Shock-to-Extreme `fill()` calls now use const colors, so they do not add dynamic fill plot counts while preserving the existing visual bands.
+- **Confirmed-close parity harness** — replaced the v3.3.0 harness with `tests/MRT-v3.3.1-v2-logic-parity-harness.ps1`. Dynamic Stop, Trim, and Final decisions now use `Close` only; Final requires `PartialTaken = true`; and BE uses the V2 round-trip commission cost.
+- **Regression cases** — added Short `T空 → T减 → next-bar T平`, Long Stop precedence, and Long/Short BE-with-cost lifecycle assertions, plus static close-only and plot-budget checks.
+
+### Preserved
+
+- V2 setup conditions, priorities, expiry, entry confirmation, frozen context, targets, ATR/statistical stops, Tight/Balanced/Loose stop modes, Trend Fail, Timeout, cooldown, lifecycle priority, same-close broker settings, real 50% default trim, and Logic/Broker separation.
+
+### Verification
+
+- Local harness reports 54 `plot()` calls, 44 Data Window plots, two `fill()` calls, one `bgcolor()`, and an estimated static plot budget of 55/60.
+- `git diff --check` is required before release.
+- TradingView Pine v6 compilation, RE10140 absence, and Strategy Tester runtime parity remain pending manual TradingView verification.
+
 ## [3.3.0] — V2 Logic-State Parity
 
 This release makes the V2.0.0 logic state the sole source of MR-T lifecycle decisions while retaining real Strategy Tester execution and Broker diagnostics.
@@ -17,7 +38,7 @@ This release makes the V2.0.0 logic state the sole source of MR-T lifecycle deci
 
 ### Verification
 
-- `tests/MRT-v3.3.0-v2-logic-parity-harness.ps1` is the single static and dynamic V2 Logic-State parity harness.
+- The release-specific v3.3.0 static and dynamic parity harness was superseded by the v3.3.1 harness above, which is now the single current test source.
 - `git diff --check` is required before release.
 - TradingView Pine v6 compilation and Strategy Tester runtime parity remain pending manual TradingView verification.
 

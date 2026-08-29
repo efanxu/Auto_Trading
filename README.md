@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md) · English
 
-A production-grade **V2 Logic-State Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.3.0 lets the V2 logic state decide every lifecycle point from a confirmed **15-minute close**, then lets Strategy Tester execute the resulting broker intent on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
+A production-grade **V2 Logic-State Parity MR-T Strategy** for TradingView, written in Pine Script v6. MR-T v3.3.1 lets the V2 logic state decide every lifecycle point from a confirmed **15-minute close**, then lets Strategy Tester execute the resulting broker intent on that same close. It is designed for **15-minute charts** and **A-share T+0 style intraday trading** (做T). Bilingual runtime UI (中文 / English).
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.3.0-informational)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.3.1-informational)](CHANGELOG.md)
 
 ---
 
@@ -90,7 +90,7 @@ There is no session-end liquidation. Positions and pending mean-reversion setups
 
 - **Market**: primarily A-share T+0 intraday (做T) on 15m. Re-validate **all** parameters before applying to another market or timeframe.
 - **Language**: set the *Language & Version -> Language* input to `zh` or `en`. This switches the panel, chart labels, and error messages. Input *labels* are bilingual-static — Pine pins their text to compile-time `const string`; alert messages use structured dynamic fields (see *Limitations*).
-- **Costs**: set `commissionBps` and `slippageTicks` to match the Strategy Tester **Properties** tab. The code defaults to `3.0 bp/side` commission and `0` ticks, which are also the defaults declared in `strategy()`; `commissionBps` feeds the V2 Logic BE threshold and `slippageTicks` feeds Broker execution diagnostics.
+- **Costs**: set `commissionBps` and `slippageTicks` to match the Strategy Tester **Properties** tab. The code defaults to `3.0 bp/side` commission and `0` ticks, which are also the defaults declared in `strategy()`; `commissionBps` feeds the V2 Logic BE threshold and `slippageTicks` feeds the Broker cost estimate shown in the Panel.
 - **Alerts**: use `Any alert() function call` for setup/fill lifecycle messages, or `Order fills only` with `{{strategy.order.alert_message}}` for executable order events. The built-in strategy alert template also appends `{{strategy.order.price}}` as the actual fill price. Messages include `MR-T`, direction, event, mode, and price.
 
 ### Backtest workflow
@@ -213,15 +213,17 @@ Input labels are Chinese (Pine requires compile-time `const string` for input ti
 
 ## Cost model & Strategy Tester panel
 
-Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the broker execution-cost diagnostic uses the same assumptions.
+Strategy Tester is the formal performance source. Commission is declared as `0.03%` per order (3 bp/side) and slippage as `0` ticks by default. Change the Strategy Tester **Properties** values for a different test, then set the matching `commissionBps` and `slippageTicks` inputs so the Broker cost estimate in the Panel uses the same assumptions.
 
-The V2 Logic State uses `logic.entryPrice = close` and `logic.cost = entryPrice * (2 * commissionBps) / 10000` for frozen targets, risk, and post-trim BE. `slippageTicks` is used only by the Broker execution-cost diagnostic; it never changes the V2 Logic BE threshold. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values. Range/Shock are lightweight Broker-side classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
+The V2 Logic State uses `logic.entryPrice = close` and `logic.cost = entryPrice * (2 * commissionBps) / 10000` for frozen targets, risk, and post-trim BE. `slippageTicks` is used only by the Broker cost estimate in the Panel; it never changes the V2 Logic BE threshold. The panel labels net profit, drawdown, closed trades, and win rate as **Tester** values. Range/Shock are lightweight Broker-side classifications shown as entries / closed positions / wins, and their win rates use `wins / closed` rather than `wins / entries`.
 
-### v3.3.0 V2 Logic-State Parity execution
+### v3.3.1 V2 Logic-State Parity execution
 
 The V2 `MRLogicState` is the only source for `T-buy`, `T-short`, `T-trim`, `T-close`, Stop, Trend Fail, Timeout, and Breakeven. On a confirmed close, it mutates immediately and emits a Broker intent. `MRBrokerState` then submits `strategy.entry` or `strategy.close` and records the actual Strategy Tester position, average fill price, P&L, and fill bars. Native Strategy Tester order markers represent Broker execution; custom T labels represent Logic Events.
 
 `process_orders_on_close = true`, `calc_on_order_fills = true`, `calc_on_every_tick = false`, `pyramiding = 0`, and zero margin requirements preserve the same-close parity configuration. A Broker fill recalculation only synchronizes execution facts and never creates, reorders, or rewrites a Logic decision. Chart levels remain confirmed-close decision thresholds, not intrabar stop/limit orders.
+
+v3.3.1 keeps the v3.3.0 Logic/Broker architecture and trims permanent diagnostics to stay below TradingView's plot limit. The Data Window now has 44 long-lived parity series and the script has 54 `plot()` calls, one `bgcolor()`, and two const-color Shock `fill()` calls (static budget estimate: 55). Strategy Tester P&L/average price and pending intents remain in the Tester or Panel; the Broker cost estimate is shown in the Panel. The release harness enforces `Data Window plot() <= 47` and `plot() <= 57`.
 
 ### Broker consistency and recovery
 
@@ -258,12 +260,12 @@ Data Window also exposes the cumulative Shock funnel: `Shock Z Candidates`, `Sho
 
 The confirmed Entry decision stores `logic.entryBar`; the same-close Broker Emulator fill is stored as `broker.entryFillBar`. Entry-fill recalculation only synchronizes the real price and size; the next confirmed close is the first management opportunity because Logic management requires `bar_index > logic.entryBar`. A Logic Trim decision immediately sets `logic.partialTaken`; its same-close real reduction is stored as `broker.trimFillBar`. A full-exit decision immediately sets `logic.pos = 0` and `logic.lastExitBar`; `broker.fullExitFillBar` records the later or same-close flat transition. Logic cooldown uses `logic.lastExitBar`, never Broker flatness.
 
-### v3.3.0 TradingView validation checklist
+### v3.3.1 TradingView validation checklist
 
 After compiling in TradingView on a 15-minute chart:
 
 1. Pine v6 compiles successfully on a 15m chart.
-2. `MR-L` / `MR-S` fills on the same confirmed signal close; `Entry Decision Bar = Entry Fill Bar`.
+2. `MR-L` / `MR-S` fills on the same confirmed signal close; `Logic Entry Bar = Broker Entry Fill Bar`.
 3. Entry fill execution only synchronizes Broker state; the Entry Logic decision bar does not trigger Trim, Stop, Trend Fail, or Timeout, and the next confirmed close is the first management bar.
 4. Trim triggers only when the confirmed close reaches the frozen Trim level.
 5. The real broker position is reduced by `trimPct` (default 50%).
@@ -280,13 +282,13 @@ After compiling in TradingView on a 15-minute chart:
 16. No normal order list contains `MR-L/MR-S-STOP`, `-TRIM`, or `-FINAL` bracket IDs.
 17. Entry/Trim fill executions never make Logic decisions, one confirmed close never emits more than one Logic lifecycle action, and Logic Event fields persist through same-bar fill recalculation. Bar Magnifier OFF/ON should not materially alter Logic lifecycle decisions.
 
-The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
+Run the local parity checks with `powershell -ExecutionPolicy Bypass -File .\tests\MRT-v3.3.1-v2-logic-parity-harness.ps1`. They cover the V2 static audit, confirmed-close-only Stop/Trim/Final semantics, Long/Short BE cost, lifecycle cases, and the plot budget. The source-level static review and `git diff --check` do not replace TradingView compilation or Strategy Tester runtime verification.
 
 ## Limitations & scope
 
 - **Hard-coded 15m contract.** The script refuses to run on other timeframes. This is deliberate (window lengths are in bars and were tuned on 15m); rescaling to other timeframes requires re-tuning.
 - **Input labels are bilingual-static.** Pine input titles are compile-time `const string`; a runtime language toggle cannot localize them. The panel, chart labels and error messages follow the `lang` input. Strategy order messages are dynamic and the default alert template includes the actual fill-price placeholder.
-- **Costs have two settings surfaces.** Pine requires the Strategy Tester commission/slippage defaults in `strategy()` to be compile-time values. `commissionBps` feeds V2 Logic cost/BE and `slippageTicks` feeds Broker execution-cost diagnostics; changing either input does not rewrite the Properties tab automatically.
+- **Costs have two settings surfaces.** Pine requires the Strategy Tester commission/slippage defaults in `strategy()` to be compile-time values. `commissionBps` feeds V2 Logic cost/BE and `slippageTicks` feeds the Panel's Broker cost estimate; changing either input does not rewrite the Properties tab automatically.
 - **A-shares T+0 bias.** The engine assumes intraday reversion against a held position. Applying it to trending crypto/forex without re-tuning will disappoint.
 - **Not financial advice.** No performance guarantees, express or implied.
 
