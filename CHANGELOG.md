@@ -2,6 +2,31 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] — Confirmed-close Strategy Tester execution
+
+This release restores the original MR-T confirmed 15-minute close decision model while retaining real TradingView Strategy Tester fills and broker positions. It is an execution-semantics change only; all inputs and strategy thresholds keep their prior names, groups, defaults, meanings, and Long/Short symmetry.
+
+### Changed
+
+- **One confirmed-close decision source** — Entry, Stop/BE, Trend Fail, Timeout, Trim, and Final are evaluated only on the normal `barstate.isconfirmed` 15m execution. `calc_on_order_fills` recalculations synchronize broker transitions only.
+- **Next-tick real execution** — `process_orders_on_close = false`, `calc_on_every_tick = false`, and `pyramiding = 0` remain fixed. Entry uses `MR-L` / `MR-S`; every reduction and full exit uses `strategy.close(..., immediately = false)` and therefore fills at the next available tick.
+- **Close-confirmed risk and targets** — frozen Risk, Trim, and Final prices are decision thresholds. Normal lifecycle management no longer maintains intrabar stop/limit orders, `strategy.order`, `strategy.exit`, OCA reduce groups, or `MR-L/MR-S-STOP/TRIM/FINAL` order IDs.
+- **Real partial fill synchronization** — Trim submits `qty_percent = trimPct` (default 50%). `partialTaken` changes only after `strategy.position_size` really shrinks; the lifecycle resets only after the broker position reaches zero.
+- **Strict phase separation** — the Entry fill bar is synchronization-only (`bar_index > entryBar` for management). After a real Trim fill, BE/Final management waits until `bar_index > partialBar`, preventing Entry → exit and Trim → BE/Final same-bar jumps.
+- **Restored Entry band reclaim** — `requireBandReclaim` now uses `close > mean15 - entryZ * safeStd` for Long and the mirrored upper boundary for Short. The Z crossover reclaim remains mandatory; residual momentum is not substituted.
+- **Shock funnel diagnostics** — Data Window adds cumulative confirmed-close counts for Z candidates, move candidates, environment pass, deceleration pass, rejection pass, setups, and confirmed entries.
+
+### Preserved
+
+- Range/Shock Setup formulas and Shock priority, Regime Score, Hard Trend Veto, Half-Life, Trend Fail, Timeout, frozen mean/std/ATR/time stop, Tight/Balanced/Loose stop construction, BE cost estimate, cross-date positions, Range/Shock lifecycle statistics, recovery guards, and all existing input defaults remain unchanged.
+- Strategy Tester remains the formal source for net profit, max drawdown, profit factor, win rate, fills, and positions.
+
+### Verification
+
+- `tests/MRT-v3.1.0-confirmed-close-harness.ps1` covers Long/Short Entry, Entry-bar exclusion, real Trim phase transitions, Final, Stop, BE, Trend Fail, Timeout, cross-date holding, broker/lifecycle consistency, zero recovery on normal paths, Shock diagnostics, parameter defaults, and absence of intrabar bracket orders.
+- Static review and `git diff --check` are required before release.
+- TradingView Pine v6 compilation, Strategy Tester runtime behavior, and Bar Magnifier OFF/ON comparison remain pending manual verification.
+
 ## [3.0.3] — Broker/fill-state consistency patch
 
 This release keeps the v3.0.2 fill-recalculation model and `varip MRFillState`, then adds strong consistency checks against the Strategy Tester broker position and hardens protective exit quantities.
