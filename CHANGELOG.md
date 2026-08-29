@@ -2,6 +2,12 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.1.0] — V3-Aligned Execution Assist
+
+- Execution Assist now uses a previous-confirmed-bar rolling one-bar PREPLAN.
+- The official Logic timeline is restored to V3 confirmed-close parity.
+- Provisional intrabar plans no longer drive the Strategy Tester lifecycle.
+
 ## [4.0.0] — Frozen execution plans and intrabar price orders
 
 - Added `MRT_V4.pine`, preserving `MRT.pine` as the byte-for-byte v3.3.2 V2 Logic-State Parity reference. Confirmed 15m signals now create tick-rounded, frozen retracement plans with Range/Shock expiry, cancellation alerts, and non-marketable limit entries.
