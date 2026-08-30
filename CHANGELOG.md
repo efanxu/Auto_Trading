@@ -2,6 +2,15 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.5.0] — Intrabar Broker Exit Lifecycle
+
+- Entry fills now submit TP1/TP2/Stop Broker brackets immediately.
+- Bar Magnifier may execute Entry→TP/Stop sequences inside the same 15m bar.
+- Actual `MR-X1` TP1 fills immediately move the remaining `MR-X2` Stop to execution-cost-aware break-even through `calc_on_order_fills`.
+- Trend Fail and Timeout remain later-bar, confirmed-close management and cancel the live brackets before `strategy.close()`.
+- Strategy Tester remains the sole V4 performance source.
+- Bar Magnifier improves intrabar sequencing using lower-timeframe historical bars. It is not tick-by-tick exchange replay; crossings inside one lowest available Magnifier bar still follow TradingView Broker Emulator rules.
+
 ## [4.4.0] — True Executable PREPLAN Entry
 
 - PREPLAN now submits real next-bar Stop-Limit entries that expire at the valid bar's confirmed close; Stop activation, gap behavior, and Limit fills are decided only by TradingView's Broker Emulator.
