@@ -2,6 +2,15 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.4.0] — True Executable PREPLAN Entry
+
+- PREPLAN now submits real next-bar Stop-Limit entries that expire at the valid bar's confirmed close; Stop activation, gap behavior, and Limit fills are decided only by TradingView's Broker Emulator.
+- Broker fills initialize the formal V4 trade from `strategy.position_avg_price`, freeze the submitted source statistics, and re-anchor the initial Stop and break-even protection to the actual fill.
+- Confirmed-close Stop/BE, Trend Fail, Timeout, Trim, and Final management starts only after the Entry bar, so the fill bar cannot also produce a formal exit.
+- Strategy Tester is now the sole V4 performance source of truth; the independent V4 equity, Profit Factor, Win Rate, and trade-return ledger plus `V4_RESULT` output were removed.
+- Enabled Bar Magnifier and removed V3 Entry/trade-count parity as a V4 acceptance target. Historical Broker Emulator output is higher-path-resolution simulation, not exchange tick-fill proof; live `ENTRY_FILLED` state must follow actual exchange fills.
+- Reworked `tests/MRT-v4-execution-plan-harness.ps1` around executable-order, fill-transition, one-bar expiry, gap-unfilled, frozen-plan, actual-fill risk, and Entry-bar management guards.
+
 ## [4.3.0] — Standalone V4 Execution Accounting
 
 - Reworked `MRT_V4.pine` around `MRV4ExecutionState`, the sole source of V4 entry price, trade return, compounded Net, Profit Factor, Win Rate, and PREPLAN usage.

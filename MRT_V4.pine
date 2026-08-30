@@ -3,13 +3,13 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-strategy("MR-T Strategy v4.3.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, margin_long = 0, margin_short = 0, max_labels_count = 500)
+strategy("MR-T Strategy v4.4.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, use_bar_magnifier = true, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v4.3.0
+// Mean Reversion T (MR-T) · Strategy v4.4.0
 // V3.3.2 = confirmed-close Logic baseline (MRT.pine).
 // V4.1.0 = V3-aligned Logic + previous-confirmed-bar execution assist.
-// V4.3.0 = standalone V4 Execution Accounting and V4_RESULT observability.
+// V4.4.0 = True Executable PREPLAN Entry.
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -18,16 +18,19 @@ strategy("MR-T Strategy v4.3.0", shorttitle = "MR-T v4", overlay = true, pyramid
 //   2. Shock Reversal    市场不一定横盘 → 异常冲击 + 减速/拒绝 + 回归确认
 // 共同保护 / Guard        Hard Trend Veto (1H + 15m 斜率与 Efficiency Ratio)
 // 生命周期 / Lifecycle    观察 → T买/T空 → T减 → T平
-// 执行辅助 / Execution    confirmed source bar → next-bar PREPLAN alert
+// 执行辅助 / Execution    confirmed source bar → next-bar Stop-Limit order
 // 架构 / Architecture     MRLogicState → MRExecutionAssistState → MRBrokerState
-//                            ↘ MRV4ExecutionState (V4 result ledger)
+//                            ↘ MRV4TradeState (filled trade lifecycle)
 //
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
-// confirmed-close Logic 决策继续与 V3 对齐;PREPLAN 只输出实盘执行辅助 alert;
-// V4 Execution Accounting 使用 PREPLAN 入场价格，不改变 Logic 或 Strategy Tester 订单路径。
+// PREPLAN 在上一根 confirmed bar 收盘后提交真实 Stop-Limit Entry。
+// Broker Emulator fill 是唯一入场事实，Strategy Tester 是 V4 收益唯一事实来源。
+// Historical Broker Emulator fills, even with Bar Magnifier, are not proof of
+// exchange tick fills. Live ENTRY_FILLED state must ultimately follow the
+// exchange's actual fill for the submitted Stop-Limit order.
 // 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v4.3.0 —— V3 Logic Clock + Previous-Bar PREPLAN + V4 Execution Accounting。
+// 版本 / Version: v4.4.0 —— True Executable PREPLAN Entry。
 // 变更见 CHANGELOG.md。
 // ============================================================================
 
@@ -46,7 +49,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "4.3.0"
+string SCRIPT_VERSION = "4.4.0"
 
 
 // ============================================================================
@@ -200,8 +203,6 @@ showBackground = input.bool(true, "显示做T环境", group = "⑪ 显示")
 showSetup = input.bool(true, "显示观察信号", group = "⑪ 显示")
 showPanel = input.bool(true, "显示状态面板", group = "⑪ 显示")
 showTradeLevels = input.bool(true, "显示本轮目标/风险", group = "⑪ 显示")
-// Reuse the existing label visibility switch; no additional input is needed.
-bool showV4ResultLabel = showSetup
 
 
 // ============================================================================
@@ -431,8 +432,8 @@ zCrossUnderPosShock = ta.crossunder(z, shockEntryZ)
 // State: V3 confirmed-close Logic, rolling PREPLAN assist, and Broker facts
 // ============================================================================
 
-// MRLogicState is the V3 confirmed-close Logic layer. It never reads Broker
-// fills to decide Entry, Trim, Final, Stop/BE, Trend Fail, or Timeout.
+// MRLogicState owns setup/environment and mirrors a filled MRV4TradeState for
+// confirmed-close Trim/Exit decisions. It never creates a formal Entry.
 type MRLogicState
     varip int    pos           = 0
     varip bool   partialTaken  = false
@@ -483,7 +484,6 @@ type MRExecutionAssistState
     varip float tp1Provisional = na
     varip float tp2Provisional = na
     varip float stopProvisional = na
-    varip bool triggerTouched = false
 
 method reset(MRExecutionAssistState this) =>
     this.active := false
@@ -501,7 +501,6 @@ method reset(MRExecutionAssistState this) =>
     this.tp1Provisional := na
     this.tp2Provisional := na
     this.stopProvisional := na
-    this.triggerTouched := false
 
 var MRLogicState logic = MRLogicState.new()
 var MRExecutionAssistState assist = MRExecutionAssistState.new()
@@ -568,66 +567,74 @@ type MRBrokerState
 
 var MRBrokerState broker = MRBrokerState.new()
 
-// MRV4ExecutionState is the sole source of truth for V4 execution
-// performance. It reads confirmed Logic events and the current-bar PREPLAN
-// snapshot, but it never writes Logic, Broker, or Strategy Tester state.
-type MRV4ExecutionState
+// MRV4TradeState starts only after a real Broker Emulator fill. It freezes the
+// exact pending PREPLAN that produced the fill and owns no independent P&L
+// ledger; Strategy Tester is the sole V4 performance source of truth.
+type MRV4TradeState
     varip bool   active = false
     varip int    dir = 0
     varip int    mode = 0
     varip int    entryBar = na
     varip float  entryPrice = na
-    varip bool   entryFromPreplan = false
-    varip int    preplanSourceBar = na
-    varip int    preplanValidBar = na
-    varip float  preplanTrigger = na
-    varip float  preplanLimit = na
-    varip bool   preplanTriggerTouched = false
-
-    varip bool   trimTaken = false
+    varip int    sourceBar = na
+    varip int    validBar = na
+    varip float  sourceMean = na
+    varip float  sourceStd = na
+    varip float  sourceATR = na
+    varip float  sourceHalfLife = na
+    varip float  sourceRegimeScore = na
+    varip float  entryTrigger = na
+    varip float  entryLimit = na
+    varip float  partialTarget = na
+    varip float  finalTarget = na
+    varip float  initialStop = na
+    varip bool   partialTaken = false
     varip int    trimBar = na
-    varip float  trimPrice = na
-    varip float  trimFraction = na
-
     varip int    exitBar = na
-    varip float  exitPrice = na
-    varip int    exitReason = 0
+    varip int    timeStopBar = na
 
-    varip float  lastEntryImprovementPct = na
-    varip float  lastTradeReturnPct = na
     varip int    lastDir = 0
     varip int    lastMode = 0
     varip int    lastEntryBar = na
     varip float  lastEntryPrice = na
-    varip bool   lastEntryFromPreplan = false
-    varip int    lastPreplanSourceBar = na
-    varip int    lastPreplanValidBar = na
-    varip float  lastPreplanTrigger = na
-    varip float  lastPreplanLimit = na
+    varip int    lastSourceBar = na
+    varip int    lastValidBar = na
+    varip float  lastEntryTrigger = na
+    varip float  lastEntryLimit = na
     varip int    lastTrimBar = na
-    varip float  lastTrimPrice = na
     varip int    lastExitBar = na
     varip float  lastExitPrice = na
     varip int    lastExitReason = 0
-    varip int    lastTradeNumber = 0
-    varip int    lastResultEventBar = na
 
-    varip float  v4EquityIndex = 1.0
-    varip float  v4GrossProfit = 0.0
-    varip float  v4GrossLoss = 0.0
-    varip int    v4Trades = 0
-    varip int    v4Wins = 0
-    varip int    confirmedEntries = 0
-    varip int    v4PreplanEntries = 0
+method resetActive(MRV4TradeState this) =>
+    this.active := false
+    this.dir := 0
+    this.mode := 0
+    this.entryBar := na
+    this.entryPrice := na
+    this.sourceBar := na
+    this.validBar := na
+    this.sourceMean := na
+    this.sourceStd := na
+    this.sourceATR := na
+    this.sourceHalfLife := na
+    this.sourceRegimeScore := na
+    this.entryTrigger := na
+    this.entryLimit := na
+    this.partialTarget := na
+    this.finalTarget := na
+    this.initialStop := na
+    this.partialTaken := false
+    this.trimBar := na
+    this.exitBar := na
+    this.timeStopBar := na
 
-var MRV4ExecutionState v4Exec = MRV4ExecutionState.new()
+var MRV4TradeState trade = MRV4TradeState.new()
 
 // Setup and Logic events use rollback-safe snapshots for chart labels/alerts.
 varip int logicSetupEventBar = na
 varip int logicSetupEventDir = 0
 varip int logicSetupEventMode = 0
-varip int v4ResultEventBar = na
-varip int v4ResultLabelBar = na
 
 bool setupEvent = logicSetupEventBar == bar_index
 int setupEventDir = logicSetupEventDir
@@ -723,23 +730,16 @@ f_preplanMessage(string eventName, int dir, int mode, int sourceBar, int validBa
       "|mode=" + f_modeName(mode) +
       "|source_bar=" + str.tostring(sourceBar) +
       "|valid_bar=" + str.tostring(validBar) +
-      "|entry_trigger=" + f_price(entryTrigger) +
-      "|entry_limit=" + f_price(entryLimit) +
-      "|tp1_provisional=" + f_price(tp1) +
-      "|tp2_provisional=" + f_price(tp2) +
+      "|trigger=" + f_price(entryTrigger) +
+      "|limit=" + f_price(entryLimit) +
+      "|tp1=" + f_price(tp1) +
+      "|tp2=" + f_price(tp2) +
       "|stop_provisional=" + f_price(stop) +
       suffix
 
 // --------------------------------------------------------------------------
-// V4 Execution Accounting
+// V4 display and executable-entry messages
 // --------------------------------------------------------------------------
-// This ledger intentionally uses normalized initial capital (1.0).
-// Strategy Tester broker P&L is not the V4 execution-performance source of truth.
-// V4 Execution Accounting is the source of truth. The PREPLAN fill rule below
-// is a Historical Stop-Limit Fill Approximation: a touched previous-bar
-// Stop-Limit is assumed filled at its already published limit. It is not
-// TradingView tick-level real-fill proof; live trading remains subject to the
-// exchange's actual fill.
 f_pct(float value) =>
     na(value) ? "-" : str.tostring(value, "#.#####")
 
@@ -753,172 +753,23 @@ f_panelPct(float value, bool signedValue) =>
 f_resultColor(float value) =>
     na(value) ? color.gray : value > 0.0 ? color.lime : value < 0.0 ? color.red : color.gray
 
-f_v4EntryImprovement(int dir, float logicPrice, float v4Price) =>
-    logicPrice != 0.0 ? (dir == 1 ? (logicPrice - v4Price) / logicPrice : (v4Price - logicPrice) / logicPrice) * 100.0 : na
-
-// Commission is charged once on entry and on each confirmed-close exit leg.
-// No additional slippage or intrabar exit price is introduced here.
-f_v4TradeReturn(int dir, float entryPrice, bool didTrim, float trimPrice, float trimFraction, float exitPrice) =>
-    float c = commissionBps / 10000.0
-    if didTrim
-        float remainderFraction = 1.0 - trimFraction
-        float grossTrim = trimFraction * dir * (trimPrice - entryPrice) / entryPrice
-        float grossRemainder = remainderFraction * dir * (exitPrice - entryPrice) / entryPrice
-        float entryFee = c
-        float trimExitFee = trimFraction * c * trimPrice / entryPrice
-        float finalExitFee = remainderFraction * c * exitPrice / entryPrice
-        grossTrim + grossRemainder - entryFee - trimExitFee - finalExitFee
-    else
-        float grossReturn = dir * (exitPrice - entryPrice) / entryPrice
-        float entryFee = c
-        float exitFee = c * exitPrice / entryPrice
-        grossReturn - entryFee - exitFee
-
-f_v4NetPct(MRV4ExecutionState this) =>
-    (this.v4EquityIndex - 1.0) * 100.0
-
-f_v4ProfitFactor(MRV4ExecutionState this) =>
-    this.v4GrossLoss > 0.0 ? this.v4GrossProfit / this.v4GrossLoss : na
-
-f_v4UsagePct(MRV4ExecutionState this) =>
-    this.confirmedEntries > 0 ? this.v4PreplanEntries / this.confirmedEntries * 100.0 : na
-
-f_v4WinRate(MRV4ExecutionState this) =>
-    this.v4Trades > 0 ? this.v4Wins / this.v4Trades * 100.0 : na
-
-method resetTrade(MRV4ExecutionState this) =>
-    this.active := false
-    this.dir := 0
-    this.mode := 0
-    this.entryBar := na
-    this.entryPrice := na
-    this.entryFromPreplan := false
-    this.preplanSourceBar := na
-    this.preplanValidBar := na
-    this.preplanTrigger := na
-    this.preplanLimit := na
-    this.preplanTriggerTouched := false
-    this.trimTaken := false
-    this.trimBar := na
-    this.trimPrice := na
-    this.trimFraction := na
-    this.exitBar := na
-    this.exitPrice := na
-    this.exitReason := 0
-
-method enter(MRV4ExecutionState this, int entryDir, int entryMode, float logicPrice, bool fromPreplan, int planSourceBar, int planValidBar, float planTrigger, float planLimit, bool planTriggerTouched) =>
-    float v4EntryPrice = fromPreplan ? planLimit : logicPrice
-    this.active := true
-    this.dir := entryDir
-    this.mode := entryMode
-    this.entryBar := bar_index
-    this.entryPrice := v4EntryPrice
-    this.entryFromPreplan := fromPreplan
-    this.preplanSourceBar := planSourceBar
-    this.preplanValidBar := planValidBar
-    this.preplanTrigger := planTrigger
-    this.preplanLimit := planLimit
-    this.preplanTriggerTouched := planTriggerTouched
-    this.trimTaken := false
-    this.trimBar := na
-    this.trimPrice := na
-    this.trimFraction := na
-    this.exitBar := na
-    this.exitPrice := na
-    this.exitReason := 0
-    this.lastEntryImprovementPct := f_v4EntryImprovement(entryDir, logicPrice, v4EntryPrice)
-    this.confirmedEntries += 1
-    if fromPreplan
-        this.v4PreplanEntries += 1
-
-method recordTrim(MRV4ExecutionState this, int decisionBar, float decisionPrice, float fraction) =>
-    if this.active and not this.trimTaken
-        this.trimTaken := true
-        this.trimBar := decisionBar
-        this.trimPrice := decisionPrice
-        this.trimFraction := fraction
-
-method closeTrade(MRV4ExecutionState this, int decisionBar, float decisionPrice, int reason) =>
-    if this.active
-        float v4TradeReturn = f_v4TradeReturn(this.dir, this.entryPrice, this.trimTaken, this.trimPrice, this.trimFraction, decisionPrice)
-        float v4EquityBeforeTrade = this.v4EquityIndex
-        float tradePnLIndex = v4EquityBeforeTrade * v4TradeReturn
-        int completedTradeNumber = this.v4Trades + 1
-
-        // Snapshot the completed trade before changing or resetting its state.
-        this.lastDir := this.dir
-        this.lastMode := this.mode
-        this.lastEntryBar := this.entryBar
-        this.lastExitBar := decisionBar
-        this.lastEntryPrice := this.entryPrice
-        this.lastEntryFromPreplan := this.entryFromPreplan
-        this.lastPreplanSourceBar := this.preplanSourceBar
-        this.lastPreplanValidBar := this.preplanValidBar
-        this.lastPreplanTrigger := this.preplanTrigger
-        this.lastPreplanLimit := this.preplanLimit
-        this.lastTrimBar := this.trimTaken ? this.trimBar : na
-        this.lastTrimPrice := this.trimTaken ? this.trimPrice : na
-        this.lastExitPrice := decisionPrice
-        this.lastExitReason := reason
-        this.lastTradeReturnPct := v4TradeReturn * 100.0
-        this.lastTradeNumber := completedTradeNumber
-        this.exitBar := decisionBar
-        this.exitPrice := decisionPrice
-        this.exitReason := reason
-
-        // Update cumulative accounting only after the per-trade snapshot.
-        this.v4EquityIndex *= 1.0 + v4TradeReturn
-        if tradePnLIndex > 0.0
-            this.v4GrossProfit += tradePnLIndex
-        else if tradePnLIndex < 0.0
-            this.v4GrossLoss += math.abs(tradePnLIndex)
-
-        this.v4Trades += 1
-        if v4TradeReturn > 0.0
-            this.v4Wins += 1
-
-        // Snapshot the completed result before resetTrade clears active fields.
-        this.lastResultEventBar := decisionBar
-        this.resetTrade()
-
-f_v4EntryMessage(string eventName, MRV4ExecutionState this) =>
-    "MR-T-V4|event=" + eventName +
+f_entryFilledMessage(MRV4TradeState this) =>
+    float fillVsLimitTicks = (this.entryPrice - this.entryLimit) / syminfo.mintick
+    "MR-T-V4|event=ENTRY_FILLED" +
       "|direction=" + f_directionName(this.dir) +
       "|mode=" + f_modeName(this.mode) +
-      "|entry_bar=" + str.tostring(this.entryBar) +
-      "|entry_price=" + f_price(this.entryPrice) +
-      "|entry_improvement_pct=" + f_pct(this.lastEntryImprovementPct) +
-      "|entry_from_preplan=" + (this.entryFromPreplan ? "true" : "false") +
-      "|preplan_source_bar=" + str.tostring(this.preplanSourceBar) +
-      "|preplan_valid_bar=" + str.tostring(this.preplanValidBar) +
-      "|preplan_trigger=" + f_price(this.preplanTrigger) +
-      "|preplan_limit=" + f_price(this.preplanLimit) +
-      "|preplan_trigger_touched=" + (this.preplanTriggerTouched ? "true" : "false")
-
-f_v4ResultMessage(MRV4ExecutionState this) =>
-    "MR-T-V4|event=V4_RESULT" +
-      "|trade_number=" + str.tostring(this.lastTradeNumber) +
-      "|direction=" + f_directionName(this.lastDir) +
-      "|mode=" + f_modeName(this.lastMode) +
-      "|entry_bar=" + str.tostring(this.lastEntryBar) +
-      "|entry_price=" + f_price(this.lastEntryPrice) +
-      "|entry_from_preplan=" + (this.lastEntryFromPreplan ? "true" : "false") +
-      "|preplan_trigger=" + f_price(this.lastPreplanTrigger) +
-      "|preplan_limit=" + f_price(this.lastPreplanLimit) +
-      "|trim_price=" + f_price(this.lastTrimPrice) +
-      "|exit_bar=" + str.tostring(this.lastExitBar) +
-      "|exit_price=" + f_price(this.lastExitPrice) +
-      "|exit_reason=" + f_exitName(this.lastExitReason) +
-      "|entry_improvement_pct=" + f_pct(this.lastEntryImprovementPct) +
-      "|trade_return_pct=" + f_pct(this.lastTradeReturnPct) +
-      "|v4_net_pct=" + f_pct(f_v4NetPct(this)) +
-      "|v4_pf=" + f_pct(f_v4ProfitFactor(this)) +
-      "|v4_win_rate=" + f_pct(f_v4WinRate(this)) +
-      "|preplan_usage_pct=" + f_pct(f_v4UsagePct(this))
+      "|source_bar=" + str.tostring(this.sourceBar) +
+      "|valid_bar=" + str.tostring(this.validBar) +
+      "|trigger=" + f_price(this.entryTrigger) +
+      "|limit=" + f_price(this.entryLimit) +
+      "|fill_bar=" + str.tostring(this.entryBar) +
+      "|fill_price=" + f_price(this.entryPrice) +
+      "|fill_vs_limit_ticks=" + f_pct(fillVsLimitTicks)
 
 // --------------------------------------------------------------------------
 // Broker transition detection and fill synchronization.
-// This section observes Strategy Tester facts and never mutates MRLogicState.
+// This section observes Strategy Tester facts. A valid Entry fill freezes the
+// pending plan into MRV4TradeState and initializes the management mirror.
 float currentPositionSize = strategy.position_size
 bool trackerWasReady = broker.trackerReady
 float previousExecutionPositionSize = broker.previousPositionSize
@@ -946,13 +797,79 @@ float latestClosedExitPrice = hasNewClosedTrade ? strategy.closedtrades.exit_pri
 if hasNewClosedTrade
     broker.latestClosedExitCode := latestClosedExitId == "MR-L" ? 1 : latestClosedExitId == "MR-S" ? 2 : latestClosedExitId == "" ? 0 : 3
 
-bool entryFilled = positionEntered and broker.entryIntentPending and broker.entryIntentDir == currentPositionDir
+// A formal Entry exists only when the Broker position transitions from exact
+// flat to non-flat for the one active PREPLAN order. Trigger/high/low facts are
+// deliberately absent from this gate.
+bool entryFilled = positionEntered and broker.entryIntentPending and assist.active and assist.validBar == bar_index and broker.entryIntentDir == currentPositionDir and assist.dir == currentPositionDir
 bool trimFilled = positionReduced and broker.trimIntentPending and broker.trimIntentDir == currentPositionDir
 bool fullExitFilled = positionClosed and broker.fullExitIntentPending
 
 if entryFilled
+    float actualEntryPrice = strategy.position_avg_price
+    int filledDir = assist.dir
+    int filledMode = assist.mode
+    float partialZ = filledMode == 2 ? shockPartialZ : rangePartialZ
+    float finalZ = filledMode == 2 ? shockExitZ : rangeExitZ
+    float actualATRStop = actualEntryPrice - filledDir * hardStopATR * assist.sourceATR
+    float frozenStatStop = assist.sourceMean - filledDir * stopZ * assist.sourceStd
+    float tightStop = filledDir == 1 ? math.max(actualATRStop, frozenStatStop) : math.min(actualATRStop, frozenStatStop)
+    float looseStop = filledDir == 1 ? math.min(actualATRStop, frozenStatStop) : math.max(actualATRStop, frozenStatStop)
+    float balancedStop = looseStop + (tightStop - looseStop) * balancedWeight
+    float actualInitialStop = f_roundToTick(stopMode == "Tight" ? tightStop : stopMode == "Loose" ? looseStop : balancedStop)
+    float rawTimeStop = na(assist.sourceHalfLife) ? fallbackTimeStopBars : assist.sourceHalfLife * timeStopMultiplier
+    float limitedTimeStop = math.min(maxTimeStopBars, math.max(minTimeStopBars, rawTimeStop))
+
+    // Freeze the exact submitted plan before clearing pending state.
+    trade.active := true
+    trade.dir := filledDir
+    trade.mode := filledMode
+    trade.entryBar := bar_index
+    trade.entryPrice := actualEntryPrice
+    trade.sourceBar := assist.sourceBar
+    trade.validBar := assist.validBar
+    trade.sourceMean := assist.sourceMean
+    trade.sourceStd := assist.sourceStd
+    trade.sourceATR := assist.sourceATR
+    trade.sourceHalfLife := assist.sourceHalfLife
+    trade.sourceRegimeScore := assist.sourceRegimeScore
+    trade.entryTrigger := assist.entryTrigger
+    trade.entryLimit := assist.entryLimit
+    trade.partialTarget := f_roundToTick(assist.sourceMean - filledDir * partialZ * assist.sourceStd)
+    trade.finalTarget := f_roundToTick(assist.sourceMean - filledDir * finalZ * assist.sourceStd)
+    trade.initialStop := actualInitialStop
+    trade.partialTaken := false
+    trade.trimBar := na
+    trade.exitBar := na
+    trade.timeStopBar := bar_index + int(math.round(limitedTimeStop))
+
+    // MRLogicState mirrors the filled trade for confirmed-close management.
+    logic.pos := filledDir
+    logic.partialTaken := false
+    logic.entryBar := trade.entryBar
+    logic.entryPrice := trade.entryPrice
+    logic.mean := trade.sourceMean
+    logic.std := trade.sourceStd
+    logic.atr := trade.sourceATR
+    logic.partialTarget := trade.partialTarget
+    logic.finalTarget := trade.finalTarget
+    logic.baseStop := trade.initialStop
+    logic.timeStop := int(math.round(limitedTimeStop))
+    logic.tradeMode := trade.mode
+    logic.cost := trade.entryPrice * (2.0 * commissionBps) / 10000.0
+    logic.trimDecisionBar := na
+    logic.exitDecisionBar := na
+    logic.setupBar := na
+    logic.setupDir := 0
+    logic.setupMode := 0
+    logic.logicEventBar := bar_index
+    logic.logicEventKind := 1
+    logic.logicEventDir := filledDir
+    logic.logicEventReason := 0
+    logic.logicEventMode := filledMode
+    logic.logicEventPrice := actualEntryPrice
+
     broker.entryIntentPending := false
-    broker.brokerEntryPrice := strategy.position_avg_price
+    broker.brokerEntryPrice := actualEntryPrice
     broker.entryFillBar := bar_index
     broker.fillEventBar := bar_index
     broker.fillEventKind := 1
@@ -961,10 +878,13 @@ if entryFilled
     broker.fillEventPrice := broker.brokerEntryPrice
     broker.netProfitAtEntry := strategy.netprofit
 
-    if broker.entryIntentMode == 1
+    if filledMode == 1
         broker.rangeEntries += 1
     else
         broker.shockEntries += 1
+
+    alert(f_entryFilledMessage(trade), alert.freq_all)
+    assist.reset()
 
 if trimFilled
     broker.trimIntentPending := false
@@ -1004,7 +924,7 @@ if fullExitFilled
     broker.brokerEntryPrice := na
 
 // Consistency and recovery are execution diagnostics only.
-bool logicHasPosition = logic.pos != 0
+bool logicHasPosition = logic.pos != 0 and trade.active
 bool directionReversed = positionSampleReady and previousExecutionPositionSize * currentPositionSize < 0.0
 bool brokerDirectionMismatch = currentPositionSize != 0.0 and logicHasPosition and currentPositionDir != logic.pos
 bool pendingDirectionMismatch = currentPositionSize != 0.0 and broker.entryIntentPending and currentPositionDir != broker.entryIntentDir
@@ -1016,12 +936,29 @@ bool unexpectedSameDirectionIncrease = sameDirectionPosition and math.abs(curren
 
 int consistencyState = currentPositionSize == 0.0 ? CONSISTENCY_OK_FLAT : CONSISTENCY_ORPHAN_BROKER
 bool consistencyRecoveryRequired = false
-bool recoveryResolved = currentPositionSize == 0.0 and logic.pos == 0 and not broker.entryIntentPending and not broker.fullExitIntentPending
+bool recoveryResolved = currentPositionSize == 0.0 and not broker.entryIntentPending and not broker.fullExitIntentPending
 
 if broker.recoveryPending
     consistencyState := broker.recoveryState
 
     if recoveryResolved
+        trade.resetActive()
+        logic.pos := 0
+        logic.partialTaken := false
+        logic.entryBar := na
+        logic.entryPrice := na
+        logic.mean := na
+        logic.std := na
+        logic.atr := na
+        logic.partialTarget := na
+        logic.finalTarget := na
+        logic.baseStop := na
+        logic.timeStop := na
+        logic.tradeMode := 0
+        logic.cost := 0.0
+        logic.setupBar := na
+        logic.setupDir := 0
+        logic.setupMode := 0
         broker.recoveryPending := false
         broker.recoveryClosePlaced := false
         broker.cleanupPending := false
@@ -1073,12 +1010,15 @@ if consistencyRecoveryRequired
         broker.cleanupMode := logic.tradeMode
         broker.cleanupReason := R_STATE_RECOVERY
         strategy.cancel_all()
+        if assist.active
+            alert(f_preplanMessage("PREPLAN_CANCEL", assist.dir, assist.mode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, "|reason=BROKER_RECOVERY"), alert.freq_all)
+            assist.reset()
+        broker.entryIntentPending := false
 
     broker.recoveryPending := true
 
     if currentPositionSize != 0.0
         if not broker.recoveryClosePlaced
-            string recoveryDirection = currentPositionDir == 1 ? "Long" : "Short"
             strategy.close_all(comment = "MR-T Broker Recovery", alert_message = f_orderMessage(currentPositionDir, "BROKER_RECOVERY", logic.tradeMode, close))
             broker.recoveryClosePlaced := true
             broker.cleanupBar := bar_index
@@ -1102,22 +1042,17 @@ if not na(logic.lastExitBar)
 int requiredCooldown = math.max(cooldownBars, 1)
 bool canEnter = na(logic.lastExitBar) or barsSinceExit >= requiredCooldown
 
-// A PREPLAN is evaluated only on the confirmed close of its valid bar.
-// The touch fact uses that completed bar's high/low and cannot create Logic.
-bool preplanForCurrentBar = allowBarCloseDecision and assist.active and assist.validBar == bar_index
-int previousPreplanDir = preplanForCurrentBar ? assist.dir : 0
-int previousPreplanMode = preplanForCurrentBar ? assist.mode : 0
-int previousPreplanSourceBar = preplanForCurrentBar ? assist.sourceBar : na
-int previousPreplanValidBar = preplanForCurrentBar ? assist.validBar : na
-float previousPreplanTrigger = preplanForCurrentBar ? assist.entryTrigger : na
-float previousPreplanLimit = preplanForCurrentBar ? assist.entryLimit : na
-float previousPreplanTP1 = preplanForCurrentBar ? assist.tp1Provisional : na
-float previousPreplanTP2 = preplanForCurrentBar ? assist.tp2Provisional : na
-float previousPreplanStop = preplanForCurrentBar ? assist.stopProvisional : na
-bool previousPreplanTriggerTouched = preplanForCurrentBar and (assist.dir == 1 ? high >= assist.entryTrigger : low <= assist.entryTrigger)
-
-if preplanForCurrentBar
-    assist.triggerTouched := previousPreplanTriggerTouched
+// Each pending Entry is valid for exactly validBar. At that bar's confirmed
+// close an unfilled order is cancelled before any replacement is submitted.
+// A Stop activation without a Limit fill remains flat and reaches this path.
+bool expiredPlanThisBar = false
+if allowBarCloseDecision and assist.active and assist.validBar == bar_index and currentPositionSize == 0.0
+    expiredPlanThisBar := true
+    string expiredEntryId = assist.dir == 1 ? "MR-L" : "MR-S"
+    strategy.cancel(expiredEntryId)
+    alert(f_preplanMessage("ENTRY_EXPIRED_UNFILLED", assist.dir, assist.mode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, ""), alert.freq_all)
+    broker.entryIntentPending := false
+    assist.reset()
 
 // ============================================================================
 // Create Setup (Shock priority; V3 mathematics unchanged)
@@ -1198,7 +1133,7 @@ if allowBarCloseDecision and not na(logic.setupBar) and logic.setupDir * z <= -s
     logic.setupMode := 0
 
 // ============================================================================
-// Entry Confirmation (official V3 close decision)
+// Legacy V3 Entry confirmation diagnostics (never submit V4 orders)
 // ============================================================================
 
 float entryZ = logic.setupMode == 2 ? shockEntryZ : rangeEntryZ
@@ -1225,78 +1160,20 @@ bool bandOK = not requireBandReclaim or priceBandReclaim
 
 bool longEntrySignal = barstate.isconfirmed and logic.pos == 0 and not hardTrendVeto and logic.setupDir == 1 and not na(logic.setupBar) and zReclaim and bandOK and candleOK
 bool shortEntrySignal = barstate.isconfirmed and logic.pos == 0 and not hardTrendVeto and logic.setupDir == -1 and not na(logic.setupBar) and zReclaim and bandOK and candleOK
-bool officialEntryDecision = longEntrySignal or shortEntrySignal
+bool legacyV3EntryDiagnostic = longEntrySignal or shortEntrySignal
 
 // ============================================================================
 // Active Logic stop (single source for management and display)
 // ============================================================================
 
 f_logicActiveStop(int dir) =>
-    float s = logic.partialTaken and moveStopToBE ? (dir == 1 ? math.max(logic.baseStop, logic.entryPrice + logic.cost) : math.min(logic.baseStop, logic.entryPrice - logic.cost)) : logic.baseStop
+    // Both the hard-stop Entry component and BE anchor come from the actual
+    // Broker fill stored in trade.entryPrice.
+    float s = trade.partialTaken and moveStopToBE ? (dir == 1 ? math.max(trade.initialStop, trade.entryPrice + logic.cost) : math.min(trade.initialStop, trade.entryPrice - logic.cost)) : trade.initialStop
     s
 
 // ============================================================================
-// V3 Logic Entry
-// ============================================================================
-
-f_logicEnter(int dir) =>
-    logic.pos := dir
-    logic.partialTaken := false
-    logic.entryPrice := close
-    logic.mean := mean15
-    logic.std := safeStd
-    logic.atr := safeATR
-    logic.entryBar := bar_index
-
-    bool shock = logic.setupMode == 2
-    logic.tradeMode := shock ? 2 : 1
-
-    float pz = shock ? shockPartialZ : rangePartialZ
-    float ez = shock ? shockExitZ : rangeExitZ
-    logic.partialTarget := logic.mean - dir * pz * logic.std
-    logic.finalTarget := logic.mean - dir * ez * logic.std
-
-    float atrStop = logic.entryPrice - dir * hardStopATR * logic.atr
-    float statStop = logic.mean - dir * stopZ * logic.std
-    float tightStop = dir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
-    float looseStop = dir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
-    float balStop = looseStop + (tightStop - looseStop) * balancedWeight
-
-    if stopMode == "Tight"
-        logic.baseStop := tightStop
-    else if stopMode == "Loose"
-        logic.baseStop := looseStop
-    else
-        logic.baseStop := balStop
-
-    float rawTimeStop = fallbackTimeStopBars
-    if not na(halfLife)
-        rawTimeStop := halfLife * timeStopMultiplier
-
-    float limitedTimeStop = math.max(minTimeStopBars, rawTimeStop)
-    limitedTimeStop := math.min(maxTimeStopBars, limitedTimeStop)
-    logic.timeStop := int(math.round(limitedTimeStop))
-
-    logic.cost := logic.entryPrice * (2.0 * commissionBps) / 10000.0
-    logic.trimDecisionBar := na
-    logic.exitDecisionBar := na
-
-    logic.setupBar := na
-    logic.setupDir := 0
-    logic.setupMode := 0
-
-    logic.eventKind := 1
-    logic.eventDir := dir
-    logic.eventReason := 0
-    logic.logicEventBar := bar_index
-    logic.logicEventKind := 1
-    logic.logicEventDir := dir
-    logic.logicEventReason := 0
-    logic.logicEventMode := logic.tradeMode
-    logic.logicEventPrice := logic.entryPrice
-
-// ============================================================================
-// V3 Logic Exit
+// Confirmed-close Trade Exit
 // ============================================================================
 
 f_logicExit(int dir, int reason) =>
@@ -1338,18 +1215,18 @@ f_logicExit(int dir, int reason) =>
 // Priority is exactly V3: Stop/BE → Trend Fail → Timeout → Trim → Final.
 f_logicManage(int dir) =>
     int decisionCode = MANAGE_NONE
-    bool canManage = logic.pos == dir and not na(logic.entryBar) and bar_index > logic.entryBar
+    bool canManage = trade.active and trade.dir == dir and bar_index > trade.entryBar and barstate.isconfirmed
 
-    if barstate.isconfirmed and canManage
+    if canManage
         float activeStop = f_logicActiveStop(dir)
         bool stopHit = not na(activeStop) and (dir == 1 ? close <= activeStop : close >= activeStop)
         bool trendFailed = dir * htfSlopeATR <= -vetoHtfSlope or dir * localSlopeATR <= -vetoLocalSlope
-        bool timeFailed = not na(logic.timeStop) and (bar_index - logic.entryBar) >= logic.timeStop
-        bool partialReached = not logic.partialTaken and not na(logic.partialTarget) and (dir == 1 ? close >= logic.partialTarget : close <= logic.partialTarget)
-        bool finalReached = logic.partialTaken and not na(logic.finalTarget) and (dir == 1 ? close >= logic.finalTarget : close <= logic.finalTarget)
+        bool timeFailed = not na(trade.timeStopBar) and bar_index >= trade.timeStopBar
+        bool partialReached = not trade.partialTaken and not na(trade.partialTarget) and (dir == 1 ? close >= trade.partialTarget : close <= trade.partialTarget)
+        bool finalReached = trade.partialTaken and not na(trade.finalTarget) and (dir == 1 ? close >= trade.finalTarget : close <= trade.finalTarget)
 
         if stopHit
-            bool isBE = logic.partialTaken and moveStopToBE
+            bool isBE = trade.partialTaken and moveStopToBE
             logic.exitDecisionBar := bar_index
             if isBE
                 f_logicExit(dir, R_BE)
@@ -1365,6 +1242,8 @@ f_logicManage(int dir) =>
             f_logicExit(dir, R_TIME)
             decisionCode := MANAGE_TIMEOUT
         else if partialReached
+            trade.partialTaken := true
+            trade.trimBar := bar_index
             logic.partialTaken := true
             logic.trimDecisionBar := bar_index
             logic.eventKind := 2
@@ -1385,58 +1264,28 @@ f_logicManage(int dir) =>
     decisionCode
 
 // ============================================================================
-// Official Logic Decision → Broker intent
+// Filled Trade confirmed-close management → Broker exit intent
 // ============================================================================
-// Only these close-processed orders enter the Strategy Tester. PREPLAN never
-// calls strategy.entry/order and never changes strategy.position_size.
-
-int officialEntryDir = longEntrySignal ? 1 : shortEntrySignal ? -1 : 0
-int officialEntryMode = officialEntryDir != 0 ? logic.setupMode : 0
-bool v4EntryFromPreplan = officialEntryDecision and preplanForCurrentBar and previousPreplanDir == officialEntryDir and previousPreplanMode == officialEntryMode and previousPreplanTriggerTouched and not na(previousPreplanLimit)
 
 if allowBarCloseDecision
-    if longEntrySignal
-        int entryMode = logic.setupMode
-        f_logicEnter(1)
-        broker.entryIntentPending := not consistencyRecoveryRequired
-        broker.entryIntentDir := 1
-        broker.entryIntentMode := entryMode
-        broker.entryIntentBar := bar_index
-        broker.shockConfirmedEntries += entryMode == 2 ? 1 : 0
-
-        if not consistencyRecoveryRequired
-            strategy.entry("MR-L", strategy.long, alert_message = f_orderMessage(1, "Long Entry", entryMode, close))
-    else if shortEntrySignal
-        int entryMode = logic.setupMode
-        f_logicEnter(-1)
-        broker.entryIntentPending := not consistencyRecoveryRequired
-        broker.entryIntentDir := -1
-        broker.entryIntentMode := entryMode
-        broker.entryIntentBar := bar_index
-        broker.shockConfirmedEntries += entryMode == 2 ? 1 : 0
-
-        if not consistencyRecoveryRequired
-            strategy.entry("MR-S", strategy.short, alert_message = f_orderMessage(-1, "Short Entry", entryMode, close))
-
-    if officialEntryDecision
-        // Snapshot the previous-bar PREPLAN before reset(). Only the matching,
-        // touched plan may replace the confirmed-close price for V4 accounting.
-        v4Exec.enter(officialEntryDir, officialEntryMode, logic.entryPrice, v4EntryFromPreplan, preplanForCurrentBar ? previousPreplanSourceBar : na, preplanForCurrentBar ? previousPreplanValidBar : na, preplanForCurrentBar ? previousPreplanTrigger : na, preplanForCurrentBar ? previousPreplanLimit : na, preplanForCurrentBar and previousPreplanTriggerTouched)
-        string entryAssistEvent = v4EntryFromPreplan ? "ENTRY_CONFIRMED" : "ENTRY_CONFIRMED_NO_PREPLAN_FILL"
-        alert(f_v4EntryMessage(entryAssistEvent, v4Exec), alert.freq_all)
-        assist.reset()
-
     f_logicManage(1)
     f_logicManage(-1)
 
-    // V4 Trim and Full Exit are always driven by the same confirmed-close
-    // Logic event bar and close price. They never create a second exit path.
-    if logic.logicEventBar == bar_index and logic.logicEventKind == 2
-        v4Exec.recordTrim(bar_index, close, trimPct / 100.0)
-    if logic.logicEventBar == bar_index and logic.logicEventKind == 3 and v4Exec.active
-        v4Exec.closeTrade(bar_index, close, logic.logicEventReason)
-        v4ResultEventBar := v4Exec.lastResultEventBar
-        alert(f_v4ResultMessage(v4Exec), alert.freq_all)
+    if logic.logicEventBar == bar_index and logic.logicEventKind == 3 and trade.active
+        trade.lastDir := trade.dir
+        trade.lastMode := trade.mode
+        trade.lastEntryBar := trade.entryBar
+        trade.lastEntryPrice := trade.entryPrice
+        trade.lastSourceBar := trade.sourceBar
+        trade.lastValidBar := trade.validBar
+        trade.lastEntryTrigger := trade.entryTrigger
+        trade.lastEntryLimit := trade.entryLimit
+        trade.lastTrimBar := trade.partialTaken ? trade.trimBar : na
+        trade.lastExitBar := bar_index
+        trade.lastExitPrice := close
+        trade.lastExitReason := logic.logicEventReason
+        trade.exitBar := bar_index
+        trade.resetActive()
 
 // A confirmed Logic full exit owns the cleanup handoff. Cleanup is allowed
 // only after this formal decision and is never a new Logic signal.
@@ -1478,14 +1327,10 @@ if cleanupRetry
             alert(f_orderMessage(broker.cleanupDir, "RESIDUAL_CLEANUP", broker.cleanupMode, close), alert.freq_all)
             broker.cleanupAlertSent := true
 
-// A PREPLAN touch is an execution-assist fact, never a Logic entry.
-if allowBarCloseDecision and preplanForCurrentBar and not officialEntryDecision and previousPreplanTriggerTouched
-    alert(f_preplanMessage("PREPLAN_TRIGGERED_UNCONFIRMED", previousPreplanDir, previousPreplanMode, previousPreplanSourceBar, previousPreplanValidBar, previousPreplanTrigger, previousPreplanLimit, previousPreplanTP1, previousPreplanTP2, previousPreplanStop, "|current_close=" + f_price(close) + "|reason=CONFIRMATION_FAILED"), alert.freq_all)
-
 // A new plan is generated only after this bar is confirmed, for the next bar.
 // sourceBar=N uses this bar's final values; validBar=N+1. It never uses an
 // unfinished bar's final close/high/low to plan that same bar.
-bool setupReadyForPreplan = allowBarCloseDecision and logic.pos == 0 and currentPositionSize == 0.0 and not broker.entryIntentPending and not broker.fullExitIntentPending and not broker.recoveryPending and not na(logic.setupBar) and logic.setupDir != 0
+bool setupReadyForPreplan = allowBarCloseDecision and not trade.active and logic.pos == 0 and currentPositionSize == 0.0 and not broker.entryIntentPending and not broker.fullExitIntentPending and not broker.recoveryPending and not na(logic.setupBar) and logic.setupDir != 0
 
 if setupReadyForPreplan
     int planDir = logic.setupDir
@@ -1509,7 +1354,7 @@ if setupReadyForPreplan
     float balancedStop = looseStop + (tightStop - looseStop) * balancedWeight
     float planStop = f_roundToTick(stopMode == "Tight" ? tightStop : stopMode == "Loose" ? looseStop : balancedStop)
 
-    string planEventName = assist.active ? "PREPLAN_UPDATE" : "PREPLAN_CREATE"
+    string planEventName = expiredPlanThisBar ? "PREPLAN_UPDATE" : "PREPLAN_CREATE"
     assist.active := true
     assist.dir := planDir
     assist.mode := planMode
@@ -1525,14 +1370,31 @@ if setupReadyForPreplan
     assist.tp1Provisional := planTP1
     assist.tp2Provisional := planTP2
     assist.stopProvisional := planStop
-    assist.triggerTouched := false
 
+    string submittedOrderMessage = f_preplanMessage("ENTRY_ORDER_SUBMITTED", planDir, planMode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, "")
+    string brokerFillOrderMessage = f_orderMessage(planDir, "ENTRY_BROKER_FILL", planMode, assist.entryLimit)
     alert(f_preplanMessage(planEventName, planDir, planMode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, ""), alert.freq_all)
-else if allowBarCloseDecision and assist.active and not officialEntryDecision
+
+    // Pine stop + limit is a real Stop-Limit Entry. The Broker Emulator alone
+    // decides activation and fill; gap-through orders may remain unfilled.
+    if planDir == 1
+        strategy.entry("MR-L", strategy.long, stop = assist.entryTrigger, limit = assist.entryLimit, alert_message = brokerFillOrderMessage)
+    else
+        strategy.entry("MR-S", strategy.short, stop = assist.entryTrigger, limit = assist.entryLimit, alert_message = brokerFillOrderMessage)
+
+    broker.entryIntentPending := true
+    broker.entryIntentDir := planDir
+    broker.entryIntentMode := planMode
+    broker.entryIntentBar := bar_index
+    alert(submittedOrderMessage, alert.freq_all)
+else if allowBarCloseDecision and assist.active
+    string cancelledEntryId = assist.dir == 1 ? "MR-L" : "MR-S"
+    strategy.cancel(cancelledEntryId)
     alert(f_preplanMessage("PREPLAN_CANCEL", assist.dir, assist.mode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, "|reason=SETUP_INVALID"), alert.freq_all)
+    broker.entryIntentPending := false
     assist.reset()
 
-// Commit Broker observations only. No Logic lifecycle mutation occurs here.
+// Commit Broker observations after all fill/decision handling for this execution.
 broker.previousPositionSize := currentPositionSize
 broker.observedClosedTrades := closedTradesNow
 
@@ -1540,8 +1402,8 @@ broker.observedClosedTrades := closedTradesNow
 setupEvent := logicSetupEventBar == bar_index
 setupEventDir := logicSetupEventDir
 setupEventMode := logicSetupEventMode
-entryEvent := logic.logicEventBar == bar_index and logic.logicEventKind == 1
-entryEventDir := logic.logicEventDir
+entryEvent := entryFilled
+entryEventDir := entryFilled ? currentPositionDir : 0
 partialEvent := logic.logicEventBar == bar_index and logic.logicEventKind == 2
 partialEventDir := logic.logicEventDir
 exitEvent := logic.logicEventBar == bar_index and logic.logicEventKind == 3
@@ -1596,11 +1458,11 @@ float activePartialLine = na
 float activeFinalLine = na
 float activeRiskLine = na
 
-bool showActiveTradeLines = logic.pos != 0
+bool showActiveTradeLines = trade.active
 if showActiveTradeLines
-    activePartialLine := logic.partialTarget
-    activeFinalLine := logic.finalTarget
-    activeRiskLine := f_logicActiveStop(logic.pos)
+    activePartialLine := trade.partialTarget
+    activeFinalLine := trade.finalTarget
+    activeRiskLine := f_logicActiveStop(trade.dir)
 
 plot(showTradeLevels ? activePartialLine : na, "T减目标 / Trim", color = color.orange, linewidth = 2, style = plot.style_linebr)
 plot(showTradeLevels ? activeFinalLine : na, "T平目标 / Target", color = color.white, linewidth = 2, style = plot.style_linebr)
@@ -1684,21 +1546,6 @@ if exitEvent and exitReason == R_BE and exitEventDir == -1
 
 
 // ============================================================================
-// V4 Result Label
-// ============================================================================
-// One compact result marker is emitted on the full V4 close bar. The
-// intra-bar guard prevents calc_on_order_fills from creating a duplicate.
-bool v4ResultEvent = v4ResultEventBar == bar_index
-if showV4ResultLabel and v4ResultEvent and v4ResultLabelBar != bar_index
-    v4ResultLabelBar := bar_index
-    string v4ResultText = na(v4Exec.lastTradeReturnPct) ? "V4 -" : "V4 " + (v4Exec.lastTradeReturnPct > 0.0 ? "+" : "") + f_pct(v4Exec.lastTradeReturnPct) + "%"
-    if v4Exec.lastDir == 1
-        label.new(bar_index, high, v4ResultText, style = label.style_label_down, color = color.new(color.gray, 75), textcolor = color.white, size = size.tiny)
-    else if v4Exec.lastDir == -1
-        label.new(bar_index, low, v4ResultText, style = label.style_label_up, color = color.new(color.gray, 75), textcolor = color.white, size = size.tiny)
-
-
-// ============================================================================
 // Data Window
 // ============================================================================
 // Keep the production Data Window compact: market context, Logic parity fields,
@@ -1732,16 +1579,15 @@ plot(broker.rangeWins, "Range Wins", display = display.data_window)
 plot(broker.shockEntries, "Shock Entries", display = display.data_window)
 plot(broker.shockClosed, "Shock Closed", display = display.data_window)
 plot(broker.shockWins, "Shock Wins", display = display.data_window)
-float displayedV4Entry = v4Exec.active ? v4Exec.entryPrice : v4Exec.lastEntryPrice
-float displayedV4EntryFromPreplan = v4Exec.active ? (v4Exec.entryFromPreplan ? 1.0 : 0.0) : (v4Exec.lastEntryFromPreplan ? 1.0 : 0.0)
-plot(displayedV4Entry, "V4 Entry Price", display = display.data_window)
-plot(displayedV4EntryFromPreplan, "V4 Entry From PREPLAN", display = display.data_window)
-plot(v4Exec.lastEntryImprovementPct, "V4 Entry Improvement %", display = display.data_window)
-plot(v4Exec.lastTradeReturnPct, "V4 Last Trade %", display = display.data_window)
-plot(f_v4NetPct(v4Exec), "V4 Net %", display = display.data_window)
-plot(f_v4ProfitFactor(v4Exec), "V4 Profit Factor", display = display.data_window)
-plot(f_v4WinRate(v4Exec), "V4 Win Rate", display = display.data_window)
-plot(f_v4UsagePct(v4Exec), "V4 PREPLAN Usage %", display = display.data_window)
+float actualEntryPriceWindow = trade.active ? strategy.position_avg_price : trade.lastEntryPrice
+plot(assist.active ? assist.entryTrigger : na, "Pending Entry Trigger", display = display.data_window)
+plot(assist.active ? assist.entryLimit : na, "Pending Entry Limit", display = display.data_window)
+plot(actualEntryPriceWindow, "Actual Entry Price", display = display.data_window)
+plot(trade.active ? trade.entryBar : trade.lastEntryBar, "Entry Fill Bar", display = display.data_window)
+plot(strategy.netprofit, "V4 Net Profit", display = display.data_window)
+plot(strategy.max_drawdown, "V4 Max Drawdown", display = display.data_window)
+plot(strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na, "V4 Profit Factor", display = display.data_window)
+plot(strategy.closedtrades, "V4 Closed Trades", display = display.data_window)
 
 
 // ============================================================================
@@ -1763,7 +1609,7 @@ if showPanel
         envColor := color.purple
 
     bool consistencyError = consistencyState >= CONSISTENCY_STALE_ACTIVE_FLAT and consistencyState <= CONSISTENCY_INVALID_CONTEXT
-    string stateText = consistencyError ? f_tr("状态错误", "STATE ERROR") : logic.pos == 1 ? f_tr("逻辑T多", "Logic Long") : logic.pos == -1 ? f_tr("逻辑T空", "Logic Short") : broker.entryIntentPending and broker.entryIntentDir == 1 ? f_tr("待多头成交", "Pending Long") : broker.entryIntentPending and broker.entryIntentDir == -1 ? f_tr("待空头成交", "Pending Short") : f_tr("逻辑空仓", "Logic Flat")
+    string stateText = broker.recoveryPending ? "RECOVERY" : consistencyError ? f_tr("状态错误", "STATE ERROR") : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : trade.active ? trade.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : assist.active and assist.dir == 1 ? "PREPLAN_PENDING_LONG" : assist.active and assist.dir == -1 ? "PREPLAN_PENDING_SHORT" : "FLAT"
 
     string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
     string brokerStateText = broker.fullExitIntentPending ? f_tr("等待全平成交", "Full exit pending") : broker.trimIntentPending ? f_tr("等待T减成交", "Trim pending") : broker.entryIntentPending ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
@@ -1784,28 +1630,27 @@ if showPanel
     string hlText = na(halfLife) ? f_tr("无效", "n/a") : str.tostring(halfLife, "#.0")
     string shockText = str.tostring(shockMove, "#.00") + " ATR"
     string scoreText = str.tostring(regimeScore, "#")
-    string v4TradeNumberText = v4Exec.active ? "#" + str.tostring(v4Exec.v4Trades + 1, "#") : v4Exec.lastTradeNumber > 0 ? "#" + str.tostring(v4Exec.lastTradeNumber, "#") : "-"
-    string modeText = v4Exec.active ? v4TradeNumberText + " " + f_directionName(v4Exec.dir) + " / " + f_modeName(v4Exec.mode) : broker.entryIntentPending ? f_directionName(broker.entryIntentDir) + " / " + f_modeName(broker.entryIntentMode) : v4Exec.lastTradeNumber > 0 ? v4TradeNumberText + " " + f_directionName(v4Exec.lastDir) + " / " + f_modeName(v4Exec.lastMode) : "-"
+    string modeText = trade.active ? f_directionName(trade.dir) + " / " + f_modeName(trade.mode) : assist.active ? f_directionName(assist.dir) + " / " + f_modeName(assist.mode) : trade.lastDir != 0 ? f_directionName(trade.lastDir) + " / " + f_modeName(trade.lastMode) : "-"
     string stopText = stopMode
-    string phaseText = logic.pos != 0 ? logic.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : broker.trimIntentPending ? "TRIM_PENDING" : broker.entryIntentPending ? "ENTRY_PENDING" : "FLAT"
-    string entryText = v4Exec.active ? f_price(v4Exec.entryPrice) : f_price(v4Exec.lastEntryPrice)
-    string preplanTriggerText = v4Exec.active ? f_price(v4Exec.preplanTrigger) : assist.active ? f_price(assist.entryTrigger) : f_price(v4Exec.lastPreplanTrigger)
-    string preplanLimitText = v4Exec.active ? f_price(v4Exec.preplanLimit) : assist.active ? f_price(assist.entryLimit) : f_price(v4Exec.lastPreplanLimit)
-    string trimText = v4Exec.active ? v4Exec.trimTaken ? f_price(v4Exec.trimPrice) : f_price(logic.partialTarget) : f_price(v4Exec.lastTrimPrice)
-    string finalText = v4Exec.active ? f_price(logic.finalTarget) : f_price(v4Exec.lastExitPrice)
-    string riskText = logic.pos == 0 ? "-" : str.tostring(f_logicActiveStop(logic.pos), format.mintick)
-    string recentTradeText = v4Exec.lastTradeNumber > 0 ? "#" + str.tostring(v4Exec.lastTradeNumber, "#") + " " + f_directionName(v4Exec.lastDir) + " " + f_exitName(v4Exec.lastExitReason) : "-"
-    string recentReturnText = f_panelPct(v4Exec.lastTradeReturnPct, true)
-    float v4Net = f_v4NetPct(v4Exec)
-    float v4PF = f_v4ProfitFactor(v4Exec)
+    string phaseText = broker.recoveryPending ? "RECOVERY" : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : trade.active ? trade.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : assist.active and assist.dir == 1 ? "PREPLAN_PENDING_LONG" : assist.active and assist.dir == -1 ? "PREPLAN_PENDING_SHORT" : "FLAT"
+    string entryText = trade.active ? f_price(strategy.position_avg_price) : f_price(trade.lastEntryPrice)
+    string preplanTriggerText = assist.active ? f_price(assist.entryTrigger) : trade.active ? f_price(trade.entryTrigger) : f_price(trade.lastEntryTrigger)
+    string preplanLimitText = assist.active ? f_price(assist.entryLimit) : trade.active ? f_price(trade.entryLimit) : f_price(trade.lastEntryLimit)
+    string trimText = trade.active ? f_price(trade.partialTarget) : "-"
+    string finalText = trade.active ? f_price(trade.finalTarget) : "-"
+    string riskText = trade.active ? f_price(f_logicActiveStop(trade.dir)) : "-"
+    string lastExitText = not na(trade.lastExitBar) ? f_exitName(trade.lastExitReason) + " @ " + f_price(trade.lastExitPrice) : "-"
+    float v4Net = strategy.netprofit
+    float v4NetPct = strategy.netprofit_percent
+    float v4PF = strategy.grossloss != 0.0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
     string v4PFText = na(v4PF) ? "-" : str.tostring(v4PF, "#.00")
-    string v4QualityText = f_panelPct(f_v4WinRate(v4Exec), false) + " / " + f_panelPct(f_v4UsagePct(v4Exec), false)
+    float v4WinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
+    string v4QualityText = str.tostring(strategy.closedtrades, "#") + " / " + f_panelPct(v4WinRate, false)
     string brokerSummaryText = brokerPositionText + " / " + brokerStateText + " / " + consistencyText
     float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
     float shockWinRate = broker.shockClosed > 0 ? broker.shockWins / broker.shockClosed * 100.0 : na
     string rangeStatsText = "R E" + str.tostring(broker.rangeEntries, "#") + "/C" + str.tostring(broker.rangeClosed, "#") + "/W" + str.tostring(broker.rangeWins, "#") + "(" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"
     string shockStatsText = "S E" + str.tostring(broker.shockEntries, "#") + "/C" + str.tostring(broker.shockClosed, "#") + "/W" + str.tostring(broker.shockWins, "#") + "(" + (na(shockWinRate) ? "-" : str.tostring(shockWinRate, "#.0") + "%") + ")"
-    color recentReturnColor = f_resultColor(v4Exec.lastTradeReturnPct)
 
     table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
     table.cell(panel, 1, 0, "15m")
@@ -1837,31 +1682,31 @@ if showPanel
     table.cell(panel, 0, 9, f_tr("阶段", "Phase"))
     table.cell(panel, 1, 9, phaseText)
 
-    table.cell(panel, 0, 10, f_tr("V4 入场价", "V4 Entry Price"))
-    table.cell(panel, 1, 10, entryText)
+    table.cell(panel, 0, 10, f_tr("Pending Trigger / Limit", "Pending Trigger / Limit"))
+    table.cell(panel, 1, 10, preplanTriggerText + " / " + preplanLimitText)
 
-    table.cell(panel, 0, 11, f_tr("PREPLAN Trigger / Limit", "PREPLAN Trigger / Limit"))
-    table.cell(panel, 1, 11, preplanTriggerText + " / " + preplanLimitText)
+    table.cell(panel, 0, 11, f_tr("实际入场价", "Actual Entry Price"))
+    table.cell(panel, 1, 11, entryText)
 
     table.cell(panel, 0, 12, f_tr("T减 / T平", "Trim / Exit"))
     table.cell(panel, 1, 12, trimText + " / " + finalText)
 
-    table.cell(panel, 0, 13, f_tr("Risk", "Risk"))
+    table.cell(panel, 0, 13, f_tr("当前止损", "Active Stop"))
     table.cell(panel, 1, 13, riskText + " (" + stopText + ")")
 
-    table.cell(panel, 0, 14, f_tr("最近交易", "Recent Trade"))
-    table.cell(panel, 1, 14, recentTradeText)
+    table.cell(panel, 0, 14, f_tr("最近退出", "Last Exit"))
+    table.cell(panel, 1, 14, lastExitText)
 
-    table.cell(panel, 0, 15, f_tr("最近收益 %", "Last Return %"))
-    table.cell(panel, 1, 15, recentReturnText, text_color = recentReturnColor)
+    table.cell(panel, 0, 15, f_tr("净利润 / Net %", "Net Profit / Net %"))
+    table.cell(panel, 1, 15, str.tostring(v4Net, "#.##") + " / " + f_panelPct(v4NetPct, true), text_color = f_resultColor(v4Net))
 
-    table.cell(panel, 0, 16, f_tr("V4累计 Net %", "V4 Net %"))
-    table.cell(panel, 1, 16, f_panelPct(v4Net, false))
+    table.cell(panel, 0, 16, f_tr("最大回撤", "Max Drawdown"))
+    table.cell(panel, 1, 16, str.tostring(strategy.max_drawdown, "#.##"))
 
     table.cell(panel, 0, 17, f_tr("V4 PF", "V4 Profit Factor"))
     table.cell(panel, 1, 17, v4PFText)
 
-    table.cell(panel, 0, 18, f_tr("V4胜率 / PREPLAN使用率", "V4 Win Rate / PREPLAN Usage"))
+    table.cell(panel, 0, 18, f_tr("交易数 / 胜率", "Trades / Win Rate"))
     table.cell(panel, 1, 18, v4QualityText)
 
     table.cell(panel, 0, 19, f_tr("Broker / 一致性", "Broker / Consistency"))
@@ -1881,9 +1726,6 @@ else
 if setupEvent and allowBarCloseDecision
     string setupEventName = setupEventMode == 2 ? "SHOCK_SETUP" : "RANGE_SETUP"
     alert(f_orderMessage(setupEventDir, setupEventName, setupEventMode, close), alert.freq_all)
-
-if entryEvent and allowBarCloseDecision
-    alert(f_orderMessage(entryEventDir, "Entry Decision", eventMode, eventPrice), alert.freq_all)
 
 if partialEvent and allowBarCloseDecision
     alert(f_orderMessage(partialEventDir, "Trim", eventMode, eventPrice), alert.freq_all)
