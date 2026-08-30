@@ -3,14 +3,15 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
 // GitHub: https://github.com/Ye-Yu-Mo
-strategy("MR-T Strategy v4.5.0", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = true, calc_on_order_fills = true, calc_on_every_tick = false, use_bar_magnifier = true, margin_long = 0, margin_short = 0, max_labels_count = 500)
+strategy("MR-T Strategy v4.5.1", shorttitle = "MR-T v4", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, use_bar_magnifier = true, margin_long = 0, margin_short = 0, max_labels_count = 500)
 
 // ============================================================================
-// Mean Reversion T (MR-T) · Strategy v4.5.0
+// Mean Reversion T (MR-T) · Strategy v4.5.1
 // V3.3.2 = confirmed-close Logic baseline (MRT.pine).
 // V4.1.0 = V3-aligned Logic + previous-confirmed-bar execution assist.
 // V4.4.0 = True Executable PREPLAN Entry.
 // V4.5.0 = Intrabar Broker-Ordered Exit Lifecycle.
+// V4.5.1 = Real-Time Execution Correctness.
 //
 // 推荐周期 / Recommended timeframe : 15 分钟 (15m) —— 脚本内强制校验
 //
@@ -26,12 +27,13 @@ strategy("MR-T Strategy v4.5.0", shorttitle = "MR-T v4", overlay = true, pyramid
 // 定位 / Scope: TradingView strategy,用于 Strategy Tester 回测,不构成投资建议。
 // PREPLAN 在上一根 confirmed bar 收盘后提交真实 Stop-Limit Entry。
 // Broker Emulator fill 是唯一入场事实，Strategy Tester 是 V4 收益唯一事实来源。
-// Bar Magnifier improves intrabar sequencing using lower-timeframe historical
-// bars. It is not tick-by-tick exchange replay. If two orders are crossed inside
-// one lowest available Magnifier bar, TradingView Broker Emulator rules decide.
+// On a 15m chart, Bar Magnifier uses lower-timeframe historical bars (typically
+// about 2m when TradingView data coverage permits) to improve fill sequencing.
+// It is not tick-by-tick exchange replay. If two orders are crossed inside one
+// lowest available Magnifier bar, TradingView Broker Emulator rules decide.
 // 换品种/周期前请重新评估全部参数。
 //
-// 版本 / Version: v4.5.0 —— Intrabar Broker-Ordered Exit Lifecycle。
+// 版本 / Version: v4.5.1 —— Real-Time Execution Correctness。
 // 变更见 CHANGELOG.md。
 // ============================================================================
 
@@ -50,7 +52,7 @@ f_tr(simple string zh, simple string en) =>
     lang == "zh" ? zh : en
 
 string SCRIPT_NAME = "MR-T"
-string SCRIPT_VERSION = "4.5.0"
+string SCRIPT_VERSION = "4.5.1"
 
 
 // ============================================================================
@@ -537,6 +539,7 @@ type MRBrokerState
     varip bool   cleanupPending = false
     varip bool   cleanupClosePlaced = false
     varip bool   cleanupAlertSent = false
+    varip int    residualCleanupCount = 0
     varip int    cleanupDir = 0
     varip int    cleanupMode = 0
     varip int    cleanupReason = 0
@@ -630,6 +633,8 @@ method resetActive(MRV4TradeState this) =>
     this.trimBar := na
     this.trimFillPrice := na
     this.exitBar := na
+    this.exitFillBar := na
+    this.exitFillPrice := na
     this.timeStopBar := na
 
 var MRV4TradeState trade = MRV4TradeState.new()
@@ -715,6 +720,28 @@ f_brokerExecutionCost(float price) =>
 
 f_orderMessage(int dir, string eventName, int mode, float price) =>
     "MR-T|direction=" + f_directionName(dir) + "|event=" + eventName + "|mode=" + f_modeName(mode) + "|price=" + f_price(price)
+
+f_priceOrderMessage(string eventName, string orderId, MRV4TradeState this, float orderPrice) =>
+    "MR-T-V4|event=" + eventName +
+      "|direction=" + f_directionName(this.dir) +
+      "|mode=" + f_modeName(this.mode) +
+      "|order_id=" + orderId +
+      "|entry_price=" + f_price(this.entryPrice) +
+      "|order_price=" + f_price(orderPrice) +
+      "|position_size={{strategy.position_size}}" +
+      "|source_bar=" + str.tostring(this.sourceBar) +
+      "|valid_bar=" + str.tostring(this.validBar)
+
+f_entryOrderMessage(int dir, int mode, string orderId, int sourceBar, int validBar, float orderPrice) =>
+    "MR-T-V4|event=ENTRY_FILLED" +
+      "|direction=" + f_directionName(dir) +
+      "|mode=" + f_modeName(mode) +
+      "|order_id=" + orderId +
+      "|entry_price={{strategy.order.price}}" +
+      "|order_price=" + f_price(orderPrice) +
+      "|position_size={{strategy.position_size}}" +
+      "|source_bar=" + str.tostring(sourceBar) +
+      "|valid_bar=" + str.tostring(validBar)
 
 f_exitName(int reason) =>
     reason == R_FINAL ? "Final Exit" : reason == R_TREND ? "Trend Fail" : reason == R_TIME ? "Timeout" : reason == R_BE ? "Breakeven" : "Stop"
@@ -812,11 +839,12 @@ if hasNewClosedTrade
 // flat to non-flat for the one active PREPLAN order. Trigger/high/low facts are
 // deliberately absent from this gate.
 bool entryFilled = positionEntered and broker.entryIntentPending and assist.active and assist.validBar == bar_index and broker.entryIntentDir == currentPositionDir and assist.dir == currentPositionDir
-bool priceExitReduction = positionReduced and trade.active and hasNewClosedTrade and (latestClosedExitId == "MR-X1" or latestClosedExitId == "MR-X2")
-bool tp1Filled = priceExitReduction and not trade.partialTaken and latestClosedExitId == "MR-X1" and latestClosedExitComment == "TP1"
-bool initialStopSliceFilled = priceExitReduction and not trade.partialTaken and latestClosedExitComment == "STOP"
+bool priceExitFill = trade.active and hasNewClosedTrade and (latestClosedExitId == "MR-TP1" or latestClosedExitId == "MR-TP2" or latestClosedExitId == "MR-SL" or latestClosedExitId == "MR-BE")
+bool priceExitReduction = positionReduced and priceExitFill
+bool tp1Filled = priceExitReduction and not trade.partialTaken and latestClosedExitId == "MR-TP1" and latestClosedExitComment == "TP1"
+bool terminalPriceReduction = priceExitReduction and (latestClosedExitId == "MR-TP2" or latestClosedExitId == "MR-SL" or latestClosedExitId == "MR-BE")
 bool stateExitReduction = positionReduced and broker.fullExitIntentPending
-bool fullExitFilled = positionClosed and trade.active and (broker.fullExitIntentPending or (hasNewClosedTrade and (latestClosedExitId == "MR-X1" or latestClosedExitId == "MR-X2")))
+bool fullExitFilled = positionClosed and trade.active and (broker.fullExitIntentPending or priceExitFill)
 
 if entryFilled
     float actualEntryPrice = strategy.position_avg_price
@@ -904,14 +932,20 @@ if entryFilled
     else
         broker.shockEntries += 1
 
-    // Submit both reserved Broker brackets during the Entry-fill recalculation.
-    // Their duplicate Initial Stops protect both reserved slices. Separate
-    // named OCA-reduce groups prevent an MR-X1 fill from reducing MR-X2's
-    // reserved remainder. These orders are active on trade.entryBar itself.
-    string activeEntryId = filledDir == 1 ? "MR-L" : "MR-S"
-    strategy.exit("MR-X1", from_entry = activeEntryId, qty_percent = trimPct, limit = trade.partialTarget, stop = trade.initialStop, oca_name = "MR-X1-BRACKET", comment_profit = "TP1", comment_loss = "STOP", alert_message = f_orderMessage(filledDir, "MR-X1_BROKER_FILL", filledMode, trade.partialTarget))
-    if trimPct < 100.0
-        strategy.exit("MR-X2", from_entry = activeEntryId, qty_percent = 100.0 - trimPct, limit = trade.finalTarget, stop = trade.initialStop, oca_name = "MR-X2-BRACKET", comment_profit = "FINAL", comment_loss = "STOP", alert_message = f_orderMessage(filledDir, "MR-X2_BROKER_FILL", filledMode, trade.finalTarget))
+    // One Broker OCA-reduce group owns the whole PRE-TP1 position. TP1 derives
+    // from the actual Broker position, while TP2 and the stop each start at Q.
+    // The protective stop has no limit parameter: it models Stop-Market risk exit.
+    float actualPositionQty = math.abs(strategy.position_size)
+    float trimQty = actualPositionQty * trimPct / 100.0
+    string preOca = "MR-OCA-PRE-" + str.tostring(trade.entryBar)
+    if filledDir == 1
+        strategy.order("MR-TP1", strategy.short, qty = trimQty, limit = trade.partialTarget, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "TP1", alert_message = f_priceOrderMessage("TP1_FILLED", "MR-TP1", trade, trade.partialTarget))
+        strategy.order("MR-TP2", strategy.short, qty = actualPositionQty, limit = trade.finalTarget, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_priceOrderMessage("TP2_FILLED", "MR-TP2", trade, trade.finalTarget))
+        strategy.order("MR-SL", strategy.short, qty = actualPositionQty, stop = trade.initialStop, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "STOP", alert_message = f_priceOrderMessage("STOP_FILLED", "MR-SL", trade, trade.initialStop))
+    else
+        strategy.order("MR-TP1", strategy.long, qty = trimQty, limit = trade.partialTarget, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "TP1", alert_message = f_priceOrderMessage("TP1_FILLED", "MR-TP1", trade, trade.partialTarget))
+        strategy.order("MR-TP2", strategy.long, qty = actualPositionQty, limit = trade.finalTarget, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_priceOrderMessage("TP2_FILLED", "MR-TP2", trade, trade.finalTarget))
+        strategy.order("MR-SL", strategy.long, qty = actualPositionQty, stop = trade.initialStop, oca_name = preOca, oca_type = strategy.oca.reduce, comment = "STOP", alert_message = f_priceOrderMessage("STOP_FILLED", "MR-SL", trade, trade.initialStop))
 
     alert(f_entryFilledMessage(trade), alert.freq_all)
     assist.reset()
@@ -935,28 +969,54 @@ if tp1Filled
     broker.fillEventReason := 0
     broker.fillEventPrice := latestClosedExitPrice
 
-    // Release the original reservations, then give MR-X2 the exact Broker
-    // remainder. calc_on_order_fills makes this BE update available to the
-    // subsequent lower-timeframe path inside the same chart bar.
-    strategy.cancel("MR-X1")
-    strategy.cancel("MR-X2")
-    strategy.exit("MR-X2", from_entry = trade.dir == 1 ? "MR-L" : "MR-S", qty = math.abs(strategy.position_size), limit = trade.finalTarget, stop = trade.breakEvenStop, oca_name = "MR-X2-BRACKET", comment_profit = "FINAL", comment_loss = moveStopToBE ? "BE" : "STOP", alert_message = f_orderMessage(trade.dir, "MR-X2_BROKER_FILL", trade.mode, trade.finalTarget))
+    // Cancel the PRE group and rebuild TP2 + BE from the actual live remainder.
+    // calc_on_order_fills exposes these orders to the remaining intrabar path.
+    float remainingQty = math.abs(strategy.position_size)
+    strategy.cancel("MR-TP1")
+    strategy.cancel("MR-TP2")
+    strategy.cancel("MR-SL")
+    if remainingQty > 0.0
+        string postOca = "MR-OCA-POST-" + str.tostring(trade.entryBar)
+        string postStopEvent = moveStopToBE ? "BE_FILLED" : "STOP_FILLED"
+        string postStopComment = moveStopToBE ? "BE" : "STOP"
+        if trade.dir == 1
+            strategy.order("MR-TP2", strategy.short, qty = remainingQty, limit = trade.finalTarget, oca_name = postOca, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_priceOrderMessage("TP2_FILLED", "MR-TP2", trade, trade.finalTarget))
+            strategy.order("MR-BE", strategy.short, qty = remainingQty, stop = trade.breakEvenStop, oca_name = postOca, oca_type = strategy.oca.reduce, comment = postStopComment, alert_message = f_priceOrderMessage(postStopEvent, "MR-BE", trade, trade.breakEvenStop))
+        else
+            strategy.order("MR-TP2", strategy.long, qty = remainingQty, limit = trade.finalTarget, oca_name = postOca, oca_type = strategy.oca.reduce, comment = "TP2", alert_message = f_priceOrderMessage("TP2_FILLED", "MR-TP2", trade, trade.finalTarget))
+            strategy.order("MR-BE", strategy.long, qty = remainingQty, stop = trade.breakEvenStop, oca_name = postOca, oca_type = strategy.oca.reduce, comment = postStopComment, alert_message = f_priceOrderMessage(postStopEvent, "MR-BE", trade, trade.breakEvenStop))
     alert(f_priceFillMessage("TP1_FILLED", trade.dir, trade.entryPrice, bar_index, latestClosedExitPrice, strategy.position_size, trade.breakEvenStop), alert.freq_all)
 
-// A fractional Initial-Stop fill must never leave an unprotected remainder.
-// Replacing MR-X2 with the exact live size is a defensive reservation fallback;
-// normal Broker Emulator handling fills both reserved Stop slices together.
-if initialStopSliceFilled
-    strategy.cancel("MR-X1")
-    strategy.cancel("MR-X2")
-    strategy.exit("MR-X2", from_entry = trade.dir == 1 ? "MR-L" : "MR-S", qty = math.abs(strategy.position_size), limit = trade.finalTarget, stop = trade.initialStop, oca_name = "MR-X2-BRACKET", comment_profit = "FINAL", comment_loss = "STOP", alert_message = f_orderMessage(trade.dir, "MR-X2_BROKER_FILL", trade.mode, trade.initialStop))
+// A terminal price fill should be exactly flat. Any nonzero remainder is an
+// execution anomaly, not a valid state: cancel price orders and close it once.
+if terminalPriceReduction and not broker.fullExitIntentPending
+    int residualReason = latestClosedExitId == "MR-TP2" ? R_FINAL : latestClosedExitComment == "BE" ? R_BE : R_STOP
+    strategy.cancel("MR-TP1")
+    strategy.cancel("MR-TP2")
+    strategy.cancel("MR-SL")
+    strategy.cancel("MR-BE")
+    broker.residualCleanupCount += 1
+    broker.fullExitIntentPending := true
+    broker.fullExitIntentDir := trade.dir
+    broker.fullExitIntentMode := trade.mode
+    broker.fullExitIntentReason := residualReason
+    broker.fullExitIntentBar := bar_index
+    broker.cleanupPending := true
+    broker.cleanupClosePlaced := true
+    broker.cleanupAlertSent := true
+    broker.cleanupDir := trade.dir
+    broker.cleanupMode := trade.mode
+    broker.cleanupReason := residualReason
+    broker.cleanupBar := bar_index
+    strategy.close_all(comment = "MR-T V4 Residual Cleanup", alert_message = f_orderMessage(trade.dir, "RESIDUAL_CLEANUP", trade.mode, close))
+    alert(f_orderMessage(trade.dir, "RESIDUAL_CLEANUP", trade.mode, close), alert.freq_all)
 
 if fullExitFilled
     int finishedDir = trade.dir
     int finishedBrokerMode = trade.mode
     float finishedEntryPrice = trade.entryPrice
-    int finishedReason = broker.fullExitIntentPending ? broker.fullExitIntentReason : latestClosedExitComment == "FINAL" or latestClosedExitComment == "TP1" ? R_FINAL : latestClosedExitComment == "BE" ? R_BE : R_STOP
-    string finishedEventName = finishedReason == R_FINAL ? "FINAL_FILLED" : finishedReason == R_BE ? "BE_FILLED" : finishedReason == R_TREND ? "TREND_FAIL_FILLED" : finishedReason == R_TIME ? "TIMEOUT_FILLED" : "STOP_FILLED"
+    int finishedReason = broker.fullExitIntentPending ? broker.fullExitIntentReason : latestClosedExitId == "MR-TP2" or latestClosedExitId == "MR-TP1" ? R_FINAL : latestClosedExitComment == "BE" ? R_BE : R_STOP
+    string finishedEventName = finishedReason == R_FINAL ? "TP2_FILLED" : finishedReason == R_BE ? "BE_FILLED" : finishedReason == R_TREND ? "TREND_FAIL_FILLED" : finishedReason == R_TIME ? "TIMEOUT_FILLED" : "STOP_FILLED"
     float tradeNetProfit = na(broker.netProfitAtEntry) ? 0.0 : strategy.netprofit - broker.netProfitAtEntry
     bool winningBrokerTrade = tradeNetProfit > 0.0
 
@@ -972,7 +1032,7 @@ if fullExitFilled
     trade.lastExitBar := bar_index
     trade.lastExitPrice := latestClosedExitPrice
     trade.lastExitReason := finishedReason
-    trade.exitBar := bar_index
+    trade.exitBar := broker.fullExitIntentPending ? broker.fullExitIntentBar : bar_index
     trade.exitFillBar := bar_index
     trade.exitFillPrice := latestClosedExitPrice
 
@@ -998,8 +1058,10 @@ if fullExitFilled
 
     broker.netProfitAtEntry := na
     broker.brokerEntryPrice := na
-    strategy.cancel("MR-X1")
-    strategy.cancel("MR-X2")
+    strategy.cancel("MR-TP1")
+    strategy.cancel("MR-TP2")
+    strategy.cancel("MR-SL")
+    strategy.cancel("MR-BE")
     alert(f_priceFillMessage(finishedEventName, finishedDir, finishedEntryPrice, bar_index, latestClosedExitPrice, 0.0, na), alert.freq_all)
 
     logic.lastExitBar := bar_index
@@ -1122,6 +1184,7 @@ if consistencyRecoveryRequired
             broker.cleanupBar := bar_index
         else if isFillSynchronizationExecution and positionChanged and not broker.cleanupClosePlaced
             strategy.close_all(comment = "MR-T V4 Residual Cleanup", alert_message = f_orderMessage(currentPositionDir, "RESIDUAL_CLEANUP", logic.tradeMode, close))
+            broker.residualCleanupCount += 1
             broker.cleanupClosePlaced := true
             broker.cleanupBar := bar_index
             if not broker.cleanupAlertSent
@@ -1319,13 +1382,16 @@ if allowBarCloseDecision
     f_logicManage(1)
     f_logicManage(-1)
 
-// A confirmed Trend/Timeout decision first cancels both live price brackets,
-// then submits one market close. Trade state remains active until Broker flat.
+// A confirmed Trend/Timeout decision first cancels all live price orders, then
+// submits one market close. With process_orders_on_close=false, decisionBar is
+// this confirmed bar while the Broker fill belongs to the next available tick.
 if allowBarCloseDecision and logic.logicEventBar == bar_index and logic.logicEventKind == 3 and not broker.fullExitIntentPending and not consistencyRecoveryRequired
     string closeEntryId = logic.logicEventDir == 1 ? "MR-L" : "MR-S"
     string closeEvent = f_exitName(logic.logicEventReason)
-    strategy.cancel("MR-X1")
-    strategy.cancel("MR-X2")
+    strategy.cancel("MR-TP1")
+    strategy.cancel("MR-TP2")
+    strategy.cancel("MR-SL")
+    strategy.cancel("MR-BE")
     broker.fullExitIntentPending := true
     broker.fullExitIntentDir := logic.logicEventDir
     broker.fullExitIntentMode := logic.logicEventMode
@@ -1343,9 +1409,9 @@ if allowBarCloseDecision and logic.logicEventBar == bar_index and logic.logicEve
 // A residual 0.00001 is not flat and cannot reset the lifecycle.
 bool cleanupRetry = broker.fullExitIntentPending and broker.cleanupPending and currentPositionSize != 0.0 and (isFillSynchronizationExecution or (not na(broker.fullExitIntentBar) and bar_index > broker.fullExitIntentBar))
 if cleanupRetry
-    broker.cleanupClosePlaced := false
     if not broker.cleanupClosePlaced
         strategy.close_all(comment = "MR-T V4 Residual Cleanup", alert_message = f_orderMessage(broker.cleanupDir, "RESIDUAL_CLEANUP", broker.cleanupMode, close))
+        broker.residualCleanupCount += 1
         broker.cleanupClosePlaced := true
         broker.cleanupBar := bar_index
         if not broker.cleanupAlertSent
@@ -1397,7 +1463,7 @@ if setupReadyForPreplan
     assist.stopProvisional := planStop
 
     string submittedOrderMessage = f_preplanMessage("ENTRY_ORDER_SUBMITTED", planDir, planMode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, "")
-    string brokerFillOrderMessage = f_orderMessage(planDir, "ENTRY_BROKER_FILL", planMode, assist.entryLimit)
+    string brokerFillOrderMessage = f_entryOrderMessage(planDir, planMode, planDir == 1 ? "MR-L" : "MR-S", assist.sourceBar, assist.validBar, assist.entryLimit)
     alert(f_preplanMessage(planEventName, planDir, planMode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional, ""), alert.freq_all)
 
     // Pine stop + limit is a real Stop-Limit Entry. The Broker Emulator alone
@@ -1636,8 +1702,7 @@ if showPanel
     bool consistencyError = consistencyState >= CONSISTENCY_STALE_ACTIVE_FLAT and consistencyState <= CONSISTENCY_INVALID_CONTEXT
     string stateText = broker.recoveryPending ? "RECOVERY" : consistencyError ? f_tr("状态错误", "STATE ERROR") : broker.fullExitIntentPending ? "FULL_EXIT_PENDING" : trade.active ? trade.partialTaken ? "POSITION_POST_TP1" : "POSITION_PRE_TP1" : assist.active and assist.dir == 1 ? "PREPLAN_PENDING_LONG" : assist.active and assist.dir == -1 ? "PREPLAN_PENDING_SHORT" : "FLAT"
 
-    string brokerPositionText = currentPositionSize == 0.0 ? f_tr("空仓", "Flat") : currentPositionDir == 1 ? f_tr("多头 ", "Long ") + str.tostring(math.abs(currentPositionSize), "#.########") : f_tr("空头 ", "Short ") + str.tostring(math.abs(currentPositionSize), "#.########")
-    string brokerStateText = broker.fullExitIntentPending ? f_tr("等待全平成交", "Full exit pending") : broker.entryIntentPending ? f_tr("等待进场成交", "Entry pending") : currentPositionSize != 0.0 ? f_tr("已成交", "Filled") : f_tr("空仓", "Flat")
+    string brokerPositionText = str.tostring(math.abs(currentPositionSize), "#.########")
     string consistencyText = f_consistencyName(consistencyState)
     color consistencyColor = consistencyError ? color.red : color.lime
 
@@ -1671,7 +1736,7 @@ if showPanel
     string v4PFText = na(v4PF) ? "-" : str.tostring(v4PF, "#.00")
     float v4WinRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
     string v4QualityText = str.tostring(strategy.closedtrades, "#") + " / " + f_panelPct(v4WinRate, false)
-    string brokerSummaryText = brokerPositionText + " / " + brokerStateText + " / " + consistencyText
+    string brokerSummaryText = brokerPositionText + " / " + consistencyText + " / RC=" + str.tostring(broker.residualCleanupCount)
     float rangeWinRate = broker.rangeClosed > 0 ? broker.rangeWins / broker.rangeClosed * 100.0 : na
     float shockWinRate = broker.shockClosed > 0 ? broker.shockWins / broker.shockClosed * 100.0 : na
     string rangeStatsText = "R E" + str.tostring(broker.rangeEntries, "#") + "/C" + str.tostring(broker.rangeClosed, "#") + "/W" + str.tostring(broker.rangeWins, "#") + "(" + (na(rangeWinRate) ? "-" : str.tostring(rangeWinRate, "#.0") + "%") + ")"

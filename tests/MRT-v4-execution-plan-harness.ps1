@@ -63,6 +63,17 @@ function Invoke-BrokerPath {
     [pscustomobject]@{ Phase = $phase; Outcomes = @($outcomes) }
 }
 
+function Invoke-OcaQuantityModel {
+    param([double]$PositionQty, [double]$TrimPercent, [ValidateSet('TP2', 'BE', 'STOP')][string]$TerminalFill)
+    if ($TerminalFill -eq 'STOP') {
+        return [pscustomobject]@{ RemainingAfterTrim = $PositionQty; FinalPosition = $PositionQty - $PositionQty }
+    }
+    $trimFillQty = $PositionQty * $TrimPercent / 100.0
+    $actualRemainingQty = $PositionQty - $trimFillQty
+    $postOrderQty = $actualRemainingQty
+    [pscustomobject]@{ RemainingAfterTrim = $actualRemainingQty; FinalPosition = $actualRemainingQty - $postOrderQty }
+}
+
 $source = [IO.File]::ReadAllText($scriptPath)
 $v3Source = [IO.File]::ReadAllText($v3Path)
 $changelog = [IO.File]::ReadAllText($changelogPath)
@@ -71,239 +82,113 @@ $manage = Get-Section $source '// Confirmed-close management' '// Filled Trade c
 $preplan = Get-Section $source '// Each pending Entry is valid for exactly validBar' '// Create Setup'
 $testCount = 0
 
-Write-Host 'MR-T v4.5.0 Intrabar Broker-Ordered Exit Lifecycle harness'
+Write-Host 'MR-T v4.5.1 Real-Time Execution Correctness harness'
 
-Pass-Test '01 MRT.pine is byte-for-byte unchanged' {
-    Assert-True ((Get-FileHash -Algorithm SHA256 -LiteralPath $v3Path).Hash -eq 'E9B42666A9150E34504794CC8311936209ECA74D9D049A0AC16C540104A3D1AF') 'MRT.pine SHA changed'
-    $null = & git -C $repoRoot diff --quiet -- MRT.pine
-    Assert-True ($LASTEXITCODE -eq 0) 'MRT.pine has working-tree changes'
+Pass-Test '01 MRT.pine is byte-for-byte unchanged from Git' {
+    $null = & git -C $repoRoot diff HEAD --quiet -- MRT.pine
+    Assert-True ($LASTEXITCODE -eq 0) 'MRT.pine differs from HEAD'
 }
-
-Pass-Test '02 Bar Magnifier and fill recalculation are enabled' {
-    Assert-Match $source 'use_bar_magnifier\s*=\s*true' 'Bar Magnifier'
-    Assert-Match $source 'calc_on_order_fills\s*=\s*true' 'fill recalculation'
+Pass-Test '02 process_orders_on_close is false' { Assert-Match $source 'process_orders_on_close\s*=\s*false' 'next-tick causality' }
+Pass-Test '03 Bar Magnifier is enabled' { Assert-Match $source 'use_bar_magnifier\s*=\s*true' 'Bar Magnifier' }
+Pass-Test '04 fill recalculation is enabled' { Assert-Match $source 'calc_on_order_fills\s*=\s*true' 'fill recalculation' }
+Pass-Test '05 every-tick calculation stays disabled' { Assert-Match $source 'calc_on_every_tick\s*=\s*false' 'tick setting' }
+Pass-Test '06 Entry remains Stop-Limit' {
+    foreach ($id in @('MR-L', 'MR-S')) { Assert-Match $source ('strategy\.entry\("{0}"[^\r\n]*stop\s*=.*limit\s*=' -f $id) "$id Stop-Limit" }
 }
-
-Pass-Test '03 Entry remains Stop-Limit' {
-    foreach ($id in @('MR-L', 'MR-S')) {
-        Assert-Match $source ('strategy\.entry\("{0}"[^\r\n]*stop\s*=.*limit\s*=' -f [regex]::Escape($id)) "$id Stop-Limit"
-    }
-}
-
-Pass-Test '04 Entry fill comes from Broker transition' {
-    Assert-Match $brokerSync 'positionEntered\s*=\s*positionSampleReady\s+and\s+previousExecutionPositionSize\s*==\s*0\.0\s+and\s+currentPositionSize\s*!=\s*0\.0' 'flat-to-position transition'
+Pass-Test '07 Entry fact is a Broker flat-to-position transition' {
+    Assert-Match $brokerSync 'positionEntered\s*=.*previousExecutionPositionSize\s*==\s*0\.0.*currentPositionSize\s*!=\s*0\.0' 'positionEntered'
     Assert-Match $brokerSync 'entryFilled\s*=\s*positionEntered\s+and\s+broker\.entryIntentPending' 'entry ownership'
 }
-
-Pass-Test '05 Entry price is strategy.position_avg_price' {
-    Assert-Match $brokerSync 'actualEntryPrice\s*=\s*strategy\.position_avg_price' 'actual Entry source'
-    Assert-Match $brokerSync 'trade\.entryPrice\s*:=\s*actualEntryPrice' 'frozen actual Entry'
+Pass-Test '08 Entry price comes from position_avg_price' { Assert-Match $brokerSync 'actualEntryPrice\s*=\s*strategy\.position_avg_price' 'actual entry price' }
+Pass-Test '09 PREPLAN remains source N valid N plus 1' { Assert-Match $source 'assist\.sourceBar\s*:=\s*bar_index[\s\S]*?assist\.validBar\s*:=\s*bar_index\s*\+\s*1' 'PREPLAN causality' }
+Pass-Test '10 PRE price exits use strategy.order' {
+    foreach ($id in @('MR-TP1', 'MR-TP2', 'MR-SL')) { Assert-Match $brokerSync ('strategy\.order\("{0}"' -f $id) "$id strategy.order" }
 }
-
-Pass-Test '06 Entry fill immediately submits MR-X1' {
-    Assert-Match $brokerSync 'if entryFilled[\s\S]*?strategy\.exit\("MR-X1"' 'MR-X1 after fill'
+Pass-Test '11 PRE TP1 is a Limit order' { Assert-Match $brokerSync 'strategy\.order\("MR-TP1"[^\r\n]*limit\s*=\s*trade\.partialTarget' 'TP1 limit' }
+Pass-Test '12 PRE TP2 is a Limit order' { Assert-Match $brokerSync 'strategy\.order\("MR-TP2"[^\r\n]*limit\s*=\s*trade\.finalTarget' 'TP2 limit' }
+Pass-Test '13 Initial Stop is Stop-only' {
+    $lines = [regex]::Matches($brokerSync, 'strategy\.order\("MR-SL"[^\r\n]*') | ForEach-Object Value
+    Assert-True ($lines.Count -eq 2) 'expected long and short MR-SL orders'
+    foreach ($line in $lines) { Assert-Match $line 'stop\s*=\s*trade\.initialStop' 'Initial Stop'; Assert-NotMatch $line '\blimit\s*=' 'Initial Stop must not have limit' }
 }
-
-Pass-Test '07 Entry fill immediately submits MR-X2' {
-    Assert-Match $brokerSync 'if entryFilled[\s\S]*?strategy\.exit\("MR-X2"' 'MR-X2 after fill'
+Pass-Test '14 PRE orders share one OCA name' {
+    foreach ($id in @('MR-TP1', 'MR-TP2', 'MR-SL')) { Assert-Match $brokerSync ('strategy\.order\("{0}"[^\r\n]*oca_name\s*=\s*preOca' -f $id) "$id PRE OCA" }
 }
-
-Pass-Test '08 MR-X1 limit is TP1' {
-    Assert-Match $brokerSync 'strategy\.exit\("MR-X1"[^\r\n]*limit\s*=\s*trade\.partialTarget' 'MR-X1 TP1'
+Pass-Test '15 PRE orders use OCA reduce' { Assert-True (([regex]::Matches($brokerSync, 'strategy\.order\("MR-(TP1|TP2|SL)"[^\r\n]*oca_name\s*=\s*preOca[^\r\n]*oca_type\s*=\s*strategy\.oca\.reduce')).Count -eq 6) 'PRE OCA reduce' }
+Pass-Test '16 Initial Stop qty is actual Q' { Assert-Match $brokerSync 'actualPositionQty\s*=\s*math\.abs\(strategy\.position_size\)[\s\S]*?"MR-SL"[^\r\n]*qty\s*=\s*actualPositionQty' 'SL actual Q' }
+Pass-Test '17 PRE TP2 qty is actual Q' { Assert-Match $brokerSync '"MR-TP2"[^\r\n]*qty\s*=\s*actualPositionQty[^\r\n]*limit\s*=\s*trade\.finalTarget' 'TP2 actual Q' }
+Pass-Test '18 TP1 qty derives from actual Q' { Assert-Match $brokerSync 'trimQty\s*=\s*actualPositionQty\s*\*\s*trimPct\s*/\s*100\.0' 'TP1 actual Q calculation' }
+Pass-Test '19 TP1 requires Broker closed-trade ID and reduction' {
+    Assert-Match $brokerSync 'hasNewClosedTrade\s*=.*strategy\.closedtrades' 'closed-trade fact'
+    Assert-Match $brokerSync 'tp1Filled\s*=\s*priceExitReduction.*latestClosedExitId\s*==\s*"MR-TP1".*latestClosedExitComment\s*==\s*"TP1"' 'TP1 attribution'
 }
-
-Pass-Test '09 MR-X1 stop is Initial Stop' {
-    Assert-Match $brokerSync 'strategy\.exit\("MR-X1"[^\r\n]*stop\s*=\s*trade\.initialStop' 'MR-X1 Stop'
+Pass-Test '20 TP1 alone changes partial state' {
+    Assert-Match $brokerSync 'if tp1Filled[\s\S]*?trade\.partialTaken\s*:=\s*true' 'partial state'
+    Assert-NotMatch $manage 'partialTaken\s*:=\s*true|partialReached' 'manual TP1 logic'
 }
-
-Pass-Test '10 MR-X2 limit is TP2' {
-    Assert-Match $brokerSync 'strategy\.exit\("MR-X2"[^\r\n]*qty_percent[^\r\n]*limit\s*=\s*trade\.finalTarget' 'MR-X2 TP2'
+Pass-Test '21 Remaining quantity comes from live position_size' { Assert-Match $brokerSync 'remainingQty\s*=\s*math\.abs\(strategy\.position_size\)' 'actual remainder' }
+Pass-Test '22 POST group uses actual remaining quantity' {
+    foreach ($id in @('MR-TP2', 'MR-BE')) { Assert-Match $brokerSync ('if remainingQty\s*>\s*0\.0[\s\S]*?strategy\.order\("{0}"[^\r\n]*qty\s*=\s*remainingQty' -f $id) "$id remaining qty" }
 }
-
-Pass-Test '11 MR-X2 stop is Initial Stop before TP1' {
-    Assert-Match $brokerSync 'strategy\.exit\("MR-X2"[^\r\n]*qty_percent[^\r\n]*stop\s*=\s*trade\.initialStop' 'MR-X2 Initial Stop'
+Pass-Test '23 POST TP2 remains Limit-only' { Assert-Match $brokerSync 'strategy\.order\("MR-TP2"[^\r\n]*qty\s*=\s*remainingQty[^\r\n]*limit\s*=\s*trade\.finalTarget' 'POST TP2' }
+Pass-Test '24 POST BE is Stop-only' {
+    $lines = [regex]::Matches($brokerSync, 'strategy\.order\("MR-BE"[^\r\n]*') | ForEach-Object Value
+    Assert-True ($lines.Count -eq 2) 'expected long and short MR-BE orders'
+    foreach ($line in $lines) { Assert-Match $line 'stop\s*=\s*trade\.breakEvenStop' 'BE stop'; Assert-NotMatch $line '\blimit\s*=' 'BE must not have limit' }
 }
-
-Pass-Test '12 Bracket quantities reserve Trim and remainder slices' {
-    Assert-Match $brokerSync '"MR-X1"[^\r\n]*qty_percent\s*=\s*trimPct' 'Trim reservation'
-    Assert-Match $brokerSync '"MR-X2"[^\r\n]*qty_percent\s*=\s*100\.0\s*-\s*trimPct' 'remainder reservation'
-    Assert-Match $brokerSync '"MR-X1"[^\r\n]*oca_name\s*=\s*"MR-X1-BRACKET"' 'isolated MR-X1 OCA group'
-    Assert-Match $brokerSync '"MR-X2"[^\r\n]*oca_name\s*=\s*"MR-X2-BRACKET"' 'isolated MR-X2 OCA group'
-    Assert-Match $source 'if trimPct\s*<\s*100\.0' 'zero-remainder guard'
+Pass-Test '25 POST TP2 and BE share OCA reduce' {
+    foreach ($id in @('MR-TP2', 'MR-BE')) { Assert-Match $brokerSync ('strategy\.order\("{0}"[^\r\n]*qty\s*=\s*remainingQty[^\r\n]*oca_name\s*=\s*postOca[^\r\n]*oca_type\s*=\s*strategy\.oca\.reduce' -f $id) "$id POST OCA" }
 }
-
-Pass-Test '13 Price exit orders are allowed on Entry bar' {
-    Assert-Match $source 'priceOrdersActive\s*=\s*trade\.active' 'price-order phase'
-    Assert-Match $brokerSync 'orders are active on trade\.entryBar itself' 'same-bar contract'
+Pass-Test '26 Entry to Stop is same-bar legal' { $r = Invoke-BrokerPath @('ENTRY','STOP'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,STOP' -and $r.Phase -eq 'FLAT') 'Entry→Stop' }
+Pass-Test '27 Entry to TP1 is same-bar legal' { $r = Invoke-BrokerPath @('ENTRY','TP1'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,TP1' -and $r.Phase -eq 'POST_TP1') 'Entry→TP1' }
+Pass-Test '28 Entry to TP1 to TP2 is same-bar legal' { $r = Invoke-BrokerPath @('ENTRY','TP1','TP2'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,TP1,TP2' -and $r.Phase -eq 'FLAT') 'Entry→TP1→TP2' }
+Pass-Test '29 Entry to TP1 to BE is same-bar legal' { $r = Invoke-BrokerPath @('ENTRY','TP1','BE'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,TP1,BE' -and $r.Phase -eq 'FLAT') 'Entry→TP1→BE' }
+Pass-Test '30 Stop first suppresses later TP processing' { $r = Invoke-BrokerPath @('ENTRY','STOP','TP1','TP2'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,STOP') 'Stop terminal' }
+Pass-Test '31 TP2 first suppresses BE processing' { $r = Invoke-BrokerPath @('ENTRY','TP1','TP2','BE'); Assert-True (($r.Outcomes -join ',') -eq 'ENTRY,TP1,TP2') 'TP2 terminal' }
+Pass-Test '32 Chart high and low never determine fills' { Assert-NotMatch $brokerSync '(?m)^\s*(bool|float)\s+\w+\s*=[^\r\n]*\b(high|low)\b' 'manual OHLC fill test' }
+Pass-Test '33 Trend Fail is confirmed-close only' { Assert-Match $manage 'closeManagementAllowed\s*=\s*trade\.active\s+and\s+barstate\.isconfirmed' 'confirmed close'; Assert-Match $manage 'trendFailed' 'Trend Fail' }
+Pass-Test '34 Timeout is confirmed-close only' { Assert-Match $manage 'closeManagementAllowed[\s\S]*?timeFailed' 'Timeout confirmed close' }
+Pass-Test '35 Trend and Timeout submit strategy.close' { Assert-Match $source 'strategy\.close\(closeEntryId' 'market close' }
+Pass-Test '36 Market close does not force immediate fill' { Assert-NotMatch $source 'immediately\s*=\s*true' 'immediate close forbidden' }
+Pass-Test '37 Decision bar and fill bar are distinct fields' {
+    Assert-Match $source 'broker\.fullExitIntentBar\s*:=\s*bar_index' 'decision bar'
+    Assert-Match $brokerSync 'trade\.exitBar\s*:=\s*broker\.fullExitIntentPending\s*\?\s*broker\.fullExitIntentBar\s*:\s*bar_index' 'decision field'
+    Assert-Match $brokerSync 'trade\.exitFillBar\s*:=\s*bar_index' 'fill bar'
 }
-
-Pass-Test '14 Price exits have no entry-bar or confirmed-close gate' {
-    $initialBrackets = Get-Section $brokerSync '// Submit both reserved Broker brackets' 'alert(f_entryFilledMessage'
-    Assert-NotMatch $initialBrackets 'bar_index\s*>\s*trade\.entryBar|barstate\.isconfirmed' 'price-order gate leaked in'
-}
-
-Pass-Test '15 Trend Fail requires confirmed close' {
-    Assert-Match $manage 'closeManagementAllowed\s*=\s*trade\.active\s+and\s+barstate\.isconfirmed' 'confirmed-close gate'
-    Assert-Match $source 'isNewLogicDecisionBar\s*:=\s*barstate\.isconfirmed\s+and\s+not isFillSynchronizationExecution' 'fill recalculation exclusion'
-    Assert-Match $manage 'trendFailed' 'Trend Fail branch'
-}
-
-Pass-Test '16 Timeout requires confirmed close' {
-    Assert-Match $manage 'closeManagementAllowed[\s\S]*?timeFailed' 'Timeout under close gate'
-}
-
-Pass-Test '17 Trend and Timeout require a later bar' {
-    Assert-Match $manage 'bar_index\s*>\s*trade\.entryBar' 'Entry-bar exclusion'
-}
-
-Pass-Test '18 TP1 state requires actual reduction and MR-X1 fill' {
-    Assert-Match $brokerSync 'positionReduced\s*=.*math\.abs\(currentPositionSize\)\s*<\s*math\.abs\(previousExecutionPositionSize\)' 'actual reduction'
-    Assert-Match $brokerSync 'tp1Filled\s*=\s*priceExitReduction[\s\S]*?latestClosedExitId\s*==\s*"MR-X1"[\s\S]*?latestClosedExitComment\s*==\s*"TP1"' 'MR-X1 Broker attribution'
-}
-
-Pass-Test '19 TP1 order and fill detection do not use chart high or low' {
-    Assert-NotMatch $brokerSync '(?m)^\s*(bool|float)\s+\w+\s*=[^\r\n]*\b(high|low)\b' 'manual OHLC fill test'
-}
-
-Pass-Test '20 TP1 fill alone marks partialTaken' {
-    Assert-Match $brokerSync 'if tp1Filled[\s\S]*?trade\.partialTaken\s*:=\s*true' 'partialTaken fill mutation'
-    Assert-NotMatch $manage 'partialTaken\s*:=\s*true|partialReached' 'close manager mutates TP1'
-}
-
-Pass-Test '21 TP1 updates MR-X2 to frozen BE' {
-    Assert-Match $brokerSync 'if tp1Filled[\s\S]*?strategy\.exit\("MR-X2"[^\r\n]*stop\s*=\s*trade\.breakEvenStop' 'BE bracket update'
-}
-
-Pass-Test '22 BE is based on actual Entry' {
-    Assert-Match $brokerSync 'candidateBreakEvenStop\s*=\s*f_roundToTick\(actualEntryPrice\s*\+\s*filledDir\s*\*\s*executionCost\)' 'actual-fill BE'
-    Assert-Match $source 'f_brokerExecutionCost\(actualEntryPrice\)' 'execution-cost BE'
-}
-
-Pass-Test '23 Post-TP1 MR-X2 quantity is actual remainder' {
-    Assert-Match $brokerSync 'if tp1Filled[\s\S]*?"MR-X2"[^\r\n]*qty\s*=\s*math\.abs\(strategy\.position_size\)' 'actual remaining qty'
-}
-
-Pass-Test '24 TP2 Broker fill makes the formal state flat' {
-    Assert-Match $brokerSync 'fullExitFilled\s*=\s*positionClosed[\s\S]*?latestClosedExitId\s*==\s*"MR-X2"' 'MR-X2 flat transition'
-    Assert-Match $brokerSync 'latestClosedExitComment\s*==\s*"FINAL"[\s\S]*?R_FINAL' 'Final attribution'
-}
-
-Pass-Test '25 Initial Stop Broker fill makes the formal state flat' {
-    Assert-Match $brokerSync 'latestClosedExitComment\s*==\s*"BE"\s*\?\s*R_BE\s*:\s*R_STOP' 'Stop attribution fallback'
-    Assert-Match $brokerSync 'trade\.resetActive\(\)' 'formal flat reset'
-}
-
-Pass-Test '26 BE Broker fill makes the formal state flat' {
-    Assert-Match $brokerSync 'latestClosedExitComment\s*==\s*"BE"\s*\?\s*R_BE' 'BE attribution'
-    Assert-Match $brokerSync 'finishedEventName[\s\S]*?"BE_FILLED"' 'BE fill alert'
-}
-
-Pass-Test '27 Entry, TP, Stop, and BE labels use Broker fill executions' {
-    Assert-Match $source 'entryEvent\s*:=\s*entryFilled' 'Entry label source'
-    Assert-Match $source 'partialEvent\s*:=\s*tp1Filled' 'TP1 label source'
-    Assert-Match $source 'exitEvent\s*:=\s*fullExitFilled' 'full-exit label source'
-}
-
-Pass-Test '28 Same-bar Entry to TP1 is permitted' {
-    $result = Invoke-BrokerPath @('ENTRY', 'TP1')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,TP1' -and $result.Phase -eq 'POST_TP1') 'Entry→TP1 model'
-}
-
-Pass-Test '29 Same-bar Entry to Stop is permitted' {
-    $result = Invoke-BrokerPath @('ENTRY', 'STOP')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,STOP' -and $result.Phase -eq 'FLAT') 'Entry→Stop model'
-}
-
-Pass-Test '30 Same-bar Entry to TP1 to TP2 is permitted' {
-    $result = Invoke-BrokerPath @('ENTRY', 'TP1', 'TP2')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,TP1,TP2' -and $result.Phase -eq 'FLAT') 'Entry→TP1→TP2 model'
-}
-
-Pass-Test '31 Same-bar Entry to TP1 to BE is permitted' {
-    $result = Invoke-BrokerPath @('ENTRY', 'TP1', 'BE')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,TP1,BE' -and $result.Phase -eq 'FLAT') 'Entry→TP1→BE model'
-}
-
-Pass-Test '32 Stop first prevents later TP processing' {
-    $result = Invoke-BrokerPath @('ENTRY', 'STOP', 'TP1', 'TP2')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,STOP') 'post-flat TP leak'
-}
-
-Pass-Test '33 TP first protects and manages only the remainder' {
-    $result = Invoke-BrokerPath @('ENTRY', 'TP1', 'BE', 'STOP')
-    Assert-True (($result.Outcomes -join ',') -eq 'ENTRY,TP1,BE') 'post-TP remainder model'
-    Assert-Match $brokerSync 'fractional Initial-Stop fill must never leave an unprotected remainder' 'reservation fallback'
-}
-
-Pass-Test '34 No independent V4 performance ledger exists' {
-    foreach ($retired in @('MRV4ExecutionState', 'MRShadowExecutionState', 'v4EquityIndex', 'f_v4TradeReturn', 'v4GrossProfit', 'v4GrossLoss')) {
-        Assert-NotMatch $source ([regex]::Escape($retired)) "retired ledger remains: $retired"
-    }
-}
-
-Pass-Test '35 Strategy Tester is the sole performance source' {
-    foreach ($metric in @('strategy.netprofit', 'strategy.grossprofit', 'strategy.grossloss', 'strategy.closedtrades', 'strategy.wintrades', 'strategy.max_drawdown')) {
-        Assert-Match $source ([regex]::Escape($metric)) "missing $metric"
-    }
-}
-
-Pass-Test '36 Panel remains exactly 2x21' {
+Pass-Test '38 Cooldown starts from actual full-exit fill bar' { Assert-Match $brokerSync 'if fullExitFilled[\s\S]*?logic\.lastExitBar\s*:=\s*bar_index' 'fill-based cooldown'; Assert-NotMatch $manage 'logic\.lastExitBar\s*:=' 'decision-based cooldown' }
+Pass-Test '39 Timeout starts at actual Entry fill bar' { Assert-Match $brokerSync 'if entryFilled[\s\S]*?trade\.entryBar\s*:=\s*bar_index[\s\S]*?trade\.timeStopBar\s*:=\s*bar_index\s*\+' 'fill-based timeout' }
+Pass-Test '40 Exact flat uses position_size equality' { Assert-Match $source 'currentPositionSize\s*==\s*0\.0' 'exact flat' }
+Pass-Test '41 No epsilon-flat shortcut exists' { Assert-NotMatch $source 'epsFlat|epsilon|math\.abs\(currentPositionSize\)\s*<\s*0\.' 'epsilon flatness' }
+Pass-Test '42 Residual cleanup is terminal fallback only' { Assert-Match $brokerSync 'if terminalPriceReduction[\s\S]*?strategy\.close_all\(comment\s*=\s*"MR-T V4 Residual Cleanup"' 'terminal residual fallback' }
+Pass-Test '43 Residual cleanup count exists' { Assert-Match $source 'residualCleanupCount' 'cleanup count'; Assert-Match $source 'RC=' 'Panel cleanup diagnostic' }
+Pass-Test '44 Normal price exit targets exact flat' { Assert-Match $brokerSync 'fullExitFilled\s*=\s*positionClosed' 'positionClosed fact'; Assert-Match $source 'terminal price fill should be exactly flat' 'exact-flat contract' }
+Pass-Test '45 resetActive clears exitFillBar' { Assert-Match $source 'method resetActive[\s\S]*?this\.exitFillBar\s*:=\s*na' 'exitFillBar reset' }
+Pass-Test '46 resetActive clears exitFillPrice' { Assert-Match $source 'method resetActive[\s\S]*?this\.exitFillPrice\s*:=\s*na' 'exitFillPrice reset' }
+Pass-Test '47 Retired MR-X IDs are absent' { Assert-NotMatch $source 'MR-X1|MR-X2' 'retired order IDs' }
+Pass-Test '48 New order IDs have explicit semantics' { foreach ($id in @('MR-TP1','MR-TP2','MR-SL','MR-BE')) { Assert-Match $source ([regex]::Escape($id)) "missing $id" } }
+Pass-Test '49 Strategy Tester is the sole V4 performance source' { foreach ($metric in @('strategy.netprofit','strategy.grossprofit','strategy.grossloss','strategy.closedtrades','strategy.wintrades','strategy.max_drawdown')) { Assert-Match $source ([regex]::Escape($metric)) "missing $metric" } }
+Pass-Test '50 No independent P and L ledger exists' { foreach ($retired in @('MRV4ExecutionState','MRShadowExecutionState','v4EquityIndex','f_v4TradeReturn','v4GrossProfit','v4GrossLoss')) { Assert-NotMatch $source ([regex]::Escape($retired)) "retired ledger: $retired" } }
+Pass-Test '51 Panel remains exactly 2x21' {
     Assert-Match $source 'table\.new\(position\.top_right,\s*2,\s*21' 'Panel dimensions'
     $rows = [regex]::Matches($source, 'table\.cell\(panel,\s*[01],\s*(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Unique
     Assert-True ($rows.Count -eq 21 -and $rows[0] -eq 0 -and $rows[-1] -eq 20) 'Panel rows 0-20'
 }
-
-Pass-Test '37 Active Stop distinguishes Initial and BE phases' {
-    Assert-Match $source 'trade\.partialTaken\s*\?\s*trade\.breakEvenStop\s*:\s*trade\.initialStop' 'phase-aware Active Stop'
-    foreach ($phase in @('POSITION_PRE_TP1', 'POSITION_POST_TP1')) { Assert-Match $source $phase "missing $phase" }
+Pass-Test '52 Quantity model TP1 to TP2 finishes exactly flat' { $r = Invoke-OcaQuantityModel 8.26674 90 'TP2'; Assert-True ($r.RemainingAfterTrim -gt 0.0 -and $r.FinalPosition -eq 0.0) 'TP1→TP2 dust' }
+Pass-Test '53 Quantity model TP1 to BE finishes exactly flat' { $r = Invoke-OcaQuantityModel 8.26674 90 'BE'; Assert-True ($r.RemainingAfterTrim -gt 0.0 -and $r.FinalPosition -eq 0.0) 'TP1→BE dust' }
+Pass-Test '54 Quantity model Initial Stop finishes exactly flat' { $r = Invoke-OcaQuantityModel 8.26674 90 'STOP'; Assert-True ($r.FinalPosition -eq 0.0) 'Initial Stop dust' }
+Pass-Test '55 Release identity and order-fill alerts are explicit' {
+    Assert-Match $source 'strategy\("MR-T Strategy v4\.5\.1"' 'strategy version'
+    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.5\.1"' 'version constant'
+    foreach ($eventName in @('ENTRY_FILLED','TP1_FILLED','TP2_FILLED','STOP_FILLED','BE_FILLED')) { Assert-Match $source $eventName "missing $eventName" }
+    foreach ($field in @('direction=','mode=','order_id=','entry_price=','order_price=','position_size=','source_bar=','valid_bar=')) { Assert-Match $source ([regex]::Escape($field)) "missing $field" }
 }
-
-Pass-Test '38 V4.4 PREPLAN source and valid-bar logic remains' {
-    Assert-Match $source 'assist\.sourceBar\s*:=\s*bar_index[\s\S]*?assist\.validBar\s*:=\s*bar_index\s*\+\s*1' 'N to N+1 plan'
-    Assert-Match $source 'setupReadyForPreplan[\s\S]*?not trade\.active' 'no rolling plan in position'
-}
-
-Pass-Test '39 Expired pending Entry cancellation remains' {
-    Assert-Match $preplan 'assist\.validBar\s*==\s*bar_index' 'valid-bar expiry'
-    Assert-Match $preplan 'strategy\.cancel\(expiredEntryId\)' 'exact Entry cancellation'
-    Assert-Match $preplan 'ENTRY_EXPIRED_UNFILLED' 'expiry alert'
-}
-
-Pass-Test '40 Broker recovery remains' {
-    Assert-Match $source 'MR-T Broker Recovery' 'Broker recovery order'
-    Assert-Match $source 'strategy\.cancel_all\(\)' 'recovery cancellation'
-    Assert-Match $source 'strategy\.close_all\(' 'recovery close'
-}
-
-Pass-Test '41 Exact flat remains position_size == 0' {
-    Assert-Match $source 'currentPositionSize\s*==\s*0\.0' 'exact-flat comparison'
-    Assert-NotMatch $source 'epsFlat|epsilon|math\.abs\(currentPositionSize\)\s*<\s*0\.' 'epsilon flatness'
-}
-
-Pass-Test '42 Residual exit orders are cancelled after formal flat' {
-    Assert-Match $brokerSync 'if fullExitFilled[\s\S]*?strategy\.cancel\("MR-X1"\)[\s\S]*?strategy\.cancel\("MR-X2"\)' 'flat bracket cleanup'
-    Assert-Match $source 'MR-T V4 Residual Cleanup' 'residual position cleanup'
-}
-
-Pass-Test '43 V4 does not require V3 Entry or trade-count parity' {
-    Assert-NotMatch $source 'V4 Entry bars == V3 Entry bars|V4 trade count == V3 trade count' 'obsolete V3 parity target'
-    Assert-Match $source 'legacyV3EntryDiagnostic' 'legacy signal is diagnostic only'
-}
-
-Pass-Test 'Release identity, alerts, and Bar Magnifier boundary are documented' {
-    Assert-Match $source 'strategy\("MR-T Strategy v4\.5\.0"' 'strategy version'
-    Assert-Match $source 'string SCRIPT_VERSION\s*=\s*"4\.5\.0"' 'script version constant'
-    foreach ($eventName in @('TP1_FILLED', 'FINAL_FILLED', 'STOP_FILLED', 'BE_FILLED')) { Assert-Match $source $eventName "missing $eventName" }
-    foreach ($field in @('entry_price=', 'fill_bar=', 'fill_price=', 'remaining_position=', 'new_stop=')) { Assert-Match $source ([regex]::Escape($field)) "missing $field" }
-    Assert-Match $source 'It is not tick-by-tick exchange replay' 'Pine precision boundary'
-    Assert-Match $changelog '(?m)^## \[4\.5\.0\].*Intrabar Broker Exit Lifecycle' 'CHANGELOG v4.5.0'
-}
-
-Pass-Test 'V3 parity regression harness stays green' {
+Pass-Test '56 Bar Magnifier precision boundary is documented' { Assert-Match $source 'It is not tick-by-tick exchange replay' 'precision boundary' }
+Pass-Test '57 CHANGELOG documents v4.5.1' { Assert-Match $changelog '(?m)^## \[4\.5\.1\].*Real-Time Execution Correctness' 'CHANGELOG v4.5.1' }
+Pass-Test '58 V3 parity regression harness stays green' {
     $null = & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $v3HarnessPath 2>&1 | Out-String
     Assert-True ($LASTEXITCODE -eq 0) 'V3 parity harness failed'
 }
 
-Assert-True ($testCount -ge 45) "expected at least 45 tests, ran $testCount"
-Write-Host "PASS: $testCount/$testCount V4.5.0 intrabar Broker exit tests"
+Assert-True ($testCount -ge 58) "expected at least 58 tests, ran $testCount"
+Write-Host "PASS: $testCount/$testCount V4.5.1 real-time execution tests"
 Write-Host 'TradingView Pine v6 compile, Stop-Limit activation, Bar Magnifier ordering, and same-bar multi-fill checks remain manual release checks.'

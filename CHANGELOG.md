@@ -2,6 +2,16 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [4.5.1] — Real-Time Execution Correctness
+
+- Orders created from confirmed bars now become fillable only from the next available tick.
+- Replaced split `strategy.exit` brackets with one Broker OCA-reduce price-order lifecycle.
+- TP1/TP2 use Limit orders; Initial/BE protection use Stop orders.
+- TP1 recalculation rebuilds remaining TP2/BE orders from actual `strategy.position_size`.
+- Confirmed-close Trend Fail/Timeout decisions fill on the next available Broker tick.
+- Added exact-flat and residual-position diagnostics.
+- Strategy mathematics unchanged.
+
 ## [4.5.0] — Intrabar Broker Exit Lifecycle
 
 - Entry fills now submit TP1/TP2/Stop Broker brackets immediately.
