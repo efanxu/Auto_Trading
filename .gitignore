@@ -31,6 +31,9 @@ python_ml_backtest/data/processed/*
 *.parquet
 *.feather
 *.zip
+# Small deterministic fixtures are allowed to be checked in.
+!python_ml_backtest/tests/fixtures/
+!python_ml_backtest/tests/fixtures/**
 
 # Model artifacts
 *.pt

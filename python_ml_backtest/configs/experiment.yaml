@@ -2,20 +2,30 @@ project:
   seed: 2026
 
 data:
-  interval: 1m
+  source: binance_public_data
+  market: usd_m_futures
+  series: index_price_klines
+  symbol: BTCUSDT
+  interval: 30m
   timezone: UTC
+  start_date: 2020-01-01
+  end_date: 2026-08-31
 
 target:
   type: binary_direction
   horizon_minutes: 30
-  equality: down
+  entry_price: next_bar_open
+  expiry_price: next_bar_close
 
 split:
-  method: walk_forward
+  method: chronological
+  train_ratio: 0.8
+  validation_ratio: 0.1
+  test_ratio: 0.1
   purge_minutes: 30
 
 prediction:
-  frequency_minutes: 1
+  frequency_minutes: 30
 
 calibration:
   method: none
@@ -28,5 +38,5 @@ signal:
 
 event:
   horizon_minutes: 30
-  stake_usdt: 5.0
-  winning_total_return_usdt: 9.25
+  stake_usdt: 10.0
+  winning_total_return_usdt: 18.5

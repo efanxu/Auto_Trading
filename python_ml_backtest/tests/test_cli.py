@@ -25,21 +25,27 @@ def test_cli_help_succeeds() -> None:
     assert result.returncode == 0
     assert "show-config" in result.stdout
     assert "check" in result.stdout
+    assert "data-download" in result.stdout
+    assert "data-prepare" in result.stdout
+    assert "dataset-build" in result.stdout
+    assert "data-check" in result.stdout
 
 
 def test_cli_show_config_succeeds() -> None:
     result = run_cli("show-config")
 
     assert result.returncode == 0
+    assert "interval: 30m" in result.stdout
     assert "timezone: UTC" in result.stdout
     assert "horizon_minutes: 30" in result.stdout
+    assert "frequency_minutes: 30" in result.stdout
     assert "break_even_win_rate:" in result.stdout
 
 
-def test_cli_check_succeeds_without_data() -> None:
+def test_cli_check_succeeds_before_or_after_data_setup() -> None:
     result = run_cli("check")
 
     assert result.returncode == 0
     assert "EVENT_PAYOUT_MATH = PASS" in result.stdout
-    assert "DATA = NOT_CONFIGURED" in result.stdout
+    assert "CONFIG_CHECK = PASS" in result.stdout
     assert "CHECK = PASS" in result.stdout

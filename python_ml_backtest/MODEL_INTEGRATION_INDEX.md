@@ -42,7 +42,7 @@ def build_model(model_config, data_info):
     ...
 ```
 
-构造器通过 `models.loader.build_model(model_name, model_config, data_info)` 被公共运行时调用。模型实现公共 `ProbabilityModel` 接口的 `fit(...)` 和 `predict_proba(...)`，只返回价格方向概率。
+构造器通过 `models.loader.build_model(model_name, model_config, data_info)` 被公共运行时调用。模型实现公共 `ProbabilityModel` 接口的 `fit(...)` 和 `predict_proba(...)`，只返回 `P(next_bar_close > next_bar_open)`。
 
 ## 模型明确不拥有的职责
 
@@ -69,8 +69,8 @@ scikit-learn、LightGBM、XGBoost 和 PyTorch 模型都必须适配相同的概�
 2. 只在模型目录实现构造器和模型自身的 fit/predict_proba 行为。
 3. 在 `configs/models/` 放置模型结构参数；公共实验参数仍留在 `configs/experiment.yaml`。
 4. 通过空 registry 的公共 loader 注册模型，不创建第二套入口或训练流程。
-5. 先完成接口级 Dummy/小样本测试，再按固定验收顺序推进 smoke、calibration、signal、backtest、walk-forward 和 repeatability。
-6. 运行 `python scripts\run.py check` 及相关测试，确认模型没有拥有公共职责。
+5. 先确认 B0 的 data、label、split contract 已通过，再完成接口级 Dummy/小样本测试，随后按固定验收顺序推进 smoke、calibration、signal、backtest、walk-forward 和 repeatability。
+6. 运行 `python scripts\run.py check`、`python scripts\run.py data-check` 及相关测试，确认模型没有拥有公共职责。
 
 ## 固定验收顺序
 
@@ -89,7 +89,7 @@ DATA_PREFLIGHT
 → FORMAL
 ```
 
-本阶段仅完成 `CONFIG_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`。未来模型不能跳过前置的数据因果和 split 检查。
+B0 已完成 `CONFIG_CHECK`、`DATA_PREFLIGHT`、`LABEL_CAUSALITY`、`SPLIT_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`。B0-C 及未来模型不能跳过前置的数据因果和 split 检查。
 
 ## 文档影响
 

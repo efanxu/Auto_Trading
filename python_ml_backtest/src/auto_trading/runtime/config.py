@@ -7,7 +7,8 @@ market data, construct labels, select thresholds, or instantiate models.
 from __future__ import annotations
 
 from copy import deepcopy
-from math import isfinite
+from datetime import date, datetime
+from math import isclose, isfinite
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,12 +26,22 @@ class ConfigError(ValueError):
 
 _REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("project", "seed"),
+    ("data", "source"),
+    ("data", "market"),
+    ("data", "series"),
+    ("data", "symbol"),
     ("data", "interval"),
     ("data", "timezone"),
+    ("data", "start_date"),
+    ("data", "end_date"),
     ("target", "type"),
     ("target", "horizon_minutes"),
-    ("target", "equality"),
+    ("target", "entry_price"),
+    ("target", "expiry_price"),
     ("split", "method"),
+    ("split", "train_ratio"),
+    ("split", "validation_ratio"),
+    ("split", "test_ratio"),
     ("split", "purge_minutes"),
     ("prediction", "frequency_minutes"),
     ("calibration", "method"),
@@ -171,16 +182,30 @@ def _validate_public_values(
 
     if isinstance(project["seed"], bool) or not isinstance(project["seed"], int):
         raise ConfigError(_source_prefix(source) + "project.seed must be an integer")
-    if data["interval"] != "1m":
-        raise ConfigError(_source_prefix(source) + "data.interval must be '1m' for the current baseline")
-    if data["timezone"] != "UTC":
-        raise ConfigError(_source_prefix(source) + "data.timezone must be 'UTC'")
+    expected_data_fields = {
+        "source": "binance_public_data",
+        "market": "usd_m_futures",
+        "series": "index_price_klines",
+        "symbol": "BTCUSDT",
+        "interval": "30m",
+        "timezone": "UTC",
+    }
+    for field, expected in expected_data_fields.items():
+        if data[field] != expected:
+            raise ConfigError(
+                _source_prefix(source)
+                + f"data.{field} must be {expected!r} for the current B0 protocol"
+            )
     if target["type"] != "binary_direction":
         raise ConfigError(_source_prefix(source) + "target.type must be 'binary_direction'")
-    if target["equality"] != "down":
-        raise ConfigError(_source_prefix(source) + "target.equality must be 'down'")
+    if target["entry_price"] != "next_bar_open":
+        raise ConfigError(_source_prefix(source) + "target.entry_price must be 'next_bar_open'")
+    if target["expiry_price"] != "next_bar_close":
+        raise ConfigError(_source_prefix(source) + "target.expiry_price must be 'next_bar_close'")
 
     target_horizon = _positive_number(target["horizon_minutes"], "target.horizon_minutes")
+    if target_horizon != 30:
+        raise ConfigError(_source_prefix(source) + "target.horizon_minutes must be 30 for the current B0 protocol")
     event_horizon = _positive_number(event["horizon_minutes"], "event.horizon_minutes")
     if event_horizon != target_horizon:
         raise ConfigError(
@@ -195,12 +220,26 @@ def _validate_public_values(
             + "split.purge_minutes must be >= target.horizon_minutes"
         )
 
-    if split["method"] not in {"time_ordered", "walk_forward"}:
+    if split["method"] != "chronological":
+        raise ConfigError(_source_prefix(source) + "split.method must be 'chronological'")
+    ratios = {
+        "train_ratio": _positive_number(split["train_ratio"], "split.train_ratio"),
+        "validation_ratio": _positive_number(
+            split["validation_ratio"], "split.validation_ratio"
+        ),
+        "test_ratio": _positive_number(split["test_ratio"], "split.test_ratio"),
+    }
+    if not isclose(sum(ratios.values()), 1.0, rel_tol=0, abs_tol=1e-12):
+        raise ConfigError("split ratios must sum to 1.0")
+
+    prediction_frequency = _positive_number(
+        prediction["frequency_minutes"], "prediction.frequency_minutes"
+    )
+    if prediction_frequency != 30:
         raise ConfigError(
             _source_prefix(source)
-            + "split.method must be 'time_ordered' or 'walk_forward'"
+            + "prediction.frequency_minutes must be 30 for the current B0 protocol"
         )
-    _positive_number(prediction["frequency_minutes"], "prediction.frequency_minutes")
     if calibration["method"] not in {"none", "platt", "isotonic"}:
         raise ConfigError(
             _source_prefix(source)
@@ -221,6 +260,11 @@ def _validate_public_values(
             threshold = _finite_number(value, f"signal.{field}")
             if not 0 <= threshold <= 1:
                 raise ConfigError(f"signal.{field} must be between 0 and 1 or null")
+
+    start_date = _config_date(data["start_date"], "data.start_date")
+    end_date = _config_date(data["end_date"], "data.end_date")
+    if start_date >= end_date:
+        raise ConfigError(_source_prefix(source) + "data.start_date must be before data.end_date")
 
 
 def _finite_number(value: Any, field: str) -> float:
@@ -248,6 +292,21 @@ def _non_negative_number(value: Any, field: str) -> float:
 
 def _source_prefix(source: str | Path | None) -> str:
     return f"{source}: " if source is not None else ""
+
+
+def _config_date(value: Any, field: str) -> date:
+    """Resolve a YAML date/string without changing the public config shape."""
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ConfigError(f"{field} must be an ISO date (YYYY-MM-DD)") from exc
+    raise ConfigError(f"{field} must be an ISO date (YYYY-MM-DD)")
 
 
 __all__ = [

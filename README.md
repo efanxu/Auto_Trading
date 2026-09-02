@@ -26,9 +26,9 @@
 
 `python_ml_backtest/`
 
-用于后续：
+当前用于 B0 数据与标签基础，后续扩展为：
 
-- BTC 分钟级数据
+- Binance BTCUSDT Index Price 30m 数据
 - 特征工程
 - 机器学习
 - 深度学习
@@ -37,3 +37,5 @@
 - Event Contract walk-forward backtest
 
 [Python ML Backtest](python_ml_backtest/README.md)
+
+当前 Python B0 数据命令见 [python_ml_backtest/README.md](python_ml_backtest/README.md)。

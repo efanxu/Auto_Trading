@@ -1,1 +1,67 @@
-"""Market-data loading and integrity checks (future implementation)."""
+"""Market-data loading, storage, and integrity checks."""
+
+from .binance_public import (
+    ArchiveDownload,
+    ArchiveNotFound,
+    BINANCE_ARCHIVE_BASE_URL,
+    BinanceDataError,
+    ChecksumError,
+    DuplicateTimestampError,
+    archive_directory,
+    build_daily_archive_url,
+    build_monthly_archive_url,
+    checksum_url,
+    download_archives,
+    download_verified_archive,
+    merge_canonical_frames,
+    parse_checksum,
+    parse_kline_csv,
+    prepare_canonical_data,
+    read_zip_archive,
+    read_zip_archive_with_stats,
+    sha256_file,
+)
+from .schema import CANONICAL_COLUMNS, PRICE_COLUMNS, SchemaError
+from .paths import B0DataPaths, default_b0_data_paths
+from .storage import atomic_write_json, atomic_write_parquet
+from .validation import (
+    DataPreflightReport,
+    DataValidationError,
+    assert_data_preflight,
+    run_data_preflight,
+    validate_ohlc,
+)
+
+__all__ = [
+    "ArchiveDownload",
+    "ArchiveNotFound",
+    "BINANCE_ARCHIVE_BASE_URL",
+    "B0DataPaths",
+    "BinanceDataError",
+    "CANONICAL_COLUMNS",
+    "ChecksumError",
+    "DataPreflightReport",
+    "DataValidationError",
+    "DuplicateTimestampError",
+    "PRICE_COLUMNS",
+    "SchemaError",
+    "archive_directory",
+    "assert_data_preflight",
+    "atomic_write_json",
+    "atomic_write_parquet",
+    "build_daily_archive_url",
+    "build_monthly_archive_url",
+    "checksum_url",
+    "download_archives",
+    "download_verified_archive",
+    "default_b0_data_paths",
+    "merge_canonical_frames",
+    "parse_checksum",
+    "parse_kline_csv",
+    "prepare_canonical_data",
+    "read_zip_archive",
+    "read_zip_archive_with_stats",
+    "run_data_preflight",
+    "sha256_file",
+    "validate_ohlc",
+]

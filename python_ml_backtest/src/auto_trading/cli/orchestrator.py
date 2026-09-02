@@ -7,6 +7,20 @@ from math import isclose
 from pathlib import Path
 from typing import Sequence
 
+import pandas as pd
+
+from auto_trading.data import (
+    BinanceDataError,
+    DataValidationError,
+    default_b0_data_paths,
+    download_archives,
+    prepare_canonical_data,
+    run_data_preflight,
+)
+from auto_trading.labels import (
+    build_persisted_event_dataset,
+    run_label_causality_check,
+)
 from auto_trading.runtime.config import (
     ConfigError,
     calculate_event_payout,
@@ -14,6 +28,7 @@ from auto_trading.runtime.config import (
     dump_config,
     load_config,
 )
+from auto_trading.splits import run_split_check
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,10 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="0.1.0")
 
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
-    for name, help_text in (
+    commands_and_help = (
         ("show-config", "show the resolved public experiment configuration"),
         ("check", "run current configuration and workspace checks"),
-    ):
+        ("data-download", "download verified official Binance archives"),
+        ("data-prepare", "build canonical 30m OHLC parquet and data report"),
+        ("dataset-build", "build causal Event labels and chronological split"),
+        ("data-check", "run data, label, and split contract checks"),
+    )
+    for name, help_text in commands_and_help:
         command = commands.add_parser(name, help=help_text)
         command.add_argument(
             "--config",
@@ -69,6 +89,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "check":
         return _run_check(config, config_path)
+    workspace_root = Path(__file__).resolve().parents[3]
+    if args.command == "data-download":
+        return _run_data_download(config, workspace_root)
+    if args.command == "data-prepare":
+        return _run_data_prepare(config, workspace_root)
+    if args.command == "dataset-build":
+        return _run_dataset_build(config, workspace_root)
+    if args.command == "data-check":
+        return _run_data_check(config, workspace_root)
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -106,9 +135,29 @@ def _run_check(config: dict, config_path: Path) -> int:
     )
 
     public_configuration_ok = (
-        config["data"]["interval"] == "1m"
+        config["data"]["source"] == "binance_public_data"
+        and config["data"]["market"] == "usd_m_futures"
+        and config["data"]["series"] == "index_price_klines"
+        and config["data"]["symbol"] == "BTCUSDT"
+        and config["data"]["interval"] == "30m"
         and config["data"]["timezone"] == "UTC"
+        and config["target"]["entry_price"] == "next_bar_open"
+        and config["target"]["expiry_price"] == "next_bar_close"
+        and config["target"]["horizon_minutes"] == 30
         and config["target"]["horizon_minutes"] == config["event"]["horizon_minutes"]
+        and config["prediction"]["frequency_minutes"] == 30
+        and config["split"]["method"] == "chronological"
+        and config["split"]["train_ratio"] > 0
+        and config["split"]["validation_ratio"] > 0
+        and config["split"]["test_ratio"] > 0
+        and isclose(
+            config["split"]["train_ratio"]
+            + config["split"]["validation_ratio"]
+            + config["split"]["test_ratio"],
+            1.0,
+            rel_tol=0,
+            abs_tol=1e-12,
+        )
         and config["split"]["purge_minutes"] >= config["target"]["horizon_minutes"]
     )
     checks.append(
@@ -164,7 +213,141 @@ def _run_check(config: dict, config_path: Path) -> int:
     print(f"DATA = {'CONFIGURED' if data_configured else 'NOT_CONFIGURED'}")
 
     all_passed = all(passed for _, passed, _ in checks) and payout_ok
+    print(f"CONFIG_CHECK = {'PASS' if all_passed else 'FAIL'}")
     print(f"CHECK = {'PASS' if all_passed else 'FAIL'}")
+    return 0 if all_passed else 1
+
+
+def _run_data_download(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    data = config["data"]
+    try:
+        results = download_archives(
+            symbol=data["symbol"],
+            interval=data["interval"],
+            start_date=data["start_date"],
+            end_date=data["end_date"],
+            raw_root=paths.raw_root,
+        )
+    except (BinanceDataError, OSError, ValueError) as exc:
+        print(f"DATA_DOWNLOAD = FAIL ({exc})")
+        return 1
+    reused = sum(result.reused for result in results)
+    print(f"DATA_DOWNLOAD = PASS (archives={len(results)}, reused={reused})")
+    print(f"RAW_DIRECTORY = {paths.raw_root}")
+    return 0
+
+
+def _run_data_prepare(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    try:
+        _, report = prepare_canonical_data(
+            config=config,
+            raw_root=paths.raw_root,
+            output_path=paths.canonical_parquet,
+            report_path=paths.data_report,
+        )
+    except (BinanceDataError, DataValidationError, OSError, ValueError) as exc:
+        print(f"DATA_PREPARE = FAIL ({exc})")
+        return 1
+    print(f"DATA_PREPARE = PASS (rows={report['rows']})")
+    print(f"DUPLICATES = {report['duplicates']}")
+    print(f"GAPS = {report['gaps']}")
+    print(f"CANONICAL = {paths.canonical_parquet}")
+    return 0
+
+
+def _run_dataset_build(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    try:
+        _, report = build_persisted_event_dataset(
+            config=config,
+            canonical_path=paths.canonical_parquet,
+            sample_path=paths.samples_parquet,
+            split_report_path=paths.split_report,
+        )
+    except (BinanceDataError, DataValidationError, OSError, ValueError, KeyError) as exc:
+        print(f"DATASET_BUILD = FAIL ({exc})")
+        return 1
+    print(
+        "DATASET_BUILD = PASS "
+        f"(candidates={report['total_candidate_events']}, "
+        f"valid={report['valid_events']}, flat={report['flat_events']}, "
+        f"purged={report['purged_rows']})"
+    )
+    print(
+        "SPLIT_ROWS = "
+        f"train={report['train_rows']}, "
+        f"validation={report['validation_rows']}, "
+        f"test={report['test_rows']}"
+    )
+    print(f"SAMPLES = {paths.samples_parquet}")
+    return 0
+
+
+def _run_data_check(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    checks: list[tuple[str, bool, str]] = []
+
+    if paths.canonical_parquet.is_file():
+        try:
+            bars = pd.read_parquet(paths.canonical_parquet)
+            data_report = run_data_preflight(bars, expected_interval_minutes=30)
+            checks.append(
+                (
+                    "DATA_PREFLIGHT",
+                    bool(data_report["passed"]),
+                    f"rows={data_report['total_rows']}, gaps={data_report['gap_count']}"
+                    if data_report["passed"]
+                    else "; ".join(data_report["issues"]),
+                )
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            bars = None
+            checks.append(("DATA_PREFLIGHT", False, str(exc)))
+    else:
+        bars = None
+        checks.append(("DATA_PREFLIGHT", False, f"missing {paths.canonical_parquet}"))
+
+    if bars is not None and paths.samples_parquet.is_file():
+        try:
+            samples = pd.read_parquet(paths.samples_parquet)
+            label_report = run_label_causality_check(bars, samples, interval_minutes=30)
+            checks.append(
+                (
+                    "LABEL_CAUSALITY",
+                    bool(label_report["passed"]),
+                    f"rows={label_report['checked_rows']}"
+                    if label_report["passed"]
+                    else "; ".join(label_report["errors"]),
+                )
+            )
+            split_report = run_split_check(
+                samples,
+                train_ratio=float(config["split"]["train_ratio"]),
+                validation_ratio=float(config["split"]["validation_ratio"]),
+                test_ratio=float(config["split"]["test_ratio"]),
+            )
+            checks.append(
+                (
+                    "SPLIT_CHECK",
+                    bool(split_report["passed"]),
+                    str(split_report.get("counts", {}))
+                    if split_report["passed"]
+                    else "; ".join(split_report["errors"]),
+                )
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            checks.append(("LABEL_CAUSALITY", False, str(exc)))
+            checks.append(("SPLIT_CHECK", False, "label dataset could not be checked"))
+    else:
+        checks.append(("LABEL_CAUSALITY", False, f"missing {paths.samples_parquet}"))
+        checks.append(("SPLIT_CHECK", False, f"missing {paths.samples_parquet}"))
+
+    for name, passed, detail in checks:
+        print(f"{name} = {'PASS' if passed else 'FAIL'} ({detail})")
+    all_passed = all(passed for _, passed, _ in checks)
+    print(f"DATA_CHECK = {'PASS' if all_passed else 'FAIL'}")
     return 0 if all_passed else 1
 
 

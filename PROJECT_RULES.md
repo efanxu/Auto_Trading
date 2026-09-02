@@ -21,14 +21,17 @@
 
 ### Label Layer
 
-Label Builder 是唯一允许读取未来 `t+h` 数据的模块。当前正式 30min 标签为：
+Label Builder 是唯一允许读取未来 `t+h` 数据的模块。当前正式 B0 30min Event 标签为：
 
 ```text
-y_t = 1 if P_(t+30min) > P_t
-y_t = 0 otherwise
+prediction_time_t   = close_time[t]
+entry_price_t       = open[t+1]
+expiry_price_t      = close[t+1]
+target_direction    = +1 (UP), -1 (DOWN), 0 (FLAT)
+target_up           = 1 (UP), 0 (DOWN), null (FLAT)
 ```
 
-相等按下跌/失败处理。
+只有紧邻的下一根 30m bar 存在时才形成正式 Event；FLAT 保留，不强制编码成 DOWN。`label_valid` 对 UP/DOWN 为 true，对 FLAT 为 false。
 
 ### Split Layer
 
@@ -39,7 +42,7 @@ y_t = 0 otherwise
 统一目标为：
 
 ```text
-X_t -> P(price_(t+30min) > price_t)
+X_t -> P(next_bar_close > next_bar_open)
 ```
 
 模型只实现拟合和概率预测，返回概率，不直接产生 Long、Short 或 NoTrade。
@@ -57,11 +60,11 @@ X_t -> P(price_(t+30min) > price_t)
 统一拥有 Event Contract 收益模型和事件生命周期。当前基线为：
 
 ```text
-Stake = 5 USDT
-Winning total return = 9.25 USDT
-Win net = +4.25 USDT
-Loss net = -5.00 USDT
-Break-even Win Rate = 5 / 9.25 = 54.054054...%
+Stake = 10 USDT
+Winning total return = 18.5 USDT
+Win net = +8.5 USDT
+Loss net = -10.00 USDT
+Break-even Win Rate = 10 / 18.5 = 54.054054...%
 ```
 
 ### Evaluation Layer
@@ -97,7 +100,7 @@ DATA_PREFLIGHT
 → FORMAL
 ```
 
-当前阶段只完成 `CONFIG_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`；数据、特征、标签、校准、信号、回测和正式 walk-forward 尚未进入实现阶段。
+当前 B0 已完成 `CONFIG_CHECK`、`DATA_PREFLIGHT`、`LABEL_CAUSALITY`、`SPLIT_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`；特征、校准、信号、回测和正式 walk-forward 尚未进入实现阶段。
 
 ## 文档与工作区规则
 
