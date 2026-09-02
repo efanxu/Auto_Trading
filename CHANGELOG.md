@@ -2,6 +2,15 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — Timestamp-based intrabar Event settlement
+
+- Replaced chart-bar Event expiry with the actual Broker Fill timestamp plus 30-minute and 1-hour millisecond targets.
+- Added historical 2m `request.security_lower_tf()` settlement using the first `time_close >= target` observation and realtime tick settlement using `timenow`.
+- Added resolved/unresolved coverage accounting, target/observed timestamps, timing-error diagnostics, and strict lower-TF no-data handling without a 15m close fallback.
+- Set Strategy Tester commission and slippage to zero, reduced the Broker probe to `0.1%` of equity, and released it immediately after recording the fill fact.
+- Separated formal Shadow Event Contract statistics from Broker probe trades and removed Event-version-only ordinary TP/SL/BE lifecycle parameters.
+- Extended `tests/MRT-event-contract-harness.ps1`; `MRT.pine` and `MRT_V4.pine` remain unchanged.
+
 ## [0.1.0] — MR-T Event Contract Baseline Experiment
 
 - Added standalone `MRT_EVENT.pine` for measuring MR-T direction accuracy after fixed 30-minute and 1-hour horizons.

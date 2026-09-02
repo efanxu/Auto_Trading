@@ -1,90 +1,101 @@
-# MR-T Event Contract v0.1.0
+# MR-T Event Contract v0.2.0
 
-`MRT_EVENT.pine` is an independent Event Contract Baseline Experiment. Its purpose is to measure whether the MR-T mean-reversion entry can predict the direction of the price after a fixed 30-minute or 1-hour holding period.
+`MRT_EVENT.pine` is an independent fixed-duration Event Contract experiment. The formal result is a Shadow Event result, not a Strategy Tester trade result.
 
-## Signal baseline
+The signal and entry baseline remains [`MRT_V4.pine` at commit `d30f506719666df1ac89f79ef322f15f81d901ec`](https://github.com/efanxu/Auto_Trading/commit/d30f506719666df1ac89f79ef322f15f81d901ec), MR-T v4.5.1 Real-Time Execution Correctness. The script retains:
 
-The signal and entry execution baseline is the `MRT_V4.pine` source at commit [`d30f506719666df1ac89f79ef322f15f81d901ec`](https://github.com/efanxu/Auto_Trading/commit/d30f506719666df1ac89f79ef322f15f81d901ec), MR-T v4.5.1 Real-Time Execution Correctness. The event script retains:
+- confirmed-close 15m Signal, Setup, Regime, Hard Trend Veto, Range/Shock funnel;
+- previous-confirmed-bar PREPLAN scheduling;
+- real Stop-Limit entry orders through the TradingView Broker Emulator;
+- `process_orders_on_close = false`, `calc_on_order_fills = true`, `calc_on_every_tick = true`, and `use_bar_magnifier = true`.
 
-- confirmed 15m decision execution;
-- last-confirmed 1H and 15m regime context;
-- Hard Trend Veto;
-- Range and Shock engines, including Shock priority, deceleration, and rejection checks;
-- Setup state and previous-confirmed-bar PREPLAN;
-- real Stop-Limit entry orders;
-- Broker flat-to-position fill detection and actual fill price;
-- source bar, valid bar, mode, direction, and fill diagnostics.
+`calc_on_every_tick` is used for realtime Event settlement only. Setup, PREPLAN, Regime, Range/Shock, and entry decisions remain behind the confirmed 15m execution gate. Historical-tick execution is not enabled.
 
-`MRT.pine` and `MRT_V4.pine` remain unchanged formal strategies.
+## Event clock
 
-## Event definition
+An Event is created only after a PREPLAN Stop-Limit order produces a real Broker Fill. The actual entry price comes from `strategy.position_avg_price`; the entry timestamp preferentially comes from `strategy.opentrades.entry_time(...)`.
 
-An Event is created only after a PREPLAN Stop-Limit order has a real TradingView Broker Fill. The Event stores:
-
-- direction: Long/T买 or Short/T空;
-- mode: Range or Shock;
-- `eventEntryPrice`: `strategy.position_avg_price` at the real Broker fill;
-- entry fill bar and entry timestamp;
-- PREPLAN `sourceBar` and `validBar`;
-- independent 30m and 1h expiry/settlement state.
-
-The script uses a short-lived Broker probe position because Pine exposes an actual entry fill through strategy Broker state. After the fill is recorded, it submits `strategy.close()` with the `EVENT_BROKER_RELEASE` comment to release that probe position. This release is not an Event settlement, does not affect Event P&L, and does not implement TP1, TP2, Initial Stop, Break Even, Trend Fail, or Timeout.
-
-## Settlement rules
-
-On a 15-minute chart the baseline horizon is two complete chart bars for 30min and four complete chart bars for 1h. For an entry fill on chart bar `B`:
+The only Event expiry clock is timestamp-based:
 
 ```text
-expiry30Bar = B + 2
-expiry60Bar = B + 4
+Event Entry = actual Broker Fill timestamp
+30m Target  = entryTimestamp + 30 * 60 * 1000
+1h Target   = entryTimestamp + 60 * 60 * 1000
 ```
 
-Settlement uses the `close` of the first confirmed chart bar at or after the stored expiry bar:
+For example, an entry at minute 17 targets minute 47 for 30m and minute 77 for 1h. Event settlement never uses a chart-bar offset or a chart `close` as an expiry-price fallback.
+
+## Historical 2m settlement
+
+On the required 15m chart the script requests one lower-timeframe tuple:
+
+```pine
+[time, time_close, close] = request.security_lower_tf(syminfo.tickerid, "2", ...)
+```
+
+During a normal historical confirmed 15m execution, every active Event is checked independently for both horizons. The first available 2m intrabar with `time_close >= targetTime` is selected. Its lower-timeframe `close` is the observed expiry price.
+
+The Event and Data Window expose:
+
+- target time;
+- observed time;
+- timing error in seconds (`observedTime - targetTime`).
+
+Average and maximum timing errors are tracked separately for 30m and 1h. With complete regular 2m coverage, the timing error should normally be between 0 and approximately 120 seconds. Larger values remain visible in the diagnostics.
+
+TradingView limits the historical number of lower-timeframe intrabars. If the target has passed and no usable 2m observation is available, that horizon is marked `UNRESOLVED_NO_INTRABAR_DATA`. It is not converted to a 15m close, not counted as a Win or Loss, and contributes no Event P&L. The other horizon remains active and can settle independently.
+
+## Realtime settlement
+
+On a realtime bar, the script waits until `timenow >= expiryTime`. On the first realtime tick satisfying that condition, it records the current `close` and `timenow` as the expiry observation. A horizon is settled only once. Signal generation remains restricted to a genuinely confirmed 15m close, so realtime settlement ticks cannot create repeated Setup or PREPLAN decisions.
+
+## Payout and statistics
+
+The Event Contract has no commission or slippage:
 
 ```text
-Long 30m/1h: close > eventEntryPrice => Win
-Short 30m/1h: close < eventEntryPrice => Win
-otherwise                         => Loss
+Stake              = 5.00 USDT
+Winning total      = 9.25 USDT
+Win net            = +4.25 USDT
+Loss net           = -5.00 USDT
+Break-even WinRate = 5 / 9.25 = 54.054...% ≈ 54.05%
 ```
 
-Equality is intentionally a Loss in v0.1.0. The 30m and 1h Shadow Events are independent: 30m can be Win while 1h is Loss, and settling 30m does not remove the 1h state.
+Long is a strict `observedPrice > entryPrice` Win. Short is a strict `observedPrice < entryPrice` Win. Equality is a Loss.
 
-TradingView can use Bar Magnifier to improve historical fill sequencing, but a Pine strategy with `calc_on_every_tick = false` cannot run a settlement callback at an arbitrary intrabar wall-clock instant. The implementation therefore records the Broker-provided fill timestamp for diagnostics and uses the fixed fill-bar-plus-horizon rule above for a strict, reproducible 15m-chart approximation. The actual settlement price is still the confirmed expiry-bar close, never the Setup close, source close, or PREPLAN creation close.
+30m and 1h maintain separate resolved/unresolved counts, Wins, Losses, Win Rate, break-even rate, Win Rate Edge, Net Event P&L, EV/Event, consecutive-win and consecutive-loss maxima, equity drawdown, timing diagnostics, and Long/Short, Range/Shock, Range Long, Range Short, Shock Long, and Shock Short breakdowns. All Win Rate denominators use resolved horizons only.
 
-## P&L model
+## Broker probe versus Event result
 
-Inputs default to:
+The Broker probe exists only to establish an executable PREPLAN fill fact:
 
 ```text
-stakeUSDT          = 5.00 USDT
-winningReturnUSDT  = 9.25 USDT  # total return, including stake
-winNetProfit       = +4.25 USDT
-lossNetProfit      = -5.00 USDT
-breakEvenWinRate   = 5 / 9.25 = 54.054...% ≈ 54.05%
+PREPLAN Stop-Limit
+→ Broker Emulator fill
+→ strategy.position_avg_price
+→ strategy.opentrades.entry_time(...)
+→ Shadow Event creation
 ```
 
-30m and 1h maintain separate `eventEquity30` and `eventEquity60` curves, totals, wins/losses, win rates, edge over break-even, EV, streaks, drawdown, direction statistics, engine statistics, and Range/Long, Range/Short, Shock/Long, and Shock/Short breakdowns.
+The probe uses `default_qty_value = 0.1` percent of equity and is released immediately with `strategy.close(..., immediately = true)`. It does not carry the 5 USDT Event stake, does not settle an Event, and does not contribute to Event P&L. The formal Event stake and payout are an independent accounting ledger.
 
-The expected value formula is:
+The panel explicitly labels:
 
 ```text
-EV = WinRate × (+4.25) + (1 - WinRate) × (-5.00)
+Event Contract Statistics
+Strategy Tester trades = Broker probe only
 ```
 
-## Concurrent Events
+Therefore Strategy Tester Net Profit, Win Rate, Average Trade, Profit Factor, commissions, and closed-trade profit are not Event Contract results. They describe only the small Broker probe lifecycle.
 
-Unsettled Events are stored in a bounded `array<MRShadowEvent>`. The queue is iterated backwards each confirmed bar, allowing 30m settlement while the same record remains active for 1h. A record is removed only after both horizons settle. `maxActiveEvents` is configurable; reaching its capacity raises a visible runtime error rather than silently dropping an Event.
+The Event version removes ordinary MR-T exit-only parameters and lifecycle state, including trim/final targets, initial stop construction, break-even protection, Trend Fail, Timeout, and other TP/SL/BE management artifacts. `MRT.pine` and `MRT_V4.pine` are not modified.
 
-The Broker probe is serialized because the v4.5.1 PREPLAN uses one real pending Stop-Limit order at a time. The Shadow Event queue is not serialized: after a probe fill is released, later PREPLAN fills can create new Events while earlier 30m/1h records remain active.
+## Local harness
 
-## Display and verification
-
-The panel has independent `30min` and `1h` columns. The Data Window includes the last Event direction/mode/price, source/valid/fill facts, both settlement results/prices/P&L, both win rates and EVs, equity curves, active count, and Range/Shock counts. Entry labels are `EVENT LONG`/`EVENT SHORT`; settlement labels are `30W`, `30L`, `60W`, and `60L`, with a bounded label queue.
-
-Run the deterministic checks with:
+Run the Event Contract and regression harnesses from the repository root:
 
 ```powershell
 pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\MRT-event-contract-harness.ps1
 ```
 
-The local harness covers Long/Short wins and losses, equality-as-Loss, independent horizons, overlap and cleanup, payout math, break-even rate, classification counters, and v4.5.1 causality guards. Pine v6 compilation and Strategy Tester runtime checks must still be performed on TradingView.
+The harness covers timestamp target math, first-observation selection, strict Long/Short comparisons, equality-as-Loss, independent horizons, overlapping Events, unavailable lower-TF coverage, exclusion of unresolved horizons from Win Rate and P&L, zero-cost declaration, probe sizing, ordinary-lifecycle removal, confirmed 15m signal gating, and unchanged formal MR-T scripts. Pine v6 compilation and TradingView runtime/visual checks remain release checks after loading the script on a 15m chart.
