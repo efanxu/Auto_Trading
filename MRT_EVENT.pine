@@ -1,0 +1,1166 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | fill={{strategy.order.price}}
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Jasxu · TradingView: https://www.tradingview.com/u/Jasxu/
+// GitHub: https://github.com/Ye-Yu-Mo
+strategy("MR-T Event Contract v0.1.0", shorttitle = "MR-T EVENT", overlay = true, pyramiding = 0, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 0, process_orders_on_close = false, calc_on_order_fills = true, calc_on_every_tick = false, use_bar_magnifier = true, margin_long = 0, margin_short = 0, max_labels_count = 500)
+
+// ============================================================================
+// MR-T Event Contract v0.1.0
+//
+// This is an independent fixed-duration event-contract experiment. Signal and
+// entry scheduling are based on MRT_V4.pine at commit
+// d30f506719666df1ac89f79ef322f15f81d901ec (MR-T v4.5.1 Real-Time Execution
+// Correctness). The ordinary MR-T TP/Stop/BE lifecycle is deliberately absent:
+// only a real Broker PREPLAN fill creates an Event Contract.
+//
+// Recommended chart: 15m. The Event queue uses the fill bar as its anchor:
+// 30m settles on the close of the first confirmed bar at or after
+// entryFillBar + 2, and 1h settles at or after entryFillBar + 4. This is the
+// strict, reproducible 15m-bar approximation documented in MRT_EVENT.md.
+// ============================================================================
+
+
+// ============================================================================
+// ⑫ Language & Version
+// ============================================================================
+
+lang = input.string("zh", "语言 / Language", options = ["zh", "en"], group = "⑫ 语言与版本 / Language & Version")
+
+f_tr(simple string zh, simple string en) =>
+    lang == "zh" ? zh : en
+
+string SCRIPT_NAME = "MR-T Event Contract"
+string SCRIPT_VERSION = "0.1.0"
+string BASELINE_COMMIT = "d30f506719666df1ac89f79ef322f15f81d901ec"
+
+
+// ============================================================================
+// ① Trade Direction
+// ============================================================================
+
+allowLong = input.bool(true, "允许T买", group = "① 交易方向")
+allowShort = input.bool(true, "允许T空", group = "① 交易方向")
+
+
+// ============================================================================
+// ② Mean & Z-score
+// ============================================================================
+
+meanLen = input.int(32, "15m 局部均值 EMA", minval = 10, group = "② 均值与Z-score")
+zLen = input.int(32, "Z-score 周期", minval = 10, group = "② 均值与Z-score")
+
+rangeEntryZ = input.float(1.65, "Range模式观察 Z", minval = 1.0, step = 0.05, group = "② 均值与Z-score")
+shockEntryZ = input.float(2.00, "Shock模式观察 Z", minval = 1.2, step = 0.05, group = "② 均值与Z-score")
+
+rangePartialZ = input.float(0.80, "Range T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+rangeExitZ = input.float(0.25, "Range T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+shockPartialZ = input.float(1.00, "Shock T减目标 Z", minval = 0.10, step = 0.05, group = "② 均值与Z-score")
+shockExitZ = input.float(0.50, "Shock T平目标 Z", minval = 0.0, step = 0.05, group = "② 均值与Z-score")
+
+stopZ = input.float(3.25, "极端统计失效 Z", minval = 2.2, step = 0.25, group = "② 均值与Z-score")
+
+
+// ============================================================================
+// ③ 1H Market State
+// ============================================================================
+
+htfTf = input.timeframe("60", "市场状态周期", group = "③ 1H 市场状态")
+htfMeanLen = input.int(20, "1H 均值 EMA", minval = 5, group = "③ 1H 市场状态")
+htfSlopeLookback = input.int(4, "1H 斜率周期", minval = 1, group = "③ 1H 市场状态")
+
+idealHtfSlope = input.float(0.10, "1H 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "③ 1H 市场状态")
+
+htfERLen = input.int(10, "1H Efficiency Ratio 周期", minval = 3, group = "③ 1H 市场状态")
+idealHtfER = input.float(0.50, "1H 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "③ 1H 市场状态")
+
+
+// ============================================================================
+// ④ 15m Market State
+// ============================================================================
+
+localSlopeLookback = input.int(8, "15m 斜率周期", minval = 2, group = "④ 15m 市场状态")
+idealLocalSlope = input.float(0.12, "15m 理想最大斜率 ATR/Bar", minval = 0.01, step = 0.01, group = "④ 15m 市场状态")
+
+localERLen = input.int(16, "15m Efficiency Ratio 周期", minval = 3, group = "④ 15m 市场状态")
+idealLocalER = input.float(0.60, "15m 理想最大 ER", minval = 0.10, maxval = 1.0, step = 0.05, group = "④ 15m 市场状态")
+
+
+// ============================================================================
+// ⑤ Regime Score
+// ============================================================================
+
+rangeMinScore = input.float(50.0, "Range模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+shockMinScore = input.float(45.0, "Shock模式最低环境分", minval = 0, maxval = 100, step = 1, group = "⑤ Regime Score")
+
+regimeSmoothLen = input.int(3, "环境分平滑周期", minval = 1, maxval = 8, group = "⑤ Regime Score")
+
+
+// ============================================================================
+// ⑥ Hard Trend Veto
+// ============================================================================
+
+vetoHtfSlope = input.float(0.18, "1H 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalSlope = input.float(0.23, "15m 趋势禁做斜率", minval = 0.05, step = 0.01, group = "⑥ Hard Trend Veto")
+
+vetoHtfER = input.float(0.75, "1H 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+vetoLocalER = input.float(0.80, "15m 趋势禁做 ER", minval = 0.50, maxval = 1.0, step = 0.01, group = "⑥ Hard Trend Veto")
+
+
+// ============================================================================
+// ⑦ Shock Engine
+// ============================================================================
+
+shockLookback = input.int(2, "Shock 检测 K 数", minval = 1, maxval = 4, group = "⑦ Shock Engine")
+minShockATR = input.float(0.80, "最小 Shock 强度 ATR", minval = 0.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireShockDeceleration = input.bool(true, "Shock要求冲击减速", group = "⑦ Shock Engine")
+decelerationRatio = input.float(0.85, "Shock减速比例", minval = 0.30, maxval = 1.20, step = 0.05, group = "⑦ Shock Engine")
+
+requireRejection = input.bool(true, "Shock要求拒绝/反向K线", group = "⑦ Shock Engine")
+
+minWickRatio = input.float(0.30, "最低拒绝影线比例", minval = 0.0, maxval = 0.8, step = 0.05, group = "⑦ Shock Engine")
+
+
+// ============================================================================
+// ⑧ Half-Life / Time Stop (retained baseline context)
+// ============================================================================
+
+halfLifeLookback = input.int(80, "Half-Life 样本长度", minval = 30, group = "⑧ Half-Life")
+
+timeStopMultiplier = input.float(3.0, "Time Stop = Half-Life ×", minval = 1.0, step = 0.25, group = "⑧ Half-Life")
+
+minTimeStopBars = input.int(8, "最短 Time Stop", minval = 2, group = "⑧ Half-Life")
+maxTimeStopBars = input.int(40, "最长 Time Stop", minval = 8, group = "⑧ Half-Life")
+fallbackTimeStopBars = input.int(24, "Half-Life无效时 Time Stop", minval = 4, group = "⑧ Half-Life")
+
+
+// ============================================================================
+// ⑨ Setup / Confirmation
+// ============================================================================
+
+rangeSetupBars = input.int(16, "Range Setup 有效 K 数", minval = 2, maxval = 48, group = "⑨ 入场确认")
+shockSetupBars = input.int(8, "Shock Setup 有效 K 数", minval = 2, maxval = 24, group = "⑨ 入场确认")
+
+requireCandleConfirm = input.bool(true, "要求K线方向确认", group = "⑨ 入场确认")
+requireBandReclaim = input.bool(true, "要求价格重新进入Z区间", group = "⑨ 入场确认")
+
+cooldownBars = input.int(3, "退出后冷却 K 数", minval = 0, maxval = 24, group = "⑨ 入场确认")
+trimPct = input.float(50.0, "T减退出仓位 (%)", minval = 1.0, maxval = 100.0, step = 1.0, group = "⑨ 入场确认")
+
+
+// ============================================================================
+// ⑩ Risk / PREPLAN context
+// ============================================================================
+
+atrLen = input.int(14, "ATR 周期", minval = 1, group = "⑩ 风险控制")
+
+hardStopATR = input.float(2.50, "ATR 紧急止损", minval = 0.50, step = 0.25, group = "⑩ 风险控制")
+
+stopMode = input.string("Balanced", "止损模式", options = ["Tight", "Balanced", "Loose"], group = "⑩ 风险控制")
+
+balancedWeight = input.float(0.50, "Balanced统计止损权重", minval = 0.0, maxval = 1.0, step = 0.05, group = "⑩ 风险控制")
+
+moveStopToBE = input.bool(true, "T减后启用保本保护", group = "⑩ 风险控制")
+
+commissionBps = input.float(3.0, "Strategy Tester 手续费(bp/边)", minval = 0.0, step = 0.5, group = "⑩ 风险控制")
+slippageTicks = input.int(0, "Strategy Tester 滑点(ticks/边)", minval = 0, group = "⑩ 风险控制")
+
+
+// ============================================================================
+// V4 Execution Assist
+// ============================================================================
+
+entryStopLimitOffsetTicks = input.int(0, "Entry Stop-Limit 偏移 ticks", minval = 0, group = "V4 Execution Assist")
+
+
+// ============================================================================
+// ⑪ Display
+// ============================================================================
+
+showBands = input.bool(true, "显示均值回归区间", group = "⑪ 显示")
+showBackground = input.bool(true, "显示做T环境", group = "⑪ 显示")
+showSetup = input.bool(true, "显示观察信号", group = "⑪ 显示")
+showPanel = input.bool(true, "显示状态面板", group = "⑪ 显示")
+showTradeLevels = input.bool(true, "显示本轮目标/风险", group = "⑪ 显示")
+
+
+// ============================================================================
+// ⑬ Event Contract
+// ============================================================================
+
+stakeUSDT = input.float(5.0, "Event stake (USDT)", minval = 0.01, step = 0.01, group = "⑬ Event Contract")
+winningReturnUSDT = input.float(9.25, "Winning total return (USDT)", minval = 0.01, step = 0.01, group = "⑬ Event Contract")
+maxActiveEvents = input.int(100, "最大 active Shadow Event 数", minval = 1, maxval = 500, group = "⑬ Event Contract")
+showEventLabels = input.bool(true, "显示 Event 入场标签", group = "⑬ Event Contract")
+showSettlementLabels = input.bool(true, "显示到期结果标签", group = "⑬ Event Contract")
+maxEventLabels = input.int(250, "最大 Event 标签数", minval = 20, maxval = 500, group = "⑬ Event Contract")
+
+int EVENT_30M_BARS = 2
+int EVENT_1H_BARS = 4
+int EVENT_30M_MS = 30 * 60 * 1000
+int EVENT_1H_MS = 60 * 60 * 1000
+
+float winNetProfit = winningReturnUSDT - stakeUSDT
+float lossNetProfit = -stakeUSDT
+float breakEvenWinRate = winningReturnUSDT > 0.0 ? stakeUSDT / winningReturnUSDT * 100.0 : na
+
+
+// ============================================================================
+// Validation and timeframe contract
+// ============================================================================
+
+if shockEntryZ <= rangeEntryZ
+    runtime.error("Shock模式 Z 必须高于 Range模式 Z。/ Shock mode Z must be higher than Range mode Z.")
+
+if rangeExitZ >= rangePartialZ
+    runtime.error("Range T平目标必须小于 Range T减目标。/ Range exit Z must be below Range partial Z.")
+
+if shockExitZ >= shockPartialZ
+    runtime.error("Shock T平目标必须小于 Shock T减目标。/ Shock exit Z must be below Shock partial Z.")
+
+if rangePartialZ >= rangeEntryZ
+    runtime.error("Range T减目标必须小于 Range观察 Z。/ Range partial Z must be below Range entry Z.")
+
+if shockPartialZ >= shockEntryZ
+    runtime.error("Shock T减目标必须小于 Shock观察 Z。/ Shock partial Z must be below Shock entry Z.")
+
+if stopZ <= shockEntryZ
+    runtime.error("Stop Z 必须高于 Shock Entry Z。/ Stop Z must be above Shock entry Z.")
+
+if winningReturnUSDT <= 0.0
+    runtime.error("Winning total return must be positive.")
+
+chartSeconds = timeframe.in_seconds(timeframe.period)
+requiredSeconds = timeframe.in_seconds("15")
+htfSeconds = timeframe.in_seconds(htfTf)
+
+if chartSeconds != requiredSeconds
+    runtime.error("Mean Reversion T Event Contract 设计用于15分钟图。/ Designed for the 15-minute chart.")
+
+if htfSeconds <= chartSeconds
+    runtime.error("高周期必须高于15分钟,默认使用60分钟。/ Higher timeframe must be above 15m. Default is 60m.")
+
+
+// ============================================================================
+// Helpers copied from the v4.5.1 signal baseline
+// ============================================================================
+
+f_er(int length) =>
+    float absMove = math.abs(ta.change(close))
+    float avgMove = ta.sma(absMove, length)
+    float path = avgMove * length
+    float net = math.abs(close - close[length])
+    path > 0.0 ? net / path : 0.0
+
+f_erPrev(int length) =>
+    f_er(length)[1]
+
+f_slopeATR(int emaLength, int atrLength, int lookback) =>
+    float m = ta.ema(close, emaLength)
+    float a = math.max(ta.atr(atrLength), syminfo.mintick)
+    (m - m[lookback]) / a / lookback
+
+f_slopeATRPrev(int emaLength, int atrLength, int lookback) =>
+    f_slopeATR(emaLength, atrLength, lookback)[1]
+
+f_score(float value, float idealLimit) =>
+    float ratio = idealLimit > 0.0 ? math.abs(value) / idealLimit : 10.0
+    float rawScore = 25.0 * (1.0 - ratio)
+    float floorScore = math.max(rawScore, 0.0)
+    math.min(floorScore, 25.0)
+
+f_roundToTick(float value) =>
+    math.round(value / syminfo.mintick) * syminfo.mintick
+
+f_modeName(int mode) =>
+    mode == 2 ? "Shock" : mode == 1 ? "Range" : "-"
+
+f_directionName(int dir) =>
+    dir == 1 ? "Long" : dir == -1 ? "Short" : "-"
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_time(int timestamp) =>
+    na(timestamp) ? "-" : str.format_time(timestamp, "yyyy-MM-dd HH:mm")
+
+f_pct(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##") + "%"
+
+f_rate(int wins, int total) =>
+    total > 0 ? wins / total * 100.0 : na
+
+f_rateText(int wins, int total) =>
+    f_pct(f_rate(wins, total))
+
+f_moneyText(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.##") + " U"
+
+f_resultText(int result) =>
+    result == 1 ? "Win" : result == -1 ? "Loss" : "-"
+
+f_resultColor(float value) =>
+    na(value) ? color.gray : value > 0.0 ? color.lime : value < 0.0 ? color.red : color.gray
+
+f_entryOrderMessage(int dir, int mode, string orderId, int sourceBar, int validBar, float orderPrice) =>
+    "MR-T-EVENT|event=ENTRY_FILLED" +
+      "|direction=" + f_directionName(dir) +
+      "|mode=" + f_modeName(mode) +
+      "|order_id=" + orderId +
+      "|entry_price={{strategy.order.price}}" +
+      "|order_price=" + f_price(orderPrice) +
+      "|position_size={{strategy.position_size}}" +
+      "|source_bar=" + str.tostring(sourceBar) +
+      "|valid_bar=" + str.tostring(validBar)
+
+f_preplanMessage(string eventName, int dir, int mode, int sourceBar, int validBar, float entryTrigger, float entryLimit, float tp1, float tp2, float stop) =>
+    "MR-T-EVENT|event=" + eventName +
+      "|direction=" + f_directionName(dir) +
+      "|mode=" + f_modeName(mode) +
+      "|source_bar=" + str.tostring(sourceBar) +
+      "|valid_bar=" + str.tostring(validBar) +
+      "|trigger=" + f_price(entryTrigger) +
+      "|limit=" + f_price(entryLimit) +
+      "|tp1_provisional=" + f_price(tp1) +
+      "|tp2_provisional=" + f_price(tp2) +
+      "|stop_provisional=" + f_price(stop)
+
+
+// ============================================================================
+// v4.5.1 signal calculations: 15m confirmed close + confirmed 1H regime
+// ============================================================================
+
+mean15 = ta.ema(close, meanLen)
+atr15 = ta.atr(atrLen)
+safeATR = math.max(atr15, syminfo.mintick)
+
+residual = close - mean15
+residualStd = ta.stdev(residual, zLen)
+safeStd = math.max(nz(residualStd), syminfo.mintick)
+z = residual / safeStd
+
+upperRangeBand = mean15 + rangeEntryZ * safeStd
+lowerRangeBand = mean15 - rangeEntryZ * safeStd
+upperShockBand = mean15 + shockEntryZ * safeStd
+lowerShockBand = mean15 - shockEntryZ * safeStd
+upperStopBand = mean15 + stopZ * safeStd
+lowerStopBand = mean15 - stopZ * safeStd
+
+localSlopeATR = (mean15 - mean15[localSlopeLookback]) / safeATR / localSlopeLookback
+localER = f_er(localERLen)
+
+// Last confirmed 1H value, with lookahead_on used only with the [1] function.
+htfSlopeATR = request.security(syminfo.tickerid, htfTf, f_slopeATRPrev(htfMeanLen, atrLen, htfSlopeLookback), lookahead = barmerge.lookahead_on)
+htfER = request.security(syminfo.tickerid, htfTf, f_erPrev(htfERLen), lookahead = barmerge.lookahead_on)
+
+htfSlopeScore = f_score(htfSlopeATR, idealHtfSlope)
+htfERScore = f_score(htfER, idealHtfER)
+localSlopeScore = f_score(localSlopeATR, idealLocalSlope)
+localERScore = f_score(localER, idealLocalER)
+
+rawRegimeScore = htfSlopeScore + htfERScore + localSlopeScore + localERScore
+regimeScore = ta.sma(rawRegimeScore, regimeSmoothLen)
+
+htfSlopeVeto = math.abs(htfSlopeATR) >= vetoHtfSlope
+localSlopeVeto = math.abs(localSlopeATR) >= vetoLocalSlope
+htfERVeto = htfER >= vetoHtfER
+localERVeto = localER >= vetoLocalER
+hardTrendVeto = htfSlopeVeto or localSlopeVeto or htfERVeto or localERVeto
+
+rangeEnvironment = not hardTrendVeto and regimeScore >= rangeMinScore
+shockEnvironment = not hardTrendVeto and regimeScore >= shockMinScore
+
+shockMove = (close - close[shockLookback]) / safeATR
+shockUp = shockMove >= minShockATR
+shockDown = shockMove <= -minShockATR
+previousShockMove = (close[shockLookback] - close[shockLookback * 2]) / safeATR
+shockDecelerating = math.abs(shockMove) <= math.abs(previousShockMove) * decelerationRatio
+decelerationOK = not requireShockDeceleration or shockDecelerating
+
+barRange = math.max(high - low, syminfo.mintick)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+lowerWickRatio = lowerWick / barRange
+upperWickRatio = upperWick / barRange
+bullishCandle = close > open
+bearishCandle = close < open
+longRejection = bullishCandle or lowerWickRatio >= minWickRatio
+shortRejection = bearishCandle or upperWickRatio >= minWickRatio
+longRejectionOK = not requireRejection or longRejection
+shortRejectionOK = not requireRejection or shortRejection
+
+residualLag = residual[1]
+residualDelta = residual - residual[1]
+hlCorr = ta.correlation(residualDelta, residualLag, halfLifeLookback)
+hlDeltaStd = ta.stdev(residualDelta, halfLifeLookback)
+hlLagStd = ta.stdev(residualLag, halfLifeLookback)
+bool betaOK = not na(hlCorr) and not na(hlDeltaStd) and not na(hlLagStd) and hlLagStd > 0.0
+float hlBeta = na
+if betaOK
+    hlBeta := hlCorr * hlDeltaStd / hlLagStd
+float halfLife = na
+if not na(hlBeta) and hlBeta < -0.000001
+    halfLife := -math.log(2.0) / hlBeta
+
+zCrossOverNegRange = ta.crossover(z, -rangeEntryZ)
+zCrossUnderPosRange = ta.crossunder(z, rangeEntryZ)
+zCrossOverNegShock = ta.crossover(z, -shockEntryZ)
+zCrossUnderPosShock = ta.crossunder(z, shockEntryZ)
+
+
+// ============================================================================
+// State: signal setup, one-slot PREPLAN assist, Broker facts, event queue
+// ============================================================================
+
+type MRSignalState
+    varip int setupBar = na
+    varip int setupDir = 0
+    varip int setupMode = 0
+    varip int decisionBar = na
+    varip int lastSetupEventBar = na
+    varip int lastSetupEventDir = 0
+    varip int lastSetupEventMode = 0
+
+type MRExecutionAssistState
+    varip bool active = false
+    varip int dir = 0
+    varip int mode = 0
+    varip int sourceBar = na
+    varip int validBar = na
+    varip float sourceMean = na
+    varip float sourceStd = na
+    varip float sourceATR = na
+    varip float sourceHalfLife = na
+    varip float sourceRegimeScore = na
+    varip float entryTrigger = na
+    varip float entryLimit = na
+    varip float tp1Provisional = na
+    varip float tp2Provisional = na
+    varip float stopProvisional = na
+
+method reset(MRExecutionAssistState this) =>
+    this.active := false
+    this.dir := 0
+    this.mode := 0
+    this.sourceBar := na
+    this.validBar := na
+    this.sourceMean := na
+    this.sourceStd := na
+    this.sourceATR := na
+    this.sourceHalfLife := na
+    this.sourceRegimeScore := na
+    this.entryTrigger := na
+    this.entryLimit := na
+    this.tp1Provisional := na
+    this.tp2Provisional := na
+    this.stopProvisional := na
+
+type MREventBrokerState
+    varip bool trackerReady = false
+    varip float previousPositionSize = na
+    varip bool entryIntentPending = false
+    varip int entryIntentDir = 0
+    varip int entryIntentMode = 0
+    varip int entryIntentBar = na
+    varip bool releaseIntentPending = false
+    varip string releaseEntryId = ""
+    varip int releaseIntentBar = na
+    varip int entryFillBar = na
+    varip int entryFillTime = na
+    varip float brokerEntryPrice = na
+    varip int releaseFillBar = na
+    varip int unownedPositionCount = 0
+    varip int queueOverflowCount = 0
+    varip int shockZCandidates = 0
+    varip int shockMoveCandidates = 0
+    varip int shockEnvironmentPass = 0
+    varip int shockDecelerationPass = 0
+    varip int shockRejectionPass = 0
+    varip int shockSetups = 0
+
+type MREventStats
+    varip int total = 0
+    varip int wins = 0
+    varip int losses = 0
+    varip int currentWinStreak = 0
+    varip int maxWinStreak = 0
+    varip int currentLossStreak = 0
+    varip int maxLossStreak = 0
+    varip float peakEquity = 0.0
+    varip float maxDrawdown = 0.0
+    varip int longEvents = 0
+    varip int longWins = 0
+    varip int shortEvents = 0
+    varip int shortWins = 0
+    varip int rangeEvents = 0
+    varip int rangeWins = 0
+    varip int shockEvents = 0
+    varip int shockWins = 0
+    varip int rangeLongEvents = 0
+    varip int rangeLongWins = 0
+    varip int rangeShortEvents = 0
+    varip int rangeShortWins = 0
+    varip int shockLongEvents = 0
+    varip int shockLongWins = 0
+    varip int shockShortEvents = 0
+    varip int shockShortWins = 0
+
+method recordSettlement(MREventStats this, int dir, int mode, bool won, float pnl, float equity) =>
+    this.total := this.total + 1
+    this.wins := this.wins + (won ? 1 : 0)
+    this.losses := this.losses + (won ? 0 : 1)
+
+    if won
+        this.currentWinStreak := this.currentWinStreak + 1
+        this.currentLossStreak := 0
+        this.maxWinStreak := math.max(this.maxWinStreak, this.currentWinStreak)
+    else
+        this.currentLossStreak := this.currentLossStreak + 1
+        this.currentWinStreak := 0
+        this.maxLossStreak := math.max(this.maxLossStreak, this.currentLossStreak)
+
+    float nextEquity = equity + pnl
+    this.peakEquity := math.max(this.peakEquity, nextEquity)
+    this.maxDrawdown := math.max(this.maxDrawdown, this.peakEquity - nextEquity)
+
+    if dir == 1
+        this.longEvents := this.longEvents + 1
+        this.longWins := this.longWins + (won ? 1 : 0)
+    else if dir == -1
+        this.shortEvents := this.shortEvents + 1
+        this.shortWins := this.shortWins + (won ? 1 : 0)
+
+    if mode == 1
+        this.rangeEvents := this.rangeEvents + 1
+        this.rangeWins := this.rangeWins + (won ? 1 : 0)
+        if dir == 1
+            this.rangeLongEvents := this.rangeLongEvents + 1
+            this.rangeLongWins := this.rangeLongWins + (won ? 1 : 0)
+        else if dir == -1
+            this.rangeShortEvents := this.rangeShortEvents + 1
+            this.rangeShortWins := this.rangeShortWins + (won ? 1 : 0)
+    else if mode == 2
+        this.shockEvents := this.shockEvents + 1
+        this.shockWins := this.shockWins + (won ? 1 : 0)
+        if dir == 1
+            this.shockLongEvents := this.shockLongEvents + 1
+            this.shockLongWins := this.shockLongWins + (won ? 1 : 0)
+        else if dir == -1
+            this.shockShortEvents := this.shockShortEvents + 1
+            this.shockShortWins := this.shockShortWins + (won ? 1 : 0)
+
+    nextEquity
+
+type MRShadowEvent
+    varip int id = na
+    varip int direction = 0
+    varip int mode = 0
+    varip float entryPrice = na
+    varip int entryBar = na
+    varip int entryTimestamp = na
+    varip int sourceBar = na
+    varip int validBar = na
+    varip int expiry30Bar = na
+    varip int expiry60Bar = na
+    varip int expiry30Time = na
+    varip int expiry60Time = na
+    varip bool settled30 = false
+    varip bool settled60 = false
+    varip int result30 = 0
+    varip int result60 = 0
+    varip float expiry30Price = na
+    varip float expiry60Price = na
+    varip float pnl30 = na
+    varip float pnl60 = na
+    varip int settled30Time = na
+    varip int settled60Time = na
+
+var MRSignalState signal = MRSignalState.new()
+var MRExecutionAssistState assist = MRExecutionAssistState.new()
+var MREventBrokerState broker = MREventBrokerState.new()
+var MREventStats eventStats30 = MREventStats.new()
+var MREventStats eventStats60 = MREventStats.new()
+varip array<MRShadowEvent> activeEvents = array.new<MRShadowEvent>()
+varip int nextEventId = 1
+varip float eventEquity30 = 0.0
+varip float eventEquity60 = 0.0
+
+varip int lastEventDirection = 0
+varip int lastEventMode = 0
+varip float lastEventEntryPrice = na
+varip int lastEventEntryBar = na
+varip int lastEventSourceBar = na
+varip int lastEventValidBar = na
+varip int lastEventEntryTimestamp = na
+varip int last30Result = 0
+varip float last30ExpiryPrice = na
+varip float last30Pnl = na
+varip int last60Result = 0
+varip float last60ExpiryPrice = na
+varip float last60Pnl = na
+
+var array<label> eventLabels = array.new<label>()
+
+method retainEventLabel(array<label> labels, label item) =>
+    array.push(labels, item)
+    if array.size(labels) > maxEventLabels
+        label.delete(array.shift(labels))
+
+
+// ============================================================================
+// Broker transition detection: only a real PREPLAN transition creates Event
+// ============================================================================
+
+float currentPositionSize = strategy.position_size
+bool trackerWasReady = broker.trackerReady
+float previousExecutionPositionSize = broker.previousPositionSize
+
+if not trackerWasReady
+    broker.previousPositionSize := currentPositionSize
+    broker.trackerReady := true
+
+bool positionSampleReady = trackerWasReady and not na(previousExecutionPositionSize)
+bool positionEntered = positionSampleReady and previousExecutionPositionSize == 0.0 and currentPositionSize != 0.0
+bool positionClosed = positionSampleReady and previousExecutionPositionSize != 0.0 and currentPositionSize == 0.0
+bool positionChanged = positionSampleReady and currentPositionSize != previousExecutionPositionSize
+bool isFillSynchronizationExecution = positionChanged
+int currentPositionDir = currentPositionSize > 0.0 ? 1 : currentPositionSize < 0.0 ? -1 : 0
+
+bool allowBarCloseDecision = barstate.isconfirmed and not isFillSynchronizationExecution and (na(signal.decisionBar) or bar_index != signal.decisionBar)
+if allowBarCloseDecision
+    signal.decisionBar := bar_index
+
+bool releaseFilled = positionClosed and broker.releaseIntentPending
+bool entryFilled = positionEntered and broker.entryIntentPending and assist.active and assist.validBar == bar_index and broker.entryIntentDir == currentPositionDir and assist.dir == currentPositionDir
+
+if releaseFilled
+    broker.releaseIntentPending := false
+    broker.releaseFillBar := bar_index
+    broker.releaseIntentBar := na
+
+// A position without the current PREPLAN owner is never an Event Entry. Close
+// it as an execution diagnostic so an unrelated state cannot pollute results.
+if positionEntered and not entryFilled
+    broker.unownedPositionCount += 1
+    strategy.close_all(comment = "MR-T Event Unowned Position", alert_message = "MR-T-EVENT|event=UNOWNED_POSITION_CLEANUP")
+
+
+// ============================================================================
+// Event settlement queue
+// ============================================================================
+// Settlement runs once per normal confirmed-bar execution. The strict > / <
+// comparisons intentionally classify equality with eventEntryPrice as Loss.
+
+if allowBarCloseDecision and array.size(activeEvents) > 0
+    for i = array.size(activeEvents) - 1 to 0
+        MRShadowEvent event = array.get(activeEvents, i)
+
+        if not event.settled30 and bar_index >= event.expiry30Bar
+            bool won30 = event.direction == 1 ? close > event.entryPrice : close < event.entryPrice
+            float pnl30 = won30 ? winNetProfit : lossNetProfit
+            event.settled30 := true
+            event.result30 := won30 ? 1 : -1
+            event.expiry30Price := close
+            event.pnl30 := pnl30
+            event.settled30Time := time_close
+            eventEquity30 := eventStats30.recordSettlement(event.direction, event.mode, won30, pnl30, eventEquity30)
+            last30Result := event.result30
+            last30ExpiryPrice := event.expiry30Price
+            last30Pnl := event.pnl30
+
+            if showSettlementLabels
+                label settlement30Label = label.new(bar_index, event.direction == 1 ? high : low, event.result30 == 1 ? "30W" : "30L", style = event.direction == 1 ? label.style_label_down : label.style_label_up, color = event.result30 == 1 ? color.new(color.lime, 0) : color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+                eventLabels.retainEventLabel(settlement30Label)
+            alert("MR-T-EVENT|event=30M_SETTLED|id=" + str.tostring(event.id) + "|result=" + f_resultText(event.result30) + "|entry_price=" + f_price(event.entryPrice) + "|expiry_price=" + f_price(event.expiry30Price) + "|pnl=" + f_moneyText(event.pnl30), alert.freq_all)
+
+        if not event.settled60 and bar_index >= event.expiry60Bar
+            bool won60 = event.direction == 1 ? close > event.entryPrice : close < event.entryPrice
+            float pnl60 = won60 ? winNetProfit : lossNetProfit
+            event.settled60 := true
+            event.result60 := won60 ? 1 : -1
+            event.expiry60Price := close
+            event.pnl60 := pnl60
+            event.settled60Time := time_close
+            eventEquity60 := eventStats60.recordSettlement(event.direction, event.mode, won60, pnl60, eventEquity60)
+            last60Result := event.result60
+            last60ExpiryPrice := event.expiry60Price
+            last60Pnl := event.pnl60
+
+            if showSettlementLabels
+                label settlement60Label = label.new(bar_index, event.direction == 1 ? high : low, event.result60 == 1 ? "60W" : "60L", style = event.direction == 1 ? label.style_label_down : label.style_label_up, color = event.result60 == 1 ? color.new(color.lime, 0) : color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+                eventLabels.retainEventLabel(settlement60Label)
+            alert("MR-T-EVENT|event=1H_SETTLED|id=" + str.tostring(event.id) + "|result=" + f_resultText(event.result60) + "|entry_price=" + f_price(event.entryPrice) + "|expiry_price=" + f_price(event.expiry60Price) + "|pnl=" + f_moneyText(event.pnl60), alert.freq_all)
+
+        if event.settled30 and event.settled60
+            array.remove(activeEvents, i)
+
+
+// ============================================================================
+// PREPLAN expiry and exact baseline Setup / Shock funnel
+// ============================================================================
+
+bool expiredPlanThisBar = false
+if allowBarCloseDecision and assist.active and assist.validBar == bar_index and currentPositionSize == 0.0
+    expiredPlanThisBar := true
+    string expiredEntryId = assist.dir == 1 ? "MR-L" : "MR-S"
+    strategy.cancel(expiredEntryId)
+    broker.entryIntentPending := false
+    alert(f_preplanMessage("ENTRY_EXPIRED_UNFILLED", assist.dir, assist.mode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional), alert.freq_all)
+    assist.reset()
+
+bool canGenerateSignal = currentPositionSize == 0.0 and not broker.releaseIntentPending
+
+bool longShockZCandidate = allowLong and z <= -shockEntryZ
+bool shortShockZCandidate = allowShort and z >= shockEntryZ
+bool longShockMoveCandidate = longShockZCandidate and shockDown
+bool shortShockMoveCandidate = shortShockZCandidate and shockUp
+bool longShockEnvironmentCandidate = longShockMoveCandidate and shockEnvironment
+bool shortShockEnvironmentCandidate = shortShockMoveCandidate and shockEnvironment
+bool longShockDecelerationCandidate = longShockEnvironmentCandidate and decelerationOK
+bool shortShockDecelerationCandidate = shortShockEnvironmentCandidate and decelerationOK
+bool longShockRejectionCandidate = longShockDecelerationCandidate and longRejectionOK
+bool shortShockRejectionCandidate = shortShockDecelerationCandidate and shortRejectionOK
+
+if allowBarCloseDecision and canGenerateSignal
+    broker.shockZCandidates += (longShockZCandidate ? 1 : 0) + (shortShockZCandidate ? 1 : 0)
+    broker.shockMoveCandidates += (longShockMoveCandidate ? 1 : 0) + (shortShockMoveCandidate ? 1 : 0)
+    broker.shockEnvironmentPass += (longShockEnvironmentCandidate ? 1 : 0) + (shortShockEnvironmentCandidate ? 1 : 0)
+    broker.shockDecelerationPass += (longShockDecelerationCandidate ? 1 : 0) + (shortShockDecelerationCandidate ? 1 : 0)
+    broker.shockRejectionPass += (longShockRejectionCandidate ? 1 : 0) + (shortShockRejectionCandidate ? 1 : 0)
+
+    bool noSameLong = na(signal.setupBar) or signal.setupDir != 1
+    bool noSameShort = na(signal.setupBar) or signal.setupDir != -1
+
+    bool longShockSetup = allowLong and shockEnvironment and shockDown and z <= -shockEntryZ and decelerationOK and longRejectionOK and noSameLong
+    bool shortShockSetup = allowShort and shockEnvironment and shockUp and z >= shockEntryZ and decelerationOK and shortRejectionOK and noSameShort
+    bool longRangeSetup = allowLong and rangeEnvironment and z <= -rangeEntryZ and noSameLong
+    bool shortRangeSetup = allowShort and rangeEnvironment and z >= rangeEntryZ and noSameShort
+
+    if longShockSetup
+        broker.shockSetups += 1
+        signal.setupBar := bar_index
+        signal.setupDir := 1
+        signal.setupMode := 2
+        signal.lastSetupEventBar := bar_index
+        signal.lastSetupEventDir := 1
+        signal.lastSetupEventMode := 2
+    else if shortShockSetup
+        broker.shockSetups += 1
+        signal.setupBar := bar_index
+        signal.setupDir := -1
+        signal.setupMode := 2
+        signal.lastSetupEventBar := bar_index
+        signal.lastSetupEventDir := -1
+        signal.lastSetupEventMode := 2
+    else if longRangeSetup
+        signal.setupBar := bar_index
+        signal.setupDir := 1
+        signal.setupMode := 1
+        signal.lastSetupEventBar := bar_index
+        signal.lastSetupEventDir := 1
+        signal.lastSetupEventMode := 1
+    else if shortRangeSetup
+        signal.setupBar := bar_index
+        signal.setupDir := -1
+        signal.setupMode := 1
+        signal.lastSetupEventBar := bar_index
+        signal.lastSetupEventDir := -1
+        signal.lastSetupEventMode := 1
+
+if allowBarCloseDecision and not na(signal.setupBar)
+    int allowedAge = signal.setupMode == 2 ? shockSetupBars : rangeSetupBars
+    if bar_index - signal.setupBar > allowedAge
+        signal.setupBar := na
+        signal.setupDir := 0
+        signal.setupMode := 0
+
+if allowBarCloseDecision and not na(signal.setupBar) and signal.setupDir * z <= -stopZ
+    signal.setupBar := na
+    signal.setupDir := 0
+    signal.setupMode := 0
+
+
+// ============================================================================
+// Legacy V3 Entry confirmation diagnostics: retained, never used as a new
+// filter. v4.5.1 PREPLAN creation remains setup-driven exactly as in baseline.
+// ============================================================================
+
+float entryZ = signal.setupMode == 2 ? shockEntryZ : rangeEntryZ
+bool candleOK = false
+if signal.setupDir == 1
+    candleOK := not requireCandleConfirm or close > close[1]
+else if signal.setupDir == -1
+    candleOK := not requireCandleConfirm or close < close[1]
+
+bool zReclaim = false
+if signal.setupDir == 1
+    zReclaim := signal.setupMode == 2 ? zCrossOverNegShock : zCrossOverNegRange
+else if signal.setupDir == -1
+    zReclaim := signal.setupMode == 2 ? zCrossUnderPosShock : zCrossUnderPosRange
+
+bool priceBandReclaim = false
+if signal.setupDir == 1
+    priceBandReclaim := close > mean15 - entryZ * safeStd
+else if signal.setupDir == -1
+    priceBandReclaim := close < mean15 + entryZ * safeStd
+
+bool bandOK = not requireBandReclaim or priceBandReclaim
+bool longEntrySignal = barstate.isconfirmed and signal.setupDir == 1 and not na(signal.setupBar) and zReclaim and bandOK and candleOK and not hardTrendVeto
+bool shortEntrySignal = barstate.isconfirmed and signal.setupDir == -1 and not na(signal.setupBar) and zReclaim and bandOK and candleOK and not hardTrendVeto
+bool legacyV3EntryDiagnostic = longEntrySignal or shortEntrySignal
+
+
+// ============================================================================
+// Actual Broker PREPLAN fill -> Event creation
+// ============================================================================
+
+if entryFilled
+    if array.size(activeEvents) >= maxActiveEvents
+        broker.queueOverflowCount += 1
+        runtime.error("MR-T Event active queue capacity reached; increase maxActiveEvents before continuing the test.")
+
+    float eventEntryPrice = strategy.position_avg_price
+    int filledDir = assist.dir
+    int filledMode = assist.mode
+    int fillTradeIndex = strategy.opentrades - 1
+    int actualEntryBar = bar_index
+    int actualEntryTimestamp = time
+    if strategy.opentrades > 0
+        actualEntryBar := strategy.opentrades.entry_bar_index(fillTradeIndex)
+        actualEntryTimestamp := strategy.opentrades.entry_time(fillTradeIndex)
+    if na(actualEntryBar)
+        actualEntryBar := bar_index
+    if na(actualEntryTimestamp)
+        actualEntryTimestamp := time
+
+    MRShadowEvent newEvent = MRShadowEvent.new()
+    newEvent.id := nextEventId
+    newEvent.direction := filledDir
+    newEvent.mode := filledMode
+    newEvent.entryPrice := eventEntryPrice
+    newEvent.entryBar := actualEntryBar
+    newEvent.entryTimestamp := actualEntryTimestamp
+    newEvent.sourceBar := assist.sourceBar
+    newEvent.validBar := assist.validBar
+    newEvent.expiry30Bar := actualEntryBar + EVENT_30M_BARS
+    newEvent.expiry60Bar := actualEntryBar + EVENT_1H_BARS
+    newEvent.expiry30Time := actualEntryTimestamp + EVENT_30M_MS
+    newEvent.expiry60Time := actualEntryTimestamp + EVENT_1H_MS
+    array.push(activeEvents, newEvent)
+    nextEventId += 1
+
+    lastEventDirection := filledDir
+    lastEventMode := filledMode
+    lastEventEntryPrice := eventEntryPrice
+    lastEventEntryBar := actualEntryBar
+    lastEventSourceBar := assist.sourceBar
+    lastEventValidBar := assist.validBar
+    lastEventEntryTimestamp := actualEntryTimestamp
+
+    broker.entryIntentPending := false
+    broker.entryFillBar := actualEntryBar
+    broker.entryFillTime := actualEntryTimestamp
+    broker.brokerEntryPrice := eventEntryPrice
+
+    if showEventLabels
+        string eventLabelText = "EVENT " + (filledDir == 1 ? "LONG" : "SHORT") +
+          "\nMode: " + f_modeName(filledMode) +
+          "\nEntry: " + f_price(eventEntryPrice) +
+          "\n30m: " + f_time(newEvent.expiry30Time) +
+          "\n1h: " + f_time(newEvent.expiry60Time)
+        label entryLabel = label.new(bar_index, filledDir == 1 ? low : high, eventLabelText, style = filledDir == 1 ? label.style_label_up : label.style_label_down, color = filledDir == 1 ? color.green : color.red, textcolor = color.white, size = size.small)
+        eventLabels.retainEventLabel(entryLabel)
+
+    alert("MR-T-EVENT|event=ENTRY_FILLED|id=" + str.tostring(newEvent.id) + "|direction=" + f_directionName(filledDir) + "|mode=" + f_modeName(filledMode) + "|entry_price=" + f_price(eventEntryPrice) + "|entry_fill_bar=" + str.tostring(actualEntryBar) + "|entry_timestamp=" + str.tostring(actualEntryTimestamp) + "|source_bar=" + str.tostring(newEvent.sourceBar) + "|valid_bar=" + str.tostring(newEvent.validBar) + "|expiry30_bar=" + str.tostring(newEvent.expiry30Bar) + "|expiry60_bar=" + str.tostring(newEvent.expiry60Bar), alert.freq_all)
+
+    // The probe position exists only so the Broker Emulator can establish a
+    // real fill fact. Releasing it does not settle or close the Shadow Event.
+    string filledEntryId = filledDir == 1 ? "MR-L" : "MR-S"
+    broker.releaseIntentPending := true
+    broker.releaseEntryId := filledEntryId
+    broker.releaseIntentBar := bar_index
+    strategy.close(filledEntryId, comment = "EVENT_BROKER_RELEASE", alert_message = "MR-T-EVENT|event=BROKER_PROBE_RELEASE|entry_id=" + filledEntryId)
+
+    signal.setupBar := na
+    signal.setupDir := 0
+    signal.setupMode := 0
+    assist.reset()
+
+
+// ============================================================================
+// PREPLAN creation: source N confirmed, valid only on next bar N + 1
+// ============================================================================
+
+bool setupReadyForPreplan = allowBarCloseDecision and canGenerateSignal and not broker.entryIntentPending and not broker.releaseIntentPending and not na(signal.setupBar) and signal.setupDir != 0
+
+if setupReadyForPreplan
+    int planDir = signal.setupDir
+    int planMode = signal.setupMode
+    float sourceMean = mean15
+    float sourceStd = safeStd
+    float sourceATR = safeATR
+    float planEntryZ = planMode == 2 ? shockEntryZ : rangeEntryZ
+    float planPartialZ = planMode == 2 ? shockPartialZ : rangePartialZ
+    float planFinalZ = planMode == 2 ? shockExitZ : rangeExitZ
+
+    float planEntryTrigger = f_roundToTick(sourceMean - planDir * planEntryZ * sourceStd)
+    float planEntryLimit = f_roundToTick(planEntryTrigger + planDir * entryStopLimitOffsetTicks * syminfo.mintick)
+    float planTP1 = f_roundToTick(sourceMean - planDir * planPartialZ * sourceStd)
+    float planTP2 = f_roundToTick(sourceMean - planDir * planFinalZ * sourceStd)
+
+    float atrStop = planEntryTrigger - planDir * hardStopATR * sourceATR
+    float statStop = sourceMean - planDir * stopZ * sourceStd
+    float tightStop = planDir == 1 ? math.max(atrStop, statStop) : math.min(atrStop, statStop)
+    float looseStop = planDir == 1 ? math.min(atrStop, statStop) : math.max(atrStop, statStop)
+    float balancedStop = looseStop + (tightStop - looseStop) * balancedWeight
+    float planStop = f_roundToTick(stopMode == "Tight" ? tightStop : stopMode == "Loose" ? looseStop : balancedStop)
+
+    assist.active := true
+    assist.dir := planDir
+    assist.mode := planMode
+    assist.sourceBar := bar_index
+    assist.validBar := bar_index + 1
+    assist.sourceMean := sourceMean
+    assist.sourceStd := sourceStd
+    assist.sourceATR := sourceATR
+    assist.sourceHalfLife := halfLife
+    assist.sourceRegimeScore := regimeScore
+    assist.entryTrigger := planEntryTrigger
+    assist.entryLimit := planEntryLimit
+    assist.tp1Provisional := planTP1
+    assist.tp2Provisional := planTP2
+    assist.stopProvisional := planStop
+
+    string submittedOrderMessage = f_preplanMessage(expiredPlanThisBar ? "PREPLAN_UPDATE" : "PREPLAN_CREATE", planDir, planMode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional)
+    string brokerFillOrderMessage = f_entryOrderMessage(planDir, planMode, planDir == 1 ? "MR-L" : "MR-S", assist.sourceBar, assist.validBar, assist.entryLimit)
+    alert(submittedOrderMessage, alert.freq_all)
+
+    // Keep the baseline's real Stop-Limit entry. Broker activation and fill,
+    // not chart high/low tests, establish entryFilled above.
+    if planDir == 1
+        strategy.entry("MR-L", strategy.long, stop = assist.entryTrigger, limit = assist.entryLimit, alert_message = brokerFillOrderMessage)
+    else
+        strategy.entry("MR-S", strategy.short, stop = assist.entryTrigger, limit = assist.entryLimit, alert_message = brokerFillOrderMessage)
+
+    broker.entryIntentPending := true
+    broker.entryIntentDir := planDir
+    broker.entryIntentMode := planMode
+    broker.entryIntentBar := bar_index
+
+else if allowBarCloseDecision and assist.active
+    string cancelledEntryId = assist.dir == 1 ? "MR-L" : "MR-S"
+    strategy.cancel(cancelledEntryId)
+    broker.entryIntentPending := false
+    alert(f_preplanMessage("PREPLAN_CANCEL", assist.dir, assist.mode, assist.sourceBar, assist.validBar, assist.entryTrigger, assist.entryLimit, assist.tp1Provisional, assist.tp2Provisional, assist.stopProvisional), alert.freq_all)
+    assist.reset()
+
+broker.previousPositionSize := currentPositionSize
+
+
+// ============================================================================
+// Chart display: compact entry/result footprint; Event P&L is Data Window only
+// ============================================================================
+
+plot(mean15, "Local Mean", color = color.yellow, linewidth = 2)
+
+pRangeUpper = plot(showBands ? upperRangeBand : na, "Range +Z", color = color.new(color.orange, 35))
+pRangeLower = plot(showBands ? lowerRangeBand : na, "Range -Z", color = color.new(color.aqua, 35))
+pShockUpper = plot(showBands ? upperShockBand : na, "Shock +Z", color = color.new(color.red, 35))
+pShockLower = plot(showBands ? lowerShockBand : na, "Shock -Z", color = color.new(color.green, 35))
+pStopUpper = plot(showBands ? upperStopBand : na, "Extreme +Z", color = color.new(color.red, 75))
+pStopLower = plot(showBands ? lowerStopBand : na, "Extreme -Z", color = color.new(color.red, 75))
+fill(pShockUpper, pStopUpper, color = color.new(color.red, 94))
+fill(pShockLower, pStopLower, color = color.new(color.green, 94))
+
+color bgCol = na
+if showBackground
+    if rangeEnvironment
+        bgCol := color.new(color.blue, 92)
+    else if shockEnvironment
+        bgCol := color.new(color.purple, 94)
+bgcolor(bgCol, title = "Mean Reversion Environment")
+
+plot(showTradeLevels and assist.active ? assist.entryTrigger : na, "Pending Entry Trigger", color = color.fuchsia, linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and assist.active ? assist.entryLimit : na, "Pending Entry Limit", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+
+if showSetup and signal.lastSetupEventBar == bar_index and signal.lastSetupEventDir == 1
+    label setupLongLabel = label.new(bar_index, low, signal.lastSetupEventMode == 2 ? "S obs" : "R obs", style = label.style_label_up, color = signal.lastSetupEventMode == 2 ? color.green : color.new(color.green, 55), textcolor = color.white, size = size.tiny)
+    eventLabels.retainEventLabel(setupLongLabel)
+if showSetup and signal.lastSetupEventBar == bar_index and signal.lastSetupEventDir == -1
+    label setupShortLabel = label.new(bar_index, high, signal.lastSetupEventMode == 2 ? "S obs" : "R obs", style = label.style_label_down, color = signal.lastSetupEventMode == 2 ? color.red : color.new(color.red, 55), textcolor = color.white, size = size.tiny)
+    eventLabels.retainEventLabel(setupShortLabel)
+
+
+// ============================================================================
+// Data Window diagnostics
+// ============================================================================
+
+float winRate30 = f_rate(eventStats30.wins, eventStats30.total)
+float winRate60 = f_rate(eventStats60.wins, eventStats60.total)
+float ev30 = eventStats30.total > 0 ? winRate30 / 100.0 * winNetProfit + (1.0 - winRate30 / 100.0) * lossNetProfit : na
+float ev60 = eventStats60.total > 0 ? winRate60 / 100.0 * winNetProfit + (1.0 - winRate60 / 100.0) * lossNetProfit : na
+float averagePnl30 = eventStats30.total > 0 ? eventEquity30 / eventStats30.total : na
+float averagePnl60 = eventStats60.total > 0 ? eventEquity60 / eventStats60.total : na
+
+plot(z, "Z-score", display = display.data_window)
+plot(regimeScore, "Regime Score", display = display.data_window)
+plot(halfLife, "Half-Life", display = display.data_window)
+plot(shockMove, "Shock ATR", display = display.data_window)
+plot(previousShockMove, "Previous Shock ATR", display = display.data_window)
+plot(localER, "15m ER", display = display.data_window)
+plot(htfER, "1H ER", display = display.data_window)
+plot(localSlopeATR, "15m Slope", display = display.data_window)
+plot(htfSlopeATR, "1H Slope", display = display.data_window)
+
+plot(lastEventDirection, "Last Event Direction", display = display.data_window)
+plot(lastEventMode, "Last Event Mode (1 Range / 2 Shock)", display = display.data_window)
+plot(lastEventEntryPrice, "Last Event Entry Price", display = display.data_window)
+plot(lastEventEntryBar, "Last Event Entry Fill Bar", display = display.data_window)
+plot(lastEventSourceBar, "Last Event Source Bar", display = display.data_window)
+plot(lastEventValidBar, "Last Event Valid Bar", display = display.data_window)
+plot(lastEventEntryTimestamp, "Last Event Entry Timestamp", display = display.data_window)
+plot(last30Result, "Last 30m Result (1 Win / -1 Loss)", display = display.data_window)
+plot(last30ExpiryPrice, "Last 30m Expiry Price", display = display.data_window)
+plot(last30Pnl, "Last 30m P&L", display = display.data_window)
+plot(last60Result, "Last 1h Result (1 Win / -1 Loss)", display = display.data_window)
+plot(last60ExpiryPrice, "Last 1h Expiry Price", display = display.data_window)
+plot(last60Pnl, "Last 1h P&L", display = display.data_window)
+plot(winRate30, "30m Win Rate", display = display.data_window)
+plot(winRate60, "1h Win Rate", display = display.data_window)
+plot(ev30, "30m EV / Event", display = display.data_window)
+plot(ev60, "1h EV / Event", display = display.data_window)
+plot(eventEquity30, "30m Event Cumulative P&L", display = display.data_window)
+plot(eventEquity60, "1h Event Cumulative P&L", display = display.data_window)
+plot(array.size(activeEvents), "Active Event Count", display = display.data_window)
+plot(eventStats30.rangeEvents, "30m Range Events", display = display.data_window)
+plot(eventStats30.rangeWins, "30m Range Wins", display = display.data_window)
+plot(eventStats30.shockEvents, "30m Shock Events", display = display.data_window)
+plot(eventStats30.shockWins, "30m Shock Wins", display = display.data_window)
+plot(eventStats60.rangeEvents, "1h Range Events", display = display.data_window)
+plot(eventStats60.rangeWins, "1h Range Wins", display = display.data_window)
+plot(eventStats60.shockEvents, "1h Shock Events", display = display.data_window)
+plot(eventStats60.shockWins, "1h Shock Wins", display = display.data_window)
+plot(broker.queueOverflowCount, "Event Queue Overflow Count", display = display.data_window)
+
+
+// ============================================================================
+// Panel: two independent Event Contract columns
+// ============================================================================
+
+var table panel = table.new(position.top_right, 3, 29, border_width = 1)
+
+if showPanel
+    string activeText = str.tostring(array.size(activeEvents))
+    string rangeLong30 = str.tostring(eventStats30.rangeLongEvents) + " / " + f_rateText(eventStats30.rangeLongWins, eventStats30.rangeLongEvents)
+    string rangeLong60 = str.tostring(eventStats60.rangeLongEvents) + " / " + f_rateText(eventStats60.rangeLongWins, eventStats60.rangeLongEvents)
+    string rangeShort30 = str.tostring(eventStats30.rangeShortEvents) + " / " + f_rateText(eventStats30.rangeShortWins, eventStats30.rangeShortEvents)
+    string rangeShort60 = str.tostring(eventStats60.rangeShortEvents) + " / " + f_rateText(eventStats60.rangeShortWins, eventStats60.rangeShortEvents)
+    string shockLong30 = str.tostring(eventStats30.shockLongEvents) + " / " + f_rateText(eventStats30.shockLongWins, eventStats30.shockLongEvents)
+    string shockLong60 = str.tostring(eventStats60.shockLongEvents) + " / " + f_rateText(eventStats60.shockLongWins, eventStats60.shockLongEvents)
+    string shockShort30 = str.tostring(eventStats30.shockShortEvents) + " / " + f_rateText(eventStats30.shockShortWins, eventStats30.shockShortEvents)
+    string shockShort60 = str.tostring(eventStats60.shockShortEvents) + " / " + f_rateText(eventStats60.shockShortWins, eventStats60.shockShortEvents)
+
+    table.cell(panel, 0, 0, SCRIPT_NAME + " v" + SCRIPT_VERSION)
+    table.cell(panel, 1, 0, "30min", text_color = color.aqua)
+    table.cell(panel, 2, 0, "1h", text_color = color.orange)
+
+    table.cell(panel, 0, 1, "Total Events")
+    table.cell(panel, 1, 1, str.tostring(eventStats30.total))
+    table.cell(panel, 2, 1, str.tostring(eventStats60.total))
+    table.cell(panel, 0, 2, "Wins")
+    table.cell(panel, 1, 2, str.tostring(eventStats30.wins))
+    table.cell(panel, 2, 2, str.tostring(eventStats60.wins))
+    table.cell(panel, 0, 3, "Losses")
+    table.cell(panel, 1, 3, str.tostring(eventStats30.losses))
+    table.cell(panel, 2, 3, str.tostring(eventStats60.losses))
+    table.cell(panel, 0, 4, "Win Rate")
+    table.cell(panel, 1, 4, f_pct(winRate30))
+    table.cell(panel, 2, 4, f_pct(winRate60))
+    table.cell(panel, 0, 5, "Break-even Win Rate")
+    table.cell(panel, 1, 5, f_pct(breakEvenWinRate))
+    table.cell(panel, 2, 5, f_pct(breakEvenWinRate))
+    table.cell(panel, 0, 6, "Win Rate Edge")
+    table.cell(panel, 1, 6, f_pct(winRate30 - breakEvenWinRate), text_color = f_resultColor(winRate30 - breakEvenWinRate))
+    table.cell(panel, 2, 6, f_pct(winRate60 - breakEvenWinRate), text_color = f_resultColor(winRate60 - breakEvenWinRate))
+    table.cell(panel, 0, 7, "Net P&L")
+    table.cell(panel, 1, 7, f_moneyText(eventEquity30), text_color = f_resultColor(eventEquity30))
+    table.cell(panel, 2, 7, f_moneyText(eventEquity60), text_color = f_resultColor(eventEquity60))
+    table.cell(panel, 0, 8, "Average P&L / Event")
+    table.cell(panel, 1, 8, f_moneyText(averagePnl30))
+    table.cell(panel, 2, 8, f_moneyText(averagePnl60))
+    table.cell(panel, 0, 9, "Expected Value / Event")
+    table.cell(panel, 1, 9, f_moneyText(ev30))
+    table.cell(panel, 2, 9, f_moneyText(ev60))
+    table.cell(panel, 0, 10, "Max Consecutive Wins")
+    table.cell(panel, 1, 10, str.tostring(eventStats30.maxWinStreak))
+    table.cell(panel, 2, 10, str.tostring(eventStats60.maxWinStreak))
+    table.cell(panel, 0, 11, "Max Consecutive Losses")
+    table.cell(panel, 1, 11, str.tostring(eventStats30.maxLossStreak))
+    table.cell(panel, 2, 11, str.tostring(eventStats60.maxLossStreak))
+    table.cell(panel, 0, 12, "Maximum Event Equity Drawdown")
+    table.cell(panel, 1, 12, f_moneyText(eventStats30.maxDrawdown))
+    table.cell(panel, 2, 12, f_moneyText(eventStats60.maxDrawdown))
+
+    table.cell(panel, 0, 13, "Long Events / Win Rate")
+    table.cell(panel, 1, 13, str.tostring(eventStats30.longEvents) + " / " + f_rateText(eventStats30.longWins, eventStats30.longEvents))
+    table.cell(panel, 2, 13, str.tostring(eventStats60.longEvents) + " / " + f_rateText(eventStats60.longWins, eventStats60.longEvents))
+    table.cell(panel, 0, 14, "Short Events / Win Rate")
+    table.cell(panel, 1, 14, str.tostring(eventStats30.shortEvents) + " / " + f_rateText(eventStats30.shortWins, eventStats30.shortEvents))
+    table.cell(panel, 2, 14, str.tostring(eventStats60.shortEvents) + " / " + f_rateText(eventStats60.shortWins, eventStats60.shortEvents))
+    table.cell(panel, 0, 15, "Range Events / Win Rate")
+    table.cell(panel, 1, 15, str.tostring(eventStats30.rangeEvents) + " / " + f_rateText(eventStats30.rangeWins, eventStats30.rangeEvents))
+    table.cell(panel, 2, 15, str.tostring(eventStats60.rangeEvents) + " / " + f_rateText(eventStats60.rangeWins, eventStats60.rangeEvents))
+    table.cell(panel, 0, 16, "Shock Events / Win Rate")
+    table.cell(panel, 1, 16, str.tostring(eventStats30.shockEvents) + " / " + f_rateText(eventStats30.shockWins, eventStats30.shockEvents))
+    table.cell(panel, 2, 16, str.tostring(eventStats60.shockEvents) + " / " + f_rateText(eventStats60.shockWins, eventStats60.shockEvents))
+    table.cell(panel, 0, 17, "Range Long (N / WR)")
+    table.cell(panel, 1, 17, rangeLong30)
+    table.cell(panel, 2, 17, rangeLong60)
+    table.cell(panel, 0, 18, "Range Short (N / WR)")
+    table.cell(panel, 1, 18, rangeShort30)
+    table.cell(panel, 2, 18, rangeShort60)
+    table.cell(panel, 0, 19, "Shock Long (N / WR)")
+    table.cell(panel, 1, 19, shockLong30)
+    table.cell(panel, 2, 19, shockLong60)
+    table.cell(panel, 0, 20, "Shock Short (N / WR)")
+    table.cell(panel, 1, 20, shockShort30)
+    table.cell(panel, 2, 20, shockShort60)
+    table.cell(panel, 0, 21, "Active Event Count")
+    table.cell(panel, 1, 21, activeText)
+    table.cell(panel, 2, 21, activeText)
+    table.cell(panel, 0, 22, "Last Event")
+    table.cell(panel, 1, 22, f_directionName(lastEventDirection) + " / " + f_modeName(lastEventMode))
+    table.cell(panel, 2, 22, f_price(lastEventEntryPrice))
+    table.cell(panel, 0, 23, "Last 30m / 1h Result")
+    table.cell(panel, 1, 23, f_resultText(last30Result))
+    table.cell(panel, 2, 23, f_resultText(last60Result))
+    table.cell(panel, 0, 24, "Entry / Source / Valid Bar")
+    table.cell(panel, 1, 24, str.tostring(lastEventEntryBar) + " / " + str.tostring(lastEventSourceBar) + " / " + str.tostring(lastEventValidBar))
+    table.cell(panel, 2, 24, f_time(lastEventEntryTimestamp))
+    table.cell(panel, 0, 25, "Stake / Winning Return")
+    table.cell(panel, 1, 25, f_moneyText(stakeUSDT))
+    table.cell(panel, 2, 25, f_moneyText(winningReturnUSDT))
+    table.cell(panel, 0, 26, "Win / Loss Net")
+    table.cell(panel, 1, 26, f_moneyText(winNetProfit))
+    table.cell(panel, 2, 26, f_moneyText(lossNetProfit))
+    table.cell(panel, 0, 27, "Broker Probe / Queue")
+    table.cell(panel, 1, 27, (broker.releaseIntentPending ? "RELEASE_PENDING" : "FLAT") + " / " + str.tostring(broker.queueOverflowCount))
+    table.cell(panel, 2, 27, BASELINE_COMMIT)
+    table.cell(panel, 0, 28, "Baseline")
+    table.cell(panel, 1, 28, "v4.5.1 PREPLAN")
+    table.cell(panel, 2, 28, "Event Baseline")
+else
+    table.clear(panel, 0, 0, 2, 28)
+
+
+// ============================================================================
+// Alerts and manual verification boundary
+// ============================================================================
+
+if allowBarCloseDecision and signal.lastSetupEventBar == bar_index
+    alert("MR-T-EVENT|event=SETUP|direction=" + f_directionName(signal.lastSetupEventDir) + "|mode=" + f_modeName(signal.lastSetupEventMode) + "|source_bar=" + str.tostring(bar_index), alert.freq_all)
+
+// TradingView's Broker Emulator decides Stop-Limit activation/fill. Bar
+// Magnifier improves historical sequencing but is not exchange tick replay.

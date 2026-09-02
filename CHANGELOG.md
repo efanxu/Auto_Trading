@@ -2,6 +2,13 @@
 
 All notable changes to **Mean Reversion T (MR-T)** are documented here. Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.0] — MR-T Event Contract Baseline Experiment
+
+- Added standalone `MRT_EVENT.pine` for measuring MR-T direction accuracy after fixed 30-minute and 1-hour horizons.
+- Kept the v4.5.1 confirmed-bar, previous-confirmed-bar PREPLAN, Stop-Limit, and real Broker fill baseline from `d30f506719666df1ac89f79ef322f15f81d901ec`.
+- Added independent concurrent Shadow Event queue, Range/Shock and Long/Short statistics, fixed 5 USDT / 9.25 USDT payout accounting, event equity curves, and diagnostics.
+- `MRT.pine` and `MRT_V4.pine` remain unchanged.
+
 ## [4.5.1] — Real-Time Execution Correctness
 
 - Orders created from confirmed bars now become fillable only from the next available tick.
