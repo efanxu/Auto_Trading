@@ -25,6 +25,21 @@ function Assert-NotMatch {
     Assert-True (-not [regex]::IsMatch($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::Singleline)) $Message
 }
 
+function Assert-HeadBlob {
+    param(
+        [string]$CurrentPath,
+        [string]$LegacyPath,
+        [string]$MovedPath,
+        [string]$Message
+    )
+
+    $null = & git -C $repoRoot cat-file -e "HEAD:$MovedPath" 2>$null
+    $headPath = if ($LASTEXITCODE -eq 0) { $MovedPath } else { $LegacyPath }
+    $currentHash = ((& git -C $repoRoot hash-object -- $CurrentPath) -join '').Trim()
+    $headHash = ((& git -C $repoRoot rev-parse "HEAD:$headPath") -join '').Trim()
+    Assert-True ($currentHash -eq $headHash) $Message
+}
+
 function Pass-Test {
     param([string]$Name, [scriptblock]$Body)
     & $Body
@@ -213,8 +228,8 @@ Pass-Test '01 Event script exists and v0.2.0 identity is explicit' {
 }
 
 Pass-Test '02 MRT.pine and MRT_V4.pine remain unchanged from HEAD' {
-    $null = & git -C $repoRoot diff HEAD --quiet -- MRT.pine MRT_V4.pine
-    Assert-True ($LASTEXITCODE -eq 0) 'formal MR-T scripts differ from HEAD'
+    Assert-HeadBlob -CurrentPath $v3Path -LegacyPath 'MRT.pine' -MovedPath 'tradingview_pine/MRT.pine' -Message 'MRT.pine differs from HEAD'
+    Assert-HeadBlob -CurrentPath $v4Path -LegacyPath 'MRT_V4.pine' -MovedPath 'tradingview_pine/MRT_V4.pine' -Message 'MRT_V4.pine differs from HEAD'
 }
 
 Pass-Test '03 v4.5.1 execution settings plus realtime settlement setting are explicit' {
@@ -492,8 +507,8 @@ Pass-Test '33 source does not reintroduce ordinary Strategy Tester result accoun
 }
 
 Pass-Test '34 formal MR-T sources remain byte-identical in the worktree diff' {
-    $null = & git -C $repoRoot diff --quiet -- MRT.pine MRT_V4.pine
-    Assert-True ($LASTEXITCODE -eq 0) 'formal MR-T scripts have worktree changes'
+    Assert-HeadBlob -CurrentPath $v3Path -LegacyPath 'MRT.pine' -MovedPath 'tradingview_pine/MRT.pine' -Message 'MRT.pine has worktree changes'
+    Assert-HeadBlob -CurrentPath $v4Path -LegacyPath 'MRT_V4.pine' -MovedPath 'tradingview_pine/MRT_V4.pine' -Message 'MRT_V4.pine has worktree changes'
 }
 
 $null = & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $v3HarnessPath 2>&1 | Out-String

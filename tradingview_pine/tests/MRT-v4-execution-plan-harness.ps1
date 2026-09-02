@@ -22,6 +22,21 @@ function Assert-NotMatch {
     Assert-True (-not [regex]::IsMatch($Text, $Pattern, [Text.RegularExpressions.RegexOptions]::Singleline)) $Message
 }
 
+function Assert-HeadBlob {
+    param(
+        [string]$CurrentPath,
+        [string]$LegacyPath,
+        [string]$MovedPath,
+        [string]$Message
+    )
+
+    $null = & git -C $repoRoot cat-file -e "HEAD:$MovedPath" 2>$null
+    $headPath = if ($LASTEXITCODE -eq 0) { $MovedPath } else { $LegacyPath }
+    $currentHash = ((& git -C $repoRoot hash-object -- $CurrentPath) -join '').Trim()
+    $headHash = ((& git -C $repoRoot rev-parse "HEAD:$headPath") -join '').Trim()
+    Assert-True ($currentHash -eq $headHash) $Message
+}
+
 function Pass-Test {
     param([string]$Name, [scriptblock]$Body)
     & $Body
@@ -85,8 +100,7 @@ $testCount = 0
 Write-Host 'MR-T v4.5.1 Real-Time Execution Correctness harness'
 
 Pass-Test '01 MRT.pine is byte-for-byte unchanged from Git' {
-    $null = & git -C $repoRoot diff HEAD --quiet -- MRT.pine
-    Assert-True ($LASTEXITCODE -eq 0) 'MRT.pine differs from HEAD'
+    Assert-HeadBlob -CurrentPath $v3Path -LegacyPath 'MRT.pine' -MovedPath 'tradingview_pine/MRT.pine' -Message 'MRT.pine differs from HEAD'
 }
 Pass-Test '02 process_orders_on_close is false' { Assert-Match $source 'process_orders_on_close\s*=\s*false' 'next-tick causality' }
 Pass-Test '03 Bar Magnifier is enabled' { Assert-Match $source 'use_bar_magnifier\s*=\s*true' 'Bar Magnifier' }

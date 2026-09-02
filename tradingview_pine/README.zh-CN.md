@@ -5,7 +5,7 @@ English · [简体中文](README.zh-CN.md)
 一个运行于 TradingView 的生产级 **V2 Logic-State Parity MR-T Strategy**,用 Pine Script v6 编写。MR-T v3.3.2 的全部 T 点决策都由 V2 Logic State 在已确认的 **15 分钟收盘**产生,随后由 Strategy Tester 执行对应 Broker intent。面向 **A 股 T+0 日内做T**,运行时界面中英双语。
 
 [![Pine Script](https://img.shields.io/badge/Pine%20Script-v6-yellow)](https://www.tradingview.com/pine-script-docs/)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](../LICENSE)
 [![Version](https://img.shields.io/badge/version-3.3.2-informational)](CHANGELOG.md)
 
 ---
@@ -92,7 +92,7 @@ flowchart TD
 ## 安装
 
 1. 打开 TradingView Pine 编辑器,粘贴 [`MRT.pine`](MRT.pine) 内容,*添加到图表*。
-2. 或 clone 本仓库,用编辑器打开 `MRT.pine`。
+2. 或 clone 本仓库,用编辑器打开 `tradingview_pine/MRT.pine`。
 
 > MR-T v3 是 **strategy**,不是 indicator —— 会维护单方向仓位并可在 Strategy Tester 中回测。
 
@@ -107,7 +107,7 @@ flowchart TD
 
 ### 回测流程
 
-1. 将 `MRT.pine` 添加到 **15m** 图表。脚本会拒绝其它图表周期。
+1. 将 `tradingview_pine/MRT.pine` 添加到 **15m** 图表。脚本会拒绝其它图表周期。
 2. 打开 **Strategy Tester -> Properties**,确认手续费为每笔订单 `0.03%`(3 bp),滑点为 `0` tick;若修改,同步修改代码输入。
 3. 确认 `Pyramiding` 为 `0`,`Margin for long positions` 与 `Margin for short positions` 为 `0%`,并在 Properties 选择默认订单大小。脚本默认单仓位使用 100% equity。
 4. 检查策略成交标记:Entry 在 confirmed signal 同一收盘成交;T减按 `trimPct` 减少仓位;T平在对应决策同一收盘退出剩余仓位。
@@ -315,7 +315,7 @@ confirmed Entry decision 保存为 `logic.entryBar`,同收盘 Broker Emulator �
 
 ## 许可证
 
-本 Pine Script 代码遵循 **Mozilla Public License 2.0** 条款,见 <https://mozilla.org/MPL/2.0/>。全文见 [LICENSE](LICENSE)。
+本 Pine Script 代码遵循 **Mozilla Public License 2.0** 条款,见 <https://mozilla.org/MPL/2.0/>。全文见 [LICENSE](../LICENSE)。
 
 ## 作者
 

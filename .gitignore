@@ -10,3 +10,31 @@ Thumbs.db
 # Local copies / scratch
 *.backup.pine
 *.orig
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Data
+python_ml_backtest/data/raw/*
+python_ml_backtest/data/processed/*
+*.parquet
+*.feather
+*.zip
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.joblib
+*.pkl
+
+# Python backtest outputs
+python_ml_backtest/results/*
+!python_ml_backtest/results/.gitkeep
