@@ -1,0 +1,32 @@
+project:
+  seed: 2026
+
+data:
+  interval: 1m
+  timezone: UTC
+
+target:
+  type: binary_direction
+  horizon_minutes: 30
+  equality: down
+
+split:
+  method: walk_forward
+  purge_minutes: 30
+
+prediction:
+  frequency_minutes: 1
+
+calibration:
+  method: none
+
+signal:
+  long_probability_threshold: null
+  short_probability_threshold: null
+  cooldown_minutes: null
+  rearm_probability_threshold: null
+
+event:
+  horizon_minutes: 30
+  stake_usdt: 5.0
+  winning_total_return_usdt: 9.25

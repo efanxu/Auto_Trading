@@ -2,6 +2,8 @@
 
 本仓库包含两个独立研究工作区。
 
+稳定项目准则见 [PROJECT_RULES.md](PROJECT_RULES.md)，当前真实状态见 [HANDOFF.md](HANDOFF.md)。
+
 ## 1. TradingView / Pine MR-T
 
 目录：
