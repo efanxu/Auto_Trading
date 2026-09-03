@@ -16,6 +16,9 @@ class B0DataPaths:
     data_report: Path
     samples_parquet: Path
     split_report: Path
+    features_parquet: Path
+    model_dataset_parquet: Path
+    feature_report: Path
 
 
 def default_b0_data_paths(workspace_root: str | Path) -> B0DataPaths:
@@ -30,6 +33,9 @@ def default_b0_data_paths(workspace_root: str | Path) -> B0DataPaths:
         data_report=processed / "btcusdt_index_30m_data_report.json",
         samples_parquet=processed / "btcusdt_index_30m_samples.parquet",
         split_report=processed / "btcusdt_index_30m_split_report.json",
+        features_parquet=processed / "btcusdt_index_30m_features.parquet",
+        model_dataset_parquet=processed / "btcusdt_index_30m_model_dataset.parquet",
+        feature_report=processed / "btcusdt_index_30m_feature_report.json",
     )
 
 

@@ -31,16 +31,30 @@ class DataInfo:
             raise ValueError("horizon_minutes must be positive when provided")
 
 
+@dataclass(frozen=True)
+class ValidationData:
+    """Container for validation features and labels passed to fit."""
+
+    x: Any
+    y: Any
+
+
 class ProbabilityModel(ABC):
     """Common model interface for predicting positive-direction probability."""
 
     @abstractmethod
-    def fit(self, x: Any, y: Any) -> "ProbabilityModel":
-        """Fit the model using the supplied training features and labels."""
+    def fit(
+        self,
+        x: Any,
+        y: Any,
+        *,
+        validation: ValidationData | None = None,
+    ) -> "ProbabilityModel":
+        """Fit the model using training data and optional validation data."""
 
     @abstractmethod
     def predict_proba(self, x: Any) -> Any:
-        """Return ``P(price_(t+30min) > price_t)`` for each input row."""
+        """Return ``P(next_bar_close > next_bar_open)`` for each input row."""
 
 
-__all__ = ["DataInfo", "ProbabilityModel"]
+__all__ = ["DataInfo", "ProbabilityModel", "ValidationData"]

@@ -36,6 +36,19 @@ signal:
   cooldown_minutes: null
   rearm_probability_threshold: null
 
+features:
+  set: price_ohlc_v1
+  max_lag_bars: 48
+  require_contiguous_history: true
+
+training:
+  early_stopping:
+    enabled: true
+    internal_fraction: 0.10
+    purge_minutes: 30
+    stopping_rounds: 100
+    metric: binary_logloss
+
 event:
   horizon_minutes: 30
   stake_usdt: 10.0

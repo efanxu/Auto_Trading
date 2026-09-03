@@ -17,10 +17,15 @@ from auto_trading.data import (
     prepare_canonical_data,
     run_data_preflight,
 )
+from auto_trading.features import (
+    build_and_persist_features,
+    run_all_feature_checks,
+)
 from auto_trading.labels import (
     build_persisted_event_dataset,
     run_label_causality_check,
 )
+from auto_trading.runtime.trainer import run_training_pipeline
 from auto_trading.runtime.config import (
     ConfigError,
     calculate_event_payout,
@@ -55,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("data-prepare", "build canonical 30m OHLC parquet and data report"),
         ("dataset-build", "build causal Event labels and chronological split"),
         ("data-check", "run data, label, and split contract checks"),
+        ("feature-build", "build causal price_ohlc_v1 features and model dataset"),
+        ("feature-check", "run feature causality, schema, finite, and alignment checks"),
     )
     for name, help_text in commands_and_help:
         command = commands.add_parser(name, help=help_text)
@@ -65,6 +72,30 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Path to experiment YAML (overrides the global option).",
         )
+
+    train_command = commands.add_parser("train", help="train probability baseline model")
+    train_command.add_argument(
+        "--config",
+        dest="command_config",
+        type=Path,
+        default=None,
+        help="Path to experiment YAML (overrides the global option).",
+    )
+    train_command.add_argument(
+        "--model",
+        dest="model",
+        type=str,
+        default="lightgbm",
+        help="Model architecture name (default: lightgbm).",
+    )
+    train_command.add_argument(
+        "--run-id",
+        dest="run_id",
+        type=str,
+        default="b0c_lightgbm_seed2026",
+        help="Unique run identifier for output directory.",
+    )
+
     return parser
 
 
@@ -98,6 +129,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_dataset_build(config, workspace_root)
     if args.command == "data-check":
         return _run_data_check(config, workspace_root)
+    if args.command == "feature-build":
+        return _run_feature_build(config, workspace_root)
+    if args.command == "feature-check":
+        return _run_feature_check(config, workspace_root)
+    if args.command == "train":
+        return _run_train(
+            config,
+            workspace_root,
+            model_name=args.model,
+            run_id=args.run_id,
+        )
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -173,10 +215,15 @@ def _run_check(config: dict, config_path: Path) -> int:
         repository_root / "HANDOFF.md",
         workspace_root / "MODEL_INTEGRATION_INDEX.md",
         workspace_root / "configs" / "experiment.yaml",
+        workspace_root / "configs" / "models" / "lightgbm.yaml",
         workspace_root / "scripts" / "run.py",
         workspace_root / "src" / "auto_trading" / "runtime" / "config.py",
+        workspace_root / "src" / "auto_trading" / "runtime" / "trainer.py",
         workspace_root / "src" / "auto_trading" / "models" / "base.py",
         workspace_root / "src" / "auto_trading" / "models" / "loader.py",
+        workspace_root / "src" / "auto_trading" / "models" / "lightgbm" / "model.py",
+        workspace_root / "src" / "auto_trading" / "features" / "price_ohlc_v1.py",
+        workspace_root / "src" / "auto_trading" / "evaluation" / "probability.py",
     ]
     missing_paths = [
         str(path.relative_to(repository_root)) for path in required_paths if not path.is_file()
@@ -349,6 +396,127 @@ def _run_data_check(config: dict, workspace_root: Path) -> int:
     all_passed = all(passed for _, passed, _ in checks)
     print(f"DATA_CHECK = {'PASS' if all_passed else 'FAIL'}")
     return 0 if all_passed else 1
+
+
+def _run_feature_build(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    if not paths.canonical_parquet.is_file():
+        print(f"FEATURE_BUILD = FAIL (missing canonical data: {paths.canonical_parquet})")
+        return 1
+    if not paths.samples_parquet.is_file():
+        print(f"FEATURE_BUILD = FAIL (missing sample data: {paths.samples_parquet})")
+        return 1
+
+    try:
+        _, _, report = build_and_persist_features(
+            canonical_path=paths.canonical_parquet,
+            samples_path=paths.samples_parquet,
+            features_path=paths.features_parquet,
+            model_dataset_path=paths.model_dataset_parquet,
+            report_path=paths.feature_report,
+        )
+    except Exception as exc:
+        print(f"FEATURE_BUILD = FAIL ({exc})")
+        return 1
+
+    print(
+        "FEATURE_BUILD = PASS "
+        f"(features={report['feature_count']}, total_rows={report['total_rows']}, "
+        f"valid={report['valid_feature_rows']}, invalid={report['invalid_feature_rows']})"
+    )
+    print(
+        "MODEL_ROWS = "
+        f"train={report['train_model_rows']}, "
+        f"validation={report['validation_model_rows']}, "
+        f"test_features={report['test_feature_rows']}"
+    )
+    print(f"FEATURES = {paths.features_parquet}")
+    print(f"MODEL_DATASET = {paths.model_dataset_parquet}")
+    print(f"FEATURE_REPORT = {paths.feature_report}")
+    return 0
+
+
+def _run_feature_check(config: dict, workspace_root: Path) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    if not paths.features_parquet.is_file() or not paths.model_dataset_parquet.is_file() or not paths.samples_parquet.is_file():
+        print("FEATURE_CHECK = FAIL (missing feature or dataset artifacts; run feature-build first)")
+        return 1
+
+    try:
+        features = pd.read_parquet(paths.features_parquet)
+        samples = pd.read_parquet(paths.samples_parquet)
+        model_dataset = pd.read_parquet(paths.model_dataset_parquet)
+
+        results = run_all_feature_checks(
+            features=features,
+            samples=samples,
+            model_dataset=model_dataset,
+        )
+    except Exception as exc:
+        print(f"FEATURE_CHECK = FAIL ({exc})")
+        return 1
+
+    causality_ok = results["causality"]["passed"]
+    schema_ok = results["schema"]["passed"]
+    finite_ok = results["finite"]["passed"]
+    alignment_ok = results["alignment"]["passed"]
+
+    print(f"FEATURE_CAUSALITY = {'PASS' if causality_ok else 'FAIL'}")
+    print(f"FEATURE_SCHEMA = {'PASS' if schema_ok else 'FAIL'}")
+    print(f"FEATURE_FINITE = {'PASS' if finite_ok else 'FAIL'}")
+    print(f"FEATURE_ALIGNMENT = {'PASS' if alignment_ok else 'FAIL'}")
+
+    all_passed = results["passed"]
+    print(f"FEATURE_CHECK = {'PASS' if all_passed else 'FAIL'}")
+    return 0 if all_passed else 1
+
+
+def _run_train(config: dict, workspace_root: Path, model_name: str, run_id: str) -> int:
+    paths = default_b0_data_paths(workspace_root)
+    model_cfg_path = workspace_root / "configs" / "models" / f"{model_name}.yaml"
+    if not model_cfg_path.is_file():
+        print(f"TRAIN = FAIL (model config not found: {model_cfg_path})")
+        return 1
+    if not paths.model_dataset_parquet.is_file():
+        print(f"TRAIN = FAIL (model dataset not found: {paths.model_dataset_parquet}; run feature-build first)")
+        return 1
+
+    results_root = workspace_root / "results"
+    try:
+        train_result = run_training_pipeline(
+            config=config,
+            model_config_path=model_cfg_path,
+            model_dataset_path=paths.model_dataset_parquet,
+            results_root=results_root,
+            model_name=model_name,
+            run_id=run_id,
+        )
+    except Exception as exc:
+        print(f"TRAIN = FAIL ({exc})")
+        return 1
+
+    metrics = train_result["metrics"]
+    run_info = train_result["run_info"]
+
+    print(f"TRAIN = PASS (model={model_name}, run_id={run_id})")
+    print(f"BEST_ITERATION = {train_result['best_iteration']}")
+    print(f"INTERNAL_ES_LOGLOSS = {train_result['best_es_logloss']:.6f}")
+    print("VALIDATION_METRICS = {")
+    print(f"  samples: {metrics['n_samples']},")
+    print(f"  positive_rate: {metrics['positive_rate']:.4f},")
+    print(f"  binary_logloss: {metrics['binary_logloss']:.6f},")
+    print(f"  brier_score: {metrics['brier_score']:.6f},")
+    print(f"  roc_auc: {metrics['roc_auc']:.6f},")
+    print(f"  accuracy_at_0_5: {metrics['accuracy_at_0_5']:.4f},")
+    print(f"  probability_mean: {metrics['probability_mean']:.4f},")
+    print(f"  probability_std: {metrics['probability_std']:.4f},")
+    print(f"  probability_min: {metrics['probability_min']:.4f},")
+    print(f"  probability_max: {metrics['probability_max']:.4f}")
+    print("}")
+    print(f"RESULTS_DIRECTORY = {train_result['run_dir']}")
+    print(f"TEST_STATUS = {run_info.get('test_status', 'SEALED')}")
+    return 0
+
 
 
 def _data_is_configured(workspace_root: Path) -> bool:

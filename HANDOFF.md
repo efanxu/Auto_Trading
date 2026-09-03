@@ -26,8 +26,8 @@ Auto_Trading/
 Binance BTCUSDT Index Price 30m
 → causal next-bar Event labels
 → chronological 8:1:1 split with purge
-→ B0-C LightGBM probability baseline
-→ calibration / Signal State Machine / Event Contract evaluation
+→ B0-C LightGBM probability baseline (COMPLETE, Test SEALED)
+→ B0-D Validation Signal Selection + Formal Test Event Evaluation
 ```
 
 ## 当前稳定协议
@@ -50,19 +50,29 @@ Binance BTCUSDT Index Price 30m
 - 实际 Event report：candidate `116256`、valid `116246`、invalid `10`、FLAT `5`、purged `2`；Train `92995`、Validation `11624`、Test `11625`。
 - purge 后正式样本共 `116244` 行，actual ratios 为 Train `0.7999982795`、Validation `0.0999965590`、Test `0.1000051616`。
 - 实际 split prediction time 区间：Train `2020-01-01T00:29:59.999000Z`–`2025-05-03T13:29:59.999000Z`；Validation `2025-05-03T14:29:59.999000Z`–`2025-12-31T17:59:59.999000Z`；Test `2025-12-31T18:59:59.999000Z`–`2026-08-31T23:29:59.999000Z`。
-- `data-check` 已通过 `DATA_PREFLIGHT`、`LABEL_CAUSALITY`、`SPLIT_CHECK` 和 `DATA_CHECK`。
-- deterministic contract tests 覆盖 URL、checksum、CSV/UTC、duplicate/conflict、gap/OHLC、label off-by-one、FLAT、gap label、split purge、payout 和 CLI；当前 `pytest` 全部通过。
+- B0-C 已实现 `price_ohlc_v1` 34 个因果特征，无未来数据泄漏，通过 `FEATURE_CAUSALITY`、`FEATURE_SCHEMA`、`FEATURE_FINITE`、`FEATURE_ALIGNMENT` 检查。
+- feature report：总行数 `116256`，valid `115776`，invalid `480`（48 warmup + 432 gap）；Train model 有效样本 `92560`（UP 46872 / DOWN 45688），Validation 有效样本 `11624`（UP 5882 / DOWN 5742），Test feature rows `11577`。
+- 外部 Train 内部按 chronological 90/10 切分为 Train-fit (`83303` 行) 与 Train-ES (`9256` 行)，边界 purge 30min。
+- LightGBM baseline 两阶段训练：Step 1 early stopping 确定 `best_iteration = 28`（internal ES logloss `0.690926`）；Step 2 在全部 `92560` 行外部 Train 上重新拟合。
+- Validation 概率层评价完成：`binary_logloss = 0.691183`，`Brier = 0.249019`，`ROC-AUC = 0.536141`，`accuracy@0.5 = 0.5258`，`positive_rate = 0.5060`。
+- Test set 严格保持封存（`test_status = SEALED`），未参与模型训练、早停、阈值选择或指标计算。
+- 独立相同 seed 运行复现性验证通过（probabilities diff = 0.0，feature importance diff = 0.0）。
+- deterministic tests 全部通过（当前 46 个 pytest 测试用例全部 PASS）。
 
 ## 当前限制
 
-- 尚未实现正式特征工程、概率校准、Signal State Machine、Event Backtester、结果汇总或 LightGBM 训练。
-- Test set 不参与模型、特征、阈值、校准或策略选择。
-- raw archive、processed parquet 和 JSON report 是本地运行产物；只提交代码、配置、测试和文档。
+- Test set 保持封存（SEALED），未计算 Test metrics 或 Event P&L。
+- 概率校准（calibration）目前为 `none`，尚未拟合 Platt / Isotonic 校准器。
+- Signal threshold selection 与 Signal State Machine 尚未冻结正式参数。
+- raw archive、processed parquet、model 权重与结果文件均在本地，不进入 Git。
 - TradingView/Pine 路线与 Python 路线执行系统相互独立。
 
 ## 下一步
 
-实现 `B0-C LightGBM Probability Baseline`：price-only feature engine、LightGBM、validation early stopping、probability metrics、validation threshold selection，以及 Test Event Contract evaluation。
+实现 `B0-D Validation Signal Selection + Formal Test Event Evaluation`：
+1. Validation 概率校准与诊断（Platt / Isotonic 比较）；
+2. 基于 Validation 选择并冻结交易阈值与 Signal State Machine 规则；
+3. 一次性解封 Test set 进行正式 10U Event Contract 回测与验收。
 
 ## 重要陷阱
 

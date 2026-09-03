@@ -25,6 +25,14 @@ def register_model(model_name: str, builder: ModelBuilder) -> None:
     MODEL_REGISTRY[model_name] = builder
 
 
+def _ensure_builtin_models() -> None:
+    """Ensure built-in models are registered."""
+    if "lightgbm" not in MODEL_REGISTRY:
+        from .lightgbm import build_lightgbm_model
+
+        register_model("lightgbm", build_lightgbm_model)
+
+
 def build_model(
     model_name: str,
     model_config: Mapping[str, Any],
@@ -32,6 +40,7 @@ def build_model(
 ) -> ProbabilityModel:
     """Build a registered model through the one public construction seam."""
 
+    _ensure_builtin_models()
     try:
         builder = MODEL_REGISTRY[model_name]
     except KeyError as exc:

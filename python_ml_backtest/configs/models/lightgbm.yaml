@@ -1,0 +1,22 @@
+model:
+  objective: binary
+  boosting_type: gbdt
+
+  learning_rate: 0.03
+  num_leaves: 31
+  max_depth: -1
+  min_child_samples: 100
+
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+
+  reg_alpha: 0.0
+  reg_lambda: 1.0
+
+  n_estimators: 2000
+
+  deterministic: true
+  force_col_wise: true
+  random_state: 2026
+  verbosity: -1

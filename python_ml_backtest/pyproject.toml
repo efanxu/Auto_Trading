@@ -12,6 +12,8 @@ dependencies = [
     "pyarrow>=12.0",
     "PyYAML>=6.0",
     "pytest>=8.0",
+    "lightgbm>=4.5,<5",
+    "scikit-learn>=1.5,<2",
 ]
 
 [tool.setuptools.packages.find]

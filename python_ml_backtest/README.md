@@ -5,7 +5,8 @@
 ```text
 B0-A  Binance BTCUSDT Index Price 30m
 B0-B  next-bar Event label + chronological 8:1:1 split
-下一步：B0-C LightGBM Probability Baseline
+B0-C  LightGBM Probability Baseline (COMPLETE, Test SEALED)
+下一步：B0-D Validation Signal Selection + Formal Test Event Evaluation
 ```
 
 ## B0 数据协议
@@ -68,6 +69,11 @@ python scripts\run.py data-download
 python scripts\run.py data-prepare
 python scripts\run.py dataset-build
 python scripts\run.py data-check
+
+python scripts\run.py feature-build
+python scripts\run.py feature-check
+
+python scripts\run.py train --model lightgbm --run-id b0c_lightgbm_seed2026
 ```
 
 产物位置：
@@ -78,6 +84,20 @@ data/processed/btcusdt_index_30m.parquet
 data/processed/btcusdt_index_30m_data_report.json
 data/processed/btcusdt_index_30m_samples.parquet
 data/processed/btcusdt_index_30m_split_report.json
+data/processed/btcusdt_index_30m_features.parquet
+data/processed/btcusdt_index_30m_model_dataset.parquet
+data/processed/btcusdt_index_30m_feature_report.json
+
+results/lightgbm/<run_id>/
+  run_info.json
+  resolved_config.yaml
+  model_config.yaml
+  model.txt
+  metrics_validation.json
+  predictions_validation.parquet
+  reliability_validation.csv
+  confidence_validation.csv
+  feature_importance.csv
 ```
 
-模型训练尚未在 B0 实现。所有未来模型继续通过单一 `scripts/run.py`、`experiment.yaml` 和公共 Data / Label / Split / Model 路径接入。
+B0-C 完成了 LightGBM 概率基线和 Validation 独立诊断，Test set 保持封存（SEALED）。所有未来模型继续通过单一 `scripts/run.py`、`experiment.yaml` 和公共 Data / Label / Feature / Split / Model 路径接入。

@@ -42,7 +42,7 @@ def build_model(model_config, data_info):
     ...
 ```
 
-构造器通过 `models.loader.build_model(model_name, model_config, data_info)` 被公共运行时调用。模型实现公共 `ProbabilityModel` 接口的 `fit(...)` 和 `predict_proba(...)`，只返回 `P(next_bar_close > next_bar_open)`。
+构造器通过 `models.loader.build_model(model_name, model_config, data_info)` 被公共运行时调用。模型实现公共 `ProbabilityModel` 接口的 `fit(x, y, *, validation: ValidationData | None = None)` 和 `predict_proba(x)`，只返回 `P(next_bar_close > next_bar_open)`。其中 `ValidationData(x, y)` 提供可选的验证数据容器用于 early stopping。
 
 ## 模型明确不拥有的职责
 

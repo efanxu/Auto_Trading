@@ -52,6 +52,14 @@ _REQUIRED_FIELDS: tuple[tuple[str, ...], ...] = (
     ("event", "horizon_minutes"),
     ("event", "stake_usdt"),
     ("event", "winning_total_return_usdt"),
+    ("features", "set"),
+    ("features", "max_lag_bars"),
+    ("features", "require_contiguous_history"),
+    ("training", "early_stopping", "enabled"),
+    ("training", "early_stopping", "internal_fraction"),
+    ("training", "early_stopping", "purge_minutes"),
+    ("training", "early_stopping", "stopping_rounds"),
+    ("training", "early_stopping", "metric"),
 )
 
 _SIGNAL_FIELDS = {
@@ -265,6 +273,32 @@ def _validate_public_values(
     end_date = _config_date(data["end_date"], "data.end_date")
     if start_date >= end_date:
         raise ConfigError(_source_prefix(source) + "data.start_date must be before data.end_date")
+
+    features = config["features"]
+    training = config["training"]
+
+    if features["set"] != "price_ohlc_v1":
+        raise ConfigError(_source_prefix(source) + "features.set must be 'price_ohlc_v1'")
+    max_lag = features["max_lag_bars"]
+    if isinstance(max_lag, bool) or not isinstance(max_lag, int) or max_lag != 48:
+        raise ConfigError(_source_prefix(source) + "features.max_lag_bars must be integer 48")
+    if not isinstance(features["require_contiguous_history"], bool):
+        raise ConfigError(_source_prefix(source) + "features.require_contiguous_history must be boolean")
+
+    if not isinstance(training.get("early_stopping"), Mapping):
+        raise ConfigError(_source_prefix(source) + "training.early_stopping must be a mapping")
+    es = training["early_stopping"]
+    if not isinstance(es["enabled"], bool):
+        raise ConfigError(_source_prefix(source) + "training.early_stopping.enabled must be boolean")
+    internal_fraction = _positive_number(es["internal_fraction"], "training.early_stopping.internal_fraction")
+    if not 0 < internal_fraction < 1:
+        raise ConfigError(_source_prefix(source) + "training.early_stopping.internal_fraction must be between 0 and 1")
+    _non_negative_number(es["purge_minutes"], "training.early_stopping.purge_minutes")
+    stopping_rounds = es["stopping_rounds"]
+    if isinstance(stopping_rounds, bool) or not isinstance(stopping_rounds, int) or stopping_rounds <= 0:
+        raise ConfigError(_source_prefix(source) + "training.early_stopping.stopping_rounds must be a positive integer")
+    if es["metric"] != "binary_logloss":
+        raise ConfigError(_source_prefix(source) + "training.early_stopping.metric must be 'binary_logloss'")
 
 
 def _finite_number(value: Any, field: str) -> float:
