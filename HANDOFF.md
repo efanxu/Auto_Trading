@@ -9,9 +9,11 @@ Auto_Trading/
    ├─ configs/experiment.yaml
    ├─ data/raw/                 # 本地 Binance archive，不进 Git
    ├─ data/processed/           # 本地 parquet/report，不进 Git
+   ├─ results/                  # 本地模型结果，不进 Git
    ├─ scripts/run.py            # 唯一公共入口
    └─ src/auto_trading/
       ├─ data/
+      ├─ features/              # B0 price_ohlc_v1 + B1 price_5m_v1/multires
       ├─ labels/
       └─ splits/
 ```
@@ -27,12 +29,12 @@ Binance BTCUSDT Index Price 30m
 → causal next-bar Event labels
 → chronological 8:1:1 split with purge
 → B0-C LightGBM probability baseline (COMPLETE, Test SEALED)
-→ B0-D Validation Signal Selection + Formal Test Event Evaluation
+→ B1 Multi-Resolution Price Foundation (COMPLETE, Validation only, Test SEALED)
 ```
 
 ## 当前稳定协议
 
-- 数据源为 Binance 官方 `data.binance.vision` USD-M Futures `indexPriceKlines`，symbol 为 `BTCUSDT`，interval 为 `30m`，内部统一使用 UTC。
+- 数据源为 Binance 官方 `data.binance.vision` USD-M Futures `indexPriceKlines`，symbol 为 `BTCUSDT`，fine interval 为 `5m`，coarse/decision interval 为 `30m`，内部统一使用 UTC。
 - 固定研究区间为 `2020-01-01` 至 `2026-08-31`（包含截止日），canonical 字段为 `open_time/open/high/low/close/close_time`。
 - 对 bar `t`，prediction time 为 `close_time[t]`；entry 使用 `open[t+1]`，expiry 使用 `close[t+1]`。`next open` 必须是下一根 30m boundary。
 - Event direction 为 `UP=+1`、`DOWN=-1`、`FLAT=0`。`target_up` 为 UP/DOWN 的 `1/0`，FLAT 为 null；`label_valid` 对 FLAT 为 false。
@@ -57,7 +59,22 @@ Binance BTCUSDT Index Price 30m
 - Validation 概率层评价完成：`binary_logloss = 0.691183`，`Brier = 0.249019`，`ROC-AUC = 0.536141`，`accuracy@0.5 = 0.5258`，`positive_rate = 0.5060`。
 - Test set 严格保持封存（`test_status = SEALED`），未参与模型训练、早停、阈值选择或指标计算。
 - 独立相同 seed 运行复现性验证通过（probabilities diff = 0.0，feature importance diff = 0.0）。
-- deterministic tests 全部通过（当前 46 个 pytest 测试用例全部 PASS）。
+- deterministic tests 全部通过（当前 53 个 pytest 测试用例全部 PASS）。
+
+## B1 Multi-Resolution Price Foundation 当前已完成内容
+
+- B1 配置已升级为公共双时间粒度协议：fine `5m`、coarse `30m`、decision frequency `30m`、event horizon `30m`；B0-C 的历史 30m artifact 和结果仍保留。
+- 5m 官方 archive 已下载并通过 checksum 复用路径：`2020-01-01`–`2026-08-31` 共 `697811` 行，duplicates `0`，gap ranges `11`；首个 open time `2020-01-01T00:00:00Z`，最后 close time `2026-08-31T23:59:59.999000Z`。
+- 5m/30m alignment 检查共检查 `116256` 个 30m prediction times，其中 `116254` 个有精确完成的 5m close-time 对齐；5 个异常均由 5m preflight 报告的真实 gap 解释，未做 forward-fill/backward-fill，相关行不进入 common eligible。
+- `price_5m_v1` 已实现 49 个 `f5_*` 因果特征；fine valid rows `115678`。与 30m `price_ohlc_v1` 34 个 `c30_*` 特征融合后为 83 维，multires valid rows `115630`。
+- 三组 B1 使用完全相同的 common eligible metadata：总计 `115615`，Train `92414`，Validation `11624`，Test structural rows `11577`。Test target、event outcome、P&L 没有用于训练或评价。
+- B1-C common-sample coarse control：best iteration `31`；Validation ROC-AUC `0.537058`、LogLoss `0.691139`、Brier `0.248996`、Accuracy@0.5 `0.5261`；q=.55 combined `2473 / 0.549535`。
+- B1-F fine only：best iteration `27`；Validation ROC-AUC `0.534416`、LogLoss `0.691405`、Brier `0.249129`、Accuracy@0.5 `0.5266`；q=.55 combined `1738 / 0.546605`。
+- B1-MR multi-resolution：best iteration `19`；Validation ROC-AUC `0.534028`、LogLoss `0.691404`、Brier `0.249129`、Accuracy@0.5 `0.5256`；q=.55 combined `574 / 0.536585`。
+- B1-MR feature importance gain share 为 coarse `36.0018%`、fine `63.9982%`。但本批次 MR 没有在 AUC、LogLoss、Brier 或 q=.55 selective hit rate 上超过 B1-C 与 B1-F，因此不报告明确 incremental value。
+- 三组 monthly Validation diagnostics 已生成；MR 的月度 AUC 为 `0.5145`–`0.5610`，q=.55 confidence event count 合计 `574`，没有可支持“多月持续提升”的证据。
+- 独立相同 seed repeat 已通过：B1-C/F/MR 的 `best_iteration`、Validation predictions、metrics、feature importance 均 exact match（prediction max diff `0.0`、importance max diff `0.0`）。
+- B1 正式结果目录：`python_ml_backtest/results/_runs/b1_multires_seed2026/`；三个 variant 目录分别以 `_coarse`、`_fine`、`_multires` 结尾。所有结果 `TEST_STATUS = SEALED`，没有生成 Test metrics/prediction artifact。
 
 ## 当前限制
 
@@ -69,10 +86,7 @@ Binance BTCUSDT Index Price 30m
 
 ## 下一步
 
-实现 `B0-D Validation Signal Selection + Formal Test Event Evaluation`：
-1. Validation 概率校准与诊断（Platt / Isotonic 比较）；
-2. 基于 Validation 选择并冻结交易阈值与 Signal State Machine 规则；
-3. 一次性解封 Test set 进行正式 10U Event Contract 回测与验收。
+根据 B1 Validation 结果，下一阶段优先评估 `Volume / Futures Activity` 是否能提供增量信息；概率校准与 Signal Selection 仍保持在 Test 解封之前，不能把当前 B1 Validation 结果当作正式 Test 结论。
 
 ## 重要陷阱
 

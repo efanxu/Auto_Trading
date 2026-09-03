@@ -428,11 +428,17 @@ def prepare_canonical_data(
     raw_root: str | Path,
     output_path: str | Path,
     report_path: str | Path,
+    interval: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Convert downloaded archives into canonical parquet and a data report."""
+    """Convert downloaded archives into canonical parquet and a data report.
+
+    ``interval`` defaults to the legacy ``data.interval`` field, and can be
+    supplied explicitly for the B1 fine/coarse dual-interval protocol.
+    """
 
     data_config = config["data"]
-    raw_directory = archive_directory(raw_root, data_config["symbol"], data_config["interval"])
+    resolved_interval = interval or data_config.get("interval", "30m")
+    raw_directory = archive_directory(raw_root, data_config["symbol"], resolved_interval)
     archive_paths = sorted(raw_directory.rglob("*.zip")) if raw_directory.is_dir() else []
     if not archive_paths:
         raise BinanceDataError(f"no Binance ZIP archives found under {raw_directory}")
@@ -454,14 +460,17 @@ def prepare_canonical_data(
             f"archives under {raw_directory} contain no rows in {start.date()}..{end_exclusive.date() - timedelta(days=1)}"
         )
 
-    preflight = assert_data_preflight(canonical, expected_interval_minutes=30)
+    preflight = assert_data_preflight(
+        canonical,
+        expected_interval_minutes=_interval_minutes(resolved_interval),
+    )
     atomic_write_parquet(canonical, Path(output_path))
     report = {
         "source": data_config["source"],
         "market": data_config["market"],
         "series": data_config["series"],
         "symbol": data_config["symbol"],
-        "interval": data_config["interval"],
+        "interval": resolved_interval,
         "timezone": data_config["timezone"],
         "start_date": _date_string(data_config["start_date"]),
         "end_date": _date_string(data_config["end_date"]),
@@ -478,6 +487,25 @@ def prepare_canonical_data(
     }
     atomic_write_json(report, Path(report_path))
     return canonical, report
+
+
+def prepare_interval_data(
+    *,
+    config: Mapping[str, Any],
+    interval: str,
+    raw_root: str | Path,
+    output_path: str | Path,
+    report_path: str | Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Explicit B1 alias for preparing one configured data interval."""
+
+    return prepare_canonical_data(
+        config=config,
+        raw_root=raw_root,
+        output_path=output_path,
+        report_path=report_path,
+        interval=interval,
+    )
 
 
 def _archive_url(
@@ -586,6 +614,19 @@ def _next_month(first_day: date) -> date:
     return date(first_day.year, first_day.month + 1, 1)
 
 
+def _interval_minutes(interval: str) -> int:
+    match = re.fullmatch(r"(\d+)([mhd])", str(interval).strip().lower())
+    if not match:
+        raise ValueError(f"unsupported Binance interval: {interval!r}")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = {"m": 1, "h": 60, "d": 1440}[unit]
+    minutes = amount * multiplier
+    if minutes <= 0:
+        raise ValueError(f"unsupported Binance interval: {interval!r}")
+    return minutes
+
+
 def _timestamp_to_iso(value: Any) -> str | None:
     if value is None or pd.isna(value):
         return None
@@ -614,6 +655,7 @@ __all__ = [
     "parse_checksum",
     "parse_kline_csv",
     "prepare_canonical_data",
+    "prepare_interval_data",
     "read_zip_archive",
     "read_zip_archive_with_stats",
     "sha256_file",

@@ -17,12 +17,13 @@ from .binance_public import (
     parse_checksum,
     parse_kline_csv,
     prepare_canonical_data,
+    prepare_interval_data,
     read_zip_archive,
     read_zip_archive_with_stats,
     sha256_file,
 )
 from .schema import CANONICAL_COLUMNS, PRICE_COLUMNS, SchemaError
-from .paths import B0DataPaths, default_b0_data_paths
+from .paths import B0DataPaths, DataPaths, default_b0_data_paths
 from .storage import atomic_write_json, atomic_write_parquet
 from .validation import (
     DataPreflightReport,
@@ -37,6 +38,7 @@ __all__ = [
     "ArchiveNotFound",
     "BINANCE_ARCHIVE_BASE_URL",
     "B0DataPaths",
+    "DataPaths",
     "BinanceDataError",
     "CANONICAL_COLUMNS",
     "ChecksumError",
@@ -59,6 +61,7 @@ __all__ = [
     "parse_checksum",
     "parse_kline_csv",
     "prepare_canonical_data",
+    "prepare_interval_data",
     "read_zip_archive",
     "read_zip_archive_with_stats",
     "run_data_preflight",

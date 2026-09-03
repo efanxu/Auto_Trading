@@ -1,6 +1,6 @@
 # Python 模型接入索引
 
-这是 Python ML Event Contract 路线新增模型时的唯一入口。新增模型先读完本文件，再按共享路径检查公共协议和边界。
+这是 Python ML Event Contract 路线新增模型时的唯一入口。当前公共输入协议同时支持 5m fine、30m coarse 和 30m decision/event horizon；新增模型先读完本文件，再按共享路径检查公共协议和边界。
 
 ## 共享路径阅读顺序
 
@@ -10,7 +10,7 @@
 3. python_ml_backtest/configs/experiment.yaml
 4. python_ml_backtest/src/auto_trading/runtime/config.py
 5. python_ml_backtest/src/auto_trading/data/
-6. python_ml_backtest/src/auto_trading/features/
+6. python_ml_backtest/src/auto_trading/features/（包括 `FeatureView`、`price_5m_v1` 和 `price_multires_v1`）
 7. python_ml_backtest/src/auto_trading/labels/
 8. python_ml_backtest/src/auto_trading/splits/
 9. python_ml_backtest/src/auto_trading/models/base.py
@@ -89,7 +89,25 @@ DATA_PREFLIGHT
 → FORMAL
 ```
 
-B0 已完成 `CONFIG_CHECK`、`DATA_PREFLIGHT`、`LABEL_CAUSALITY`、`SPLIT_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`。B0-C 及未来模型不能跳过前置的数据因果和 split 检查。
+B0 已完成 `CONFIG_CHECK`、`DATA_PREFLIGHT`、`LABEL_CAUSALITY`、`SPLIT_CHECK`、`INTERFACE_SMALL` 和 `CLI_CHECK`。B1 增加了 5m preflight、5m/30m alignment、fine/multi-resolution causality、common-sample equality 和 monthly Validation diagnostics。B0-C 及未来模型不能跳过前置的数据因果和 split 检查。
+
+## B1 FeatureView 接入协议
+
+B1 的公共 View 由 `auto_trading.features.views.resolve_feature_view()` 解析，Trainer 不再固定依赖 `PRICE_OHLC_V1_FEATURE_NAMES`：
+
+```text
+B1-C   FeatureView(name=B1-C, feature_set=price_ohlc_v1)       34 × c30_*
+B1-F   FeatureView(name=B1-F, feature_set=price_5m_v1)         49 × f5_*
+B1-MR  FeatureView(name=B1-MR, feature_set=price_multires_v1)  83 × (c30_* + f5_*)
+```
+
+`FeatureView.feature_names` 是模型唯一需要学习的列 contract；`validity_column`/`eligibility_column` 描述可用性，`groups` 描述 feature importance 聚合。B1-C、B1-F、B1-MR 都使用相同的 `common_eligible` 样本（`label_valid AND coarse_feature_valid AND fine_feature_valid`），并通过 `runtime/trainer.py` 的同一套 chronological Train-fit/Train-ES、early stopping、formal refit、Validation metrics 和 Test sealing 路径运行。
+
+历史 B0-C 仍通过 Trainer 的 legacy 34-column view 使用原始 `price_ohlc_v1` artifact，不能用 B1-C common-control 结果替换历史 B0-C。
+
+## B1 artifact 与 Test sealing
+
+`scripts/run.py compare-features --model lightgbm --run-id <id>` 只编排三个 View，不实现第二套 Trainer。每个 variant 的结果目录应包含 `resolved_model_config.yaml`（实际 `best_iteration`/`n_estimators`/`n_jobs`/seed）、`metrics_validation_monthly.csv` 和 `feature_group_importance.json`；正式路径不得生成 `metrics_test.json` 或 `predictions_test.parquet`。非空 run directory 默认拒绝覆盖，重复实验必须使用新 run-id。
 
 ## 文档影响
 

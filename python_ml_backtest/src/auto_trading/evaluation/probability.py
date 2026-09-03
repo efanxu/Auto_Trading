@@ -160,8 +160,79 @@ def compute_confidence_report(
     return pd.DataFrame(records)
 
 
+def compute_monthly_validation_diagnostics(
+    prediction_times: Sequence[Any] | pd.Series,
+    y_true: Sequence[int] | np.ndarray,
+    y_prob: Sequence[float] | np.ndarray,
+    *,
+    confidence_threshold: float = 0.55,
+) -> pd.DataFrame:
+    """Compute fixed monthly validation metrics and q=0.55 diagnostics."""
+
+    times = pd.to_datetime(pd.Series(prediction_times), utc=True).reset_index(drop=True)
+    y_t = np.asarray(y_true, dtype=int)
+    y_p = np.asarray(y_prob, dtype=float)
+    if len(times) != len(y_t) or len(y_t) != len(y_p):
+        raise ValueError(
+            f"length mismatch: prediction_times={len(times)}, y_true={len(y_t)}, y_prob={len(y_p)}"
+        )
+    if len(y_t) == 0:
+        return pd.DataFrame(
+            columns=[
+                "month",
+                "samples",
+                "accuracy",
+                "roc_auc",
+                "binary_logloss",
+                "confidence_event_count",
+                "confidence_hit_rate",
+            ]
+        )
+
+    records: list[dict[str, Any]] = []
+    month_values = times.dt.strftime("%Y-%m")
+    for month in sorted(month_values.dropna().unique()):
+        mask = month_values == month
+        metrics = compute_probability_metrics(y_t[mask.to_numpy()], y_p[mask.to_numpy()])
+        probs = y_p[mask.to_numpy()]
+        labels = y_t[mask.to_numpy()]
+        long_mask = probs >= float(confidence_threshold)
+        short_mask = probs <= 1.0 - float(confidence_threshold)
+        confidence_mask = long_mask | short_mask
+        confidence_count = int(confidence_mask.sum())
+        if confidence_count:
+            hits = (long_mask & (labels == 1)) | (short_mask & (labels == 0))
+            confidence_rate: float | None = float(hits[confidence_mask].mean())
+        else:
+            confidence_rate = None
+        records.append(
+            {
+                "month": str(month),
+                "samples": metrics["n_samples"],
+                "accuracy": metrics["accuracy_at_0_5"],
+                "roc_auc": metrics["roc_auc"],
+                "binary_logloss": metrics["binary_logloss"],
+                "confidence_event_count": confidence_count,
+                "confidence_hit_rate": confidence_rate,
+            }
+        )
+    return pd.DataFrame(
+        records,
+        columns=[
+            "month",
+            "samples",
+            "accuracy",
+            "roc_auc",
+            "binary_logloss",
+            "confidence_event_count",
+            "confidence_hit_rate",
+        ],
+    )
+
+
 __all__ = [
     "compute_confidence_report",
+    "compute_monthly_validation_diagnostics",
     "compute_probability_metrics",
     "compute_reliability_table",
 ]

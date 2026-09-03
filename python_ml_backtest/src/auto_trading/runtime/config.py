@@ -115,6 +115,7 @@ def resolve_config(
         raise ConfigError(_source_prefix(source) + "top-level YAML value must be a mapping")
 
     resolved = deepcopy(dict(config))
+    _add_multires_defaults(resolved)
     _validate_required_fields(resolved, source=source)
     _validate_public_values(resolved, source=source)
 
@@ -174,6 +175,24 @@ def _validate_required_fields(
             current = current[key]
 
 
+def _add_multires_defaults(config: dict[str, Any]) -> None:
+    """Add B1 interval keys while keeping old B0 mappings loadable."""
+
+    data = config.setdefault("data", {})
+    if isinstance(data, dict):
+        intervals = data.setdefault("intervals", {})
+        if isinstance(intervals, dict):
+            intervals.setdefault("fine", "5m")
+            intervals.setdefault("coarse", data.get("interval", "30m"))
+
+    features = config.setdefault("features", {})
+    if isinstance(features, dict):
+        features.setdefault("fine_interval", "5m")
+        features.setdefault("coarse_interval", data.get("interval", "30m"))
+        features.setdefault("fine_max_lookback_bars", 288)
+        features.setdefault("coarse_max_lookback_bars", features.get("max_lag_bars", 48))
+
+
 def _validate_public_values(
     config: Mapping[str, Any],
     *,
@@ -187,6 +206,7 @@ def _validate_public_values(
     calibration = config["calibration"]
     signal = config["signal"]
     event = config["event"]
+    intervals = data["intervals"]
 
     if isinstance(project["seed"], bool) or not isinstance(project["seed"], int):
         raise ConfigError(_source_prefix(source) + "project.seed must be an integer")
@@ -204,6 +224,12 @@ def _validate_public_values(
                 _source_prefix(source)
                 + f"data.{field} must be {expected!r} for the current B0 protocol"
             )
+    if not isinstance(intervals, Mapping):
+        raise ConfigError(_source_prefix(source) + "data.intervals must be a mapping")
+    if intervals.get("fine") != "5m":
+        raise ConfigError(_source_prefix(source) + "data.intervals.fine must be '5m'")
+    if intervals.get("coarse") != "30m":
+        raise ConfigError(_source_prefix(source) + "data.intervals.coarse must be '30m'")
     if target["type"] != "binary_direction":
         raise ConfigError(_source_prefix(source) + "target.type must be 'binary_direction'")
     if target["entry_price"] != "next_bar_open":
@@ -277,13 +303,29 @@ def _validate_public_values(
     features = config["features"]
     training = config["training"]
 
-    if features["set"] != "price_ohlc_v1":
-        raise ConfigError(_source_prefix(source) + "features.set must be 'price_ohlc_v1'")
+    if features["set"] not in {"price_ohlc_v1", "price_multires_v1"}:
+        raise ConfigError(
+            _source_prefix(source)
+            + "features.set must be 'price_ohlc_v1' or 'price_multires_v1'"
+        )
     max_lag = features["max_lag_bars"]
     if isinstance(max_lag, bool) or not isinstance(max_lag, int) or max_lag != 48:
         raise ConfigError(_source_prefix(source) + "features.max_lag_bars must be integer 48")
     if not isinstance(features["require_contiguous_history"], bool):
         raise ConfigError(_source_prefix(source) + "features.require_contiguous_history must be boolean")
+    if features["set"] == "price_multires_v1":
+        if features["fine_interval"] != "5m":
+            raise ConfigError(_source_prefix(source) + "features.fine_interval must be '5m'")
+        if features["coarse_interval"] != "30m":
+            raise ConfigError(_source_prefix(source) + "features.coarse_interval must be '30m'")
+        if features["fine_max_lookback_bars"] != 288:
+            raise ConfigError(
+                _source_prefix(source) + "features.fine_max_lookback_bars must be integer 288"
+            )
+        if features["coarse_max_lookback_bars"] != 48:
+            raise ConfigError(
+                _source_prefix(source) + "features.coarse_max_lookback_bars must be integer 48"
+            )
 
     if not isinstance(training.get("early_stopping"), Mapping):
         raise ConfigError(_source_prefix(source) + "training.early_stopping must be a mapping")

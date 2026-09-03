@@ -6,6 +6,9 @@ data:
   market: usd_m_futures
   series: index_price_klines
   symbol: BTCUSDT
+  intervals:
+    fine: 5m
+    coarse: 30m
   interval: 30m
   timezone: UTC
   start_date: 2020-01-01
@@ -37,7 +40,11 @@ signal:
   rearm_probability_threshold: null
 
 features:
-  set: price_ohlc_v1
+  set: price_multires_v1
+  fine_interval: 5m
+  coarse_interval: 30m
+  fine_max_lookback_bars: 288
+  coarse_max_lookback_bars: 48
   max_lag_bars: 48
   require_contiguous_history: true
 

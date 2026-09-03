@@ -41,10 +41,13 @@ class DataPreflightReport:
 
         return {
             "expected_interval_minutes": self.expected_interval_minutes,
+            "rows": self.total_rows,
             "total_rows": self.total_rows,
             "first_open_time": self.first_open_time,
             "last_close_time": self.last_close_time,
+            "duplicates": self.duplicate_count,
             "duplicate_count": self.duplicate_count,
+            "gaps": self.gap_count,
             "gap_count": self.gap_count,
             "gap_ranges": [dict(item) for item in self.gap_ranges],
             "irregular_interval_count": self.irregular_interval_count,
